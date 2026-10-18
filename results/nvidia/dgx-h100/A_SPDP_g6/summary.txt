@@ -1,0 +1,1 @@
+$WORK/A_SPDP_g6 iters=800 wall=740.5s first_it=75.7s s/iter median=0.7900 mean=0.7975 min=0.7400 max=0.9700

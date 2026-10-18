@@ -1,0 +1,1 @@
+$WORK/A_DP_g1 iters=800 wall=780.5s first_it=78.4s s/iter median=0.8500 mean=0.8533 min=0.7900 max=0.9700

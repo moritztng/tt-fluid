@@ -1,0 +1,71 @@
+index, name, pci.bus_id, clocks.max.sm [MHz], clocks.max.memory [MHz], power.limit [W], driver_version
+0, NVIDIA H100 80GB HBM3, 00000000:18:00.0, 1980 MHz, 2619 MHz, 700.00 W, 615.71.09
+1, NVIDIA H100 80GB HBM3, 00000000:2A:00.0, 1980 MHz, 2619 MHz, 700.00 W, 615.71.09
+2, NVIDIA H100 80GB HBM3, 00000000:3A:00.0, 1980 MHz, 2619 MHz, 700.00 W, 615.71.09
+3, NVIDIA H100 80GB HBM3, 00000000:5D:00.0, 1980 MHz, 2619 MHz, 700.00 W, 615.71.09
+4, NVIDIA H100 80GB HBM3, 00000000:9A:00.0, 1980 MHz, 2619 MHz, 700.00 W, 615.71.09
+5, NVIDIA H100 80GB HBM3, 00000000:AB:00.0, 1980 MHz, 2619 MHz, 700.00 W, 615.71.09
+6, NVIDIA H100 80GB HBM3, 00000000:BA:00.0, 1980 MHz, 2619 MHz, 700.00 W, 615.71.09
+7, NVIDIA H100 80GB HBM3, 00000000:DB:00.0, 1980 MHz, 2619 MHz, 700.00 W, 615.71.09
+	[4mGPU0	GPU1	GPU2	GPU3	GPU4	GPU5	GPU6	GPU7	NIC0	NIC1	NIC2	NIC3	NIC4	CPU Affinity	NUMA Affinity	GPU NUMA ID[0m
+GPU0	 X 	NV18	NV18	NV18	NV18	NV18	NV18	NV18	PIX	NODE	SYS	SYS	NODE	0-55,112-167	0		N/A
+GPU1	NV18	 X 	NV18	NV18	NV18	NV18	NV18	NV18	NODE	NODE	SYS	SYS	NODE	0-55,112-167	0		N/A
+GPU2	NV18	NV18	 X 	NV18	NV18	NV18	NV18	NV18	NODE	PIX	SYS	SYS	NODE	0-55,112-167	0		N/A
+GPU3	NV18	NV18	NV18	 X 	NV18	NV18	NV18	NV18	NODE	NODE	SYS	SYS	NODE	0-55,112-167	0		N/A
+GPU4	NV18	NV18	NV18	NV18	 X 	NV18	NV18	NV18	SYS	SYS	PIX	NODE	SYS	56-111,168-223	1		N/A
+GPU5	NV18	NV18	NV18	NV18	NV18	 X 	NV18	NV18	SYS	SYS	NODE	NODE	SYS	56-111,168-223	1		N/A
+GPU6	NV18	NV18	NV18	NV18	NV18	NV18	 X 	NV18	SYS	SYS	NODE	PIX	SYS	56-111,168-223	1		N/A
+GPU7	NV18	NV18	NV18	NV18	NV18	NV18	NV18	 X 	SYS	SYS	NODE	NODE	SYS	56-111,168-223	1		N/A
+NIC0	PIX	NODE	NODE	NODE	SYS	SYS	SYS	SYS	 X 	NODE	SYS	SYS	NODE				
+NIC1	NODE	NODE	PIX	NODE	SYS	SYS	SYS	SYS	NODE	 X 	SYS	SYS	NODE				
+NIC2	SYS	SYS	SYS	SYS	PIX	NODE	NODE	NODE	SYS	SYS	 X 	NODE	SYS				
+NIC3	SYS	SYS	SYS	SYS	NODE	NODE	PIX	NODE	SYS	SYS	NODE	 X 	SYS				
+NIC4	NODE	NODE	NODE	NODE	SYS	SYS	SYS	SYS	NODE	NODE	SYS	SYS	 X 				
+
+Legend:
+
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
+  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
+  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
+  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
+  PIX  = Connection traversing at most a single PCIe bridge
+  NV#  = Connection traversing a bonded set of # NVLinks
+
+NIC Legend:
+
+  NIC0: mlx5_0
+  NIC1: mlx5_1
+  NIC2: mlx5_4
+  NIC3: mlx5_5
+  NIC4: mlx5_bond_0
+
+CPU(s):                                  224
+Model name:                              Intel(R) Xeon(R) Platinum 8480+
+Socket(s):                               2
+CPU(s) scaling MHz:                      25%
+[2026-10-15T04:46:14Z] A DP: 8 independent cases x 800 it, 3692s left
+[2026-10-15T05:00:05Z] A DP makespan 831.6 s
+$WORK/A_DP_g0 iters=800 wall=760.5s first_it=77.9s s/iter median=0.8300 mean=0.8304 min=0.7800 max=0.9500
+$WORK/A_DP_g1 iters=800 wall=780.5s first_it=78.4s s/iter median=0.8500 mean=0.8533 min=0.7900 max=0.9700
+$WORK/A_DP_g2 iters=800 wall=760.5s first_it=78.5s s/iter median=0.8300 mean=0.8280 min=0.7700 max=0.9700
+$WORK/A_DP_g3 iters=800 wall=790.5s first_it=78.1s s/iter median=0.8600 mean=0.8584 min=0.8000 max=1.0200
+$WORK/A_DP_g4 iters=800 wall=830.5s first_it=78.6s s/iter median=0.9100 mean=0.9126 min=0.8200 max=1.1700
+$WORK/A_DP_g5 iters=800 wall=760.5s first_it=78.0s s/iter median=0.8300 mean=0.8325 min=0.7700 max=0.9600
+$WORK/A_DP_g6 iters=800 wall=800.5s first_it=79.4s s/iter median=0.8700 mean=0.8754 min=0.8200 max=1.0000
+$WORK/A_DP_g7 iters=800 wall=770.5s first_it=78.5s s/iter median=0.8300 mean=0.8318 min=0.7700 max=0.9600
+[2026-10-15T05:00:05Z] B DP: 1 case on 8 GPUs x 3000 it, 2861s left
+$WORK/B_DP iters=0 wall=10.0s first_it=0.0s s/iter median=0.0000 mean=0.0000 min=0.0000 max=0.0000
+[2026-10-15T05:00:16Z] B SPDP: 1 case on 8 GPUs x 3000 it, 2850s left
+$WORK/B_SPDP iters=0 wall=10.0s first_it=0.0s s/iter median=0.0000 mean=0.0000 min=0.0000 max=0.0000
+[2026-10-15T05:00:27Z] A SPDP: 8 independent cases x 800 it, 2839s left
+[2026-10-15T05:13:18Z] A SPDP makespan 771.5 s
+$WORK/A_SPDP_g0 iters=800 wall=750.5s first_it=75.7s s/iter median=0.7900 mean=0.7969 min=0.7400 max=0.9600
+$WORK/A_SPDP_g1 iters=800 wall=760.5s first_it=74.9s s/iter median=0.8100 mean=0.8113 min=0.7700 max=0.9800
+$WORK/A_SPDP_g2 iters=800 wall=740.5s first_it=74.6s s/iter median=0.7800 mean=0.7896 min=0.7300 max=0.9600
+$WORK/A_SPDP_g3 iters=800 wall=740.5s first_it=74.0s s/iter median=0.7900 mean=0.7980 min=0.7500 max=0.9800
+$WORK/A_SPDP_g4 iters=800 wall=770.5s first_it=75.8s s/iter median=0.8300 mean=0.8326 min=0.7700 max=1.0700
+$WORK/A_SPDP_g5 iters=800 wall=760.5s first_it=75.8s s/iter median=0.8100 mean=0.8184 min=0.7700 max=0.9900
+$WORK/A_SPDP_g6 iters=800 wall=740.5s first_it=75.7s s/iter median=0.7900 mean=0.7975 min=0.7400 max=0.9700
+$WORK/A_SPDP_g7 iters=800 wall=740.5s first_it=74.2s s/iter median=0.7900 mean=0.7916 min=0.7300 max=0.9600
+[2026-10-15T05:13:18Z] PLAN-END

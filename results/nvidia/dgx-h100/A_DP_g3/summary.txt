@@ -1,0 +1,1 @@
+$WORK/A_DP_g3 iters=800 wall=790.5s first_it=78.1s s/iter median=0.8600 mean=0.8584 min=0.8000 max=1.0200

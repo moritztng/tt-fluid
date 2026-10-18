@@ -1,0 +1,16 @@
+2026-10-17T08:32:15Z armed pid 3477934 code c12381e+a5e0e4b(gpin bitset)
+2026-10-17T08:32:15Z take: booked 08:39:31Z-11:39:31Z cards 0 1 2 3 in the shared booking table, no sentinels
+2026-10-17T08:38:15Z take: holds cards 0 1 2 3 after 6 min, idle 0 chip-min
+2026-10-17T08:38:15Z held 0-3: node0 aiclk=1350 hb=36168 node1 aiclk=1350 hb=36168 node2 aiclk=1350 hb=54564 node3 aiclk=1350 hb=54564 
+2026-10-17T08:38:58Z reset rc 0 [95m Re-initializing boards after reset.... [0m
+2026-10-17T08:39:10Z smoke A rc 0
+2026-10-17T08:39:16Z smoke B rc 0
+2026-10-17T08:39:19Z vq3_A launch: case 800 --tsort 1 --gcache 14 --bgts 5 --tgts 2 --l1 1 on 0,1
+2026-10-17T08:39:19Z vq3_B launch: case 800 --tsort 1 --gcache 14 --bgts 5 --tgts 2 --l1 1 on 2,3
+2026-10-17T09:01:09Z vq3_A rc 0 process wall 1301.29 s maxrss 34157196 KB run 0 wall 1250.753 s core0 ticks [1684977873635, 1685375544542] aiclk {'min': 1350, 'max': 1350, 'n': 2} 
+2026-10-17T09:01:09Z vq3_B rc 0 process wall 1310.31 s maxrss 34267420 KB run 0 wall 1259.625 s core0 ticks [1676569320167, 1697597346160] aiclk {'min': 1350, 'max': 1350, 'n': 2} 
+bit-identical vq3_A_case_1x2_state.npz vs k2ab_DTG_case_1x2_state.npz: True
+bit-identical vq3_A_case_1x2_state.npz vs ps_D_case_1x2_state.npz: True
+bit-identical vq3_B_case_1x2_state.npz vs k2ab_DTG_case_1x2_state.npz: True
+bit-identical vq3_B_case_1x2_state.npz vs ps_D_case_1x2_state.npz: True
+2026-10-17T09:01:18Z done, releasing chips 0-3
