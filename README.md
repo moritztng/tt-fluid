@@ -11,8 +11,8 @@ for bit and needs no hardware.
 
 On the OpenFOAM HPC benchmark's motorbike case (HPC_motorbike Small: 8.66 M cells, 800 SIMPLE iterations), a $9,999 Tenstorrent QuietBox 2
 costs **$0.115 per case, 2.34x less than an 8x H100 SXM server** running the GPU port of OpenFOAM (SPUMA) at its
-cheapest documented price, and 3.19x less than 8x B200. The drag coefficient lands within the scatter of the GPU runs
-against OpenFOAM's own fp64 CPU result. Every number in this README is printed by a script in this repository from raw
+cheapest documented price, and 3.19x less than 8x B200. The drag coefficient lands 10 drag counts (0.2 %) below OpenFOAM's
+fp64 CPU result, inside the reference's own uncertainty, while the eight H100 runs scatter from -4 to +30. Every number in this README is printed by a script in this repository from raw
 data in this repository.
 
 ![Cost per case and drag coefficient vs OpenFOAM](docs/figures/headline.svg)

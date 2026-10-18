@@ -57,8 +57,11 @@ Lift (Cl) agrees within 3 counts in both windows.
 Against OpenFOAM's long-run mean instead (its iterations 501-3372, Cd 0.42226), iterations 101-800 are still partly
 transient for every run: tt-fluid is -21.3 counts (2 sigma 11.6), the eight H100 runs -14.7 to +19.3, the B200 +4.2.
 On that comparison the Tenstorrent run is the furthest from OpenFOAM. The last line `cdwindow.py` prints applies a
-3-count target to it, which this run does not meet. The spread of the eight H100 runs of one case (34 counts) shows how
-much a window mean moves with nothing but summation order. The Tenstorrent result sits inside that spread.
+3-count target to it, which this run does not meet.
+
+The eight H100 runs are the same case on identical GPUs, and their window means still spread over 34 counts: that is
+how much a window mean moves with nothing but the order of floating-point sums. The Tenstorrent result (-10.3) lies
+just outside that spread on the low side and inside OpenFOAM's own +-22.
 
 Reproduce:
 

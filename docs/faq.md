@@ -15,8 +15,9 @@ No. `pip install -e .` and `ttfluid check` run the exact device program on a CPU
 per pitzDaily iteration) but gives the same numbers, bit for bit, that the chip produces.
 
 **Why fp32? OpenFOAM runs in fp64.**
-The chip's vector unit works in fp32. On the benchmark case the drag coefficient lands within the spread of GPU runs in
-OpenFOAM's own mixed precision ([accuracy.md](accuracy.md)). Mixed-precision OpenFOAM (SPDP) on GPUs makes the same
+The chip's vector unit works in fp32. On the benchmark case the drag coefficient is 10 counts (0.2 %) below OpenFOAM's fp64
+result, inside the reference's own uncertainty; GPU runs in OpenFOAM's mixed precision scatter from -4 to +30 counts
+([accuracy.md](accuracy.md)). Mixed-precision OpenFOAM (SPDP) on GPUs makes the same
 trade.
 
 **Why is a single H100 faster per case but the QuietBox 2 cheaper per case?**
