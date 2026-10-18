@@ -1,0 +1,8 @@
+EXE_INC = \
+    -I$(LIB_SRC)/finiteVolume/lnInclude \
+    -I$(LIB_SRC)/meshTools/lnInclude
+
+/* Export bound() only, so LD_PRELOAD interposes nothing else. */
+LIB_LIBS = \
+    -Wl,--version-script=exports.map \
+    -L$(SPUMA_RT_LIBBIN) -lfiniteVolume -lmeshTools -lOpenFOAM

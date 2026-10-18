@@ -1,0 +1,7 @@
+BOUNDFIX {
+  global:
+    extern "C++" {
+      "Foam::bound(Foam::GeometricField<double, Foam::fvPatchField, Foam::volMesh>&, Foam::dimensioned<double> const&)";
+    };
+  local: *;
+};
