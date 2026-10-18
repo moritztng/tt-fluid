@@ -1,4 +1,4 @@
-"""Cost per case of occDrivAer Small (8.66 M cells, k-omega SST, 800 SIMPLE iterations) on each system, from the raw
+"""Cost per case of HPC_motorbike Small (8.66 M cells, k-omega SST, 800 SIMPLE iterations) on each system, from the raw
 run data in results/ and the list prices below. Prints a markdown table; `--json` writes the same numbers.
 
     python3 bench/per_dollar.py [--results results] [--json out.json]

@@ -9,7 +9,7 @@ turbulence model, all four linear solves and the flux correction. It writes the 
 OpenFOAM is not needed at run time. The same program also runs on a CPU emulator, which reproduces the device result bit
 for bit and needs no hardware.
 
-On the occDrivAer Small car-aerodynamics case (8.66 M cells, 800 SIMPLE iterations), a $9,999 Tenstorrent QuietBox 2
+On the OpenFOAM HPC benchmark's motorbike case (HPC_motorbike Small: 8.66 M cells, 800 SIMPLE iterations), a $9,999 Tenstorrent QuietBox 2
 costs **$0.115 per case, 2.34x less than an 8x H100 SXM server** running the GPU port of OpenFOAM (SPUMA) at its
 cheapest documented price, and 3.19x less than 8x B200. The drag coefficient lands within the scatter of the GPU runs
 against OpenFOAM's own fp64 CPU result. Every number in this README is printed by a script in this repository from raw
@@ -27,7 +27,8 @@ a cheaper box doing the same job, with the accuracy checked against OpenFOAM at 
 
 ## Results
 
-occDrivAer Small (OpenFOAM HPC Technical Committee), 8,662,309 cells, k-omega SST, 800 SIMPLE iterations from the same
+HPC_motorbike Small (OpenFOAM HPC Technical Committee benchmark, the motorBike tutorial geometry on a finer
+mesh), 8,662,309 cells, k-omega SST, 800 SIMPLE iterations from the same
 potentialFoam start on both sides. Cost per case uses one formula for every system: `capex / 3 years + wall kW x PUE
 1.3 x $0.15/kWh`, then `$/case = batch wall time x $/h / cases in the batch` ([method](docs/performance.md)).
 
@@ -86,7 +87,7 @@ ttfluid run cases/pitzDaily -n 300 --chips 2       # both chips of a p300 board
 row is the largest relative difference between the two (0 when they agree bitwise). `--write` puts the final U, p, k,
 omega and nut into a copy of the case that ParaView or any OpenFOAM tool can open. Wormhole cards take `--arch wh`.
 The [getting-started guide](docs/getting-started.md) walks through the output line by line; the
-[tutorial](docs/tutorial.md) goes from pitzDaily to the occDrivAer run behind the table above.
+[tutorial](docs/tutorial.md) goes from pitzDaily to the motorbike run behind the table above.
 
 ## How it works
 
@@ -127,13 +128,13 @@ with `ruff` and a full-history `gitleaks` scan.
   the order of fp32 sums. Each partition is deterministic.
 - On pitzDaily the first SST iteration agrees with OpenFOAM v2412 to about 1e-2 in k and omega (all later steps,
   started from OpenFOAM's own state, agree to about 1e-9); see [docs/accuracy.md](docs/accuracy.md).
-- Lowering a case of several million cells takes host RAM: about 220 GB for occDrivAer Small.
+- Lowering a case of several million cells takes host RAM: about 220 GB for HPC_motorbike Small.
 - Tested with the ttnn 0.68.0 wheel. This release was verified on a Blackhole p300 board; the same device program ran
   on Blackhole p150 cards and a Wormhole Galaxy during development.
 
 ## Roadmap
 
-- A Blackhole Galaxy (32 chips) run of occDrivAer Small and the 65 M-cell occDrivAer Large.
+- A Blackhole Galaxy (32 chips) run of HPC_motorbike Small, and the 65 M-cell occDrivAer car case.
 - Lower large cases in parallel across chips (`ttfluid/lower/spmd.py`) so host RAM stops being the limit.
 - Close the first-iteration SST gap on pitzDaily.
 - More boundary conditions and the simpleFoam variants that keep the same structure (e.g. porosity, MRF).

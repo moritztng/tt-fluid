@@ -1,12 +1,14 @@
 # Performance methodology
 
-The question this page answers is narrow: **what does one converged occDrivAer Small case cost on each system**, when
+The question this page answers is narrow: **what does one HPC_motorbike Small case cost on each system**, when
 each system runs the same physics from the same start and is graded against the same OpenFOAM reference? Everything
 below is computed by `bench/per_dollar.py` from the files in `results/`.
 
 ## The case
 
-occDrivAer Small from the OpenFOAM HPC Technical Committee benchmark set: 8,662,309 cells, steady incompressible
+HPC_motorbike Small from the OpenFOAM HPC Technical Committee benchmark set
+(`incompressible/simpleFoam/HPC_motorbike/Small`: OpenFOAM's motorBike geometry meshed with snappyHexMesh to
+8,662,309 cells), steady incompressible
 simpleFoam with k-omega SST, 800 SIMPLE iterations from a potentialFoam initialisation, the solver settings the case
 ships with (p: tolerance 1e-7, relTol 0.01; U, k, omega: tolerance 1e-8, relTol 0.1). Both sides run all 800
 iterations; neither stops early. Accuracy is graded on the drag and lift history ([accuracy.md](accuracy.md)).
@@ -76,7 +78,7 @@ Build and run scripts: `bench/nvidia/spuma_build.sh`, `spdp_build.sh`, `spuma_pa
 
 - It is not a speed record. One H100 finishes a case in about 750 s; one p300c board takes about 1300 s. The advantage
   comes from the price of the box.
-- It is one case. occDrivAer Small is a realistic external-aerodynamics mesh, but other meshes and models will land
+- It is one case. HPC_motorbike Small is a realistic snappyHexMesh external-aerodynamics mesh, but other meshes and models will land
   elsewhere.
-- Larger Tenstorrent systems (the 32-chip Galaxy) and the 65 M-cell occDrivAer Large are on the roadmap. We do not
+- Larger Tenstorrent systems (the 32-chip Galaxy) and the 65 M-cell occDrivAer car case are on the roadmap. We do not
   quote numbers for them here because their raw data is not in this release.

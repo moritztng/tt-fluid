@@ -4,7 +4,7 @@ Three questions, three kinds of check:
 
 1. Does the solver discretise like OpenFOAM? The numpy solver is checked against OpenFOAM v2412 field by field.
 2. Does the device run the program it was given? The device must match the CPU emulator of the same program bit for bit.
-3. Is the fp32 answer good enough? Drag and lift of a car are compared with OpenFOAM in fp64 over windows of iterations.
+3. Is the fp32 answer good enough? Drag and lift of a motorbike are compared with OpenFOAM in fp64 over windows of iterations.
 
 ## 1. The solver against OpenFOAM v2412 (pitzDaily)
 
@@ -34,9 +34,9 @@ difference is 0. The emulator itself is regression-tested in `tests/test_emulato
 The two partitions give different numbers: after 3 pitzDaily iterations the 1-chip and 2-chip residuals differ by about
 1 %. That is fp32 summation order, not an error. Each partition is deterministic, run after run.
 
-## 3. Drag and lift against OpenFOAM fp64 (occDrivAer Small)
+## 3. Drag and lift against OpenFOAM fp64 (HPC_motorbike Small)
 
-occDrivAer Small (8.66 M cells, k-omega SST) does not settle to a steady state under SIMPLE: the drag coefficient
+HPC_motorbike Small (8.66 M cells, k-omega SST) does not settle to a steady state under SIMPLE: the drag coefficient
 oscillates by about 36 drag counts (1 count = 0.0001 in Cd) from one iteration to the next. A comparison of single
 iterations would mean nothing. Both sides are therefore averaged over a window of iterations, and the error of each mean
 comes from batch means (blocks of 100 iterations). The OpenFOAM reference is v2412 in fp64 on a CPU from the same
@@ -75,6 +75,6 @@ final states against two earlier builds.
 
 ### A known behaviour of the case
 
-On long runs (about 2,200 iterations) occDrivAer Small can produce a NaN on the device. The same discretisation in fp64
+On long runs (about 2,200 iterations) HPC_motorbike Small can produce a NaN on the device. The same discretisation in fp64
 on the host floors omega in the same cell and fails the same way, so it belongs to the model and mesh, not to fp32 or
 the device. tt-fluid stops a run one iteration after any field becomes non-finite.

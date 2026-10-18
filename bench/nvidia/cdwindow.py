@@ -1,6 +1,6 @@
 """Windowed Cd/Cl gate: device per-iteration coefficients (run_mesh --forces history) vs OpenFOAM coefficient.dat.
 
-On a case whose Cd oscillates from iteration to iteration (occDrivAer Small: ~36 counts sd per it, 100-it block means
+On a case whose Cd oscillates from iteration to iteration (HPC_motorbike Small: ~36 counts sd per it, 100-it block means
 spread ~20 counts), a single-iteration comparison says nothing. Both sides are averaged over a window and the error of
 each mean comes from batch means (blocks of --block its), so the verdict reads diff +- 2 sigma against the gate.
 
