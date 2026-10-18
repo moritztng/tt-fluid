@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 from .ops import FaceOps
-from .fields import VolField, FixedValue, Calculated
+from .fields import VolField, FixedValue
 
 SMALL = 1e-15
 GREAT = 1e15

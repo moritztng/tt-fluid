@@ -20,7 +20,6 @@ read must keep the address mod 32), so C_LDR skips `page_phase` 16-B units.
 import numpy as np
 
 from .machine import LANES, DBASE, KBASE, NH, widen_bf16
-from .trace import SCALAR
 
 # compute
 C_END, C_ACQ, C_COMMIT, C_REL, C_LD, C_ST, C_FILL, C_RVF = range(8)

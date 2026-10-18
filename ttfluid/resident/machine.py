@@ -25,10 +25,9 @@ import bisect
 import os
 from collections import Counter, defaultdict
 
-import os
 import numpy as np
 
-from .analysis import PURE, live_outs, liveness, successors
+from .analysis import PURE, live_outs, liveness
 from .trace import SCALAR, Space
 
 SCRATCH = Space("scratch", 1024)   # one-tile temporaries of a fused run

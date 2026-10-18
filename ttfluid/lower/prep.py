@@ -14,7 +14,6 @@ lowers to reads a halo cell's own face sums.
 import argparse
 import copy
 import pickle
-import sys
 import time
 from pathlib import Path
 

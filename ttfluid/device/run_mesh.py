@@ -9,7 +9,7 @@ included. Two Blackhole chips of a p300 board have two links between them: --arc
 Options as run_vm.py, plus --mesh R,C (the chips' mesh; K = R * C partition blocks are placed on it so that
 neighbouring blocks are neighbouring chips).
 """
-import argparse, collections, itertools, json, os, pickle, re, sys, threading, time
+import argparse, collections, json, os, pickle, re, sys, threading, time
 from pathlib import Path
 
 import numpy as np
@@ -74,7 +74,9 @@ ap.add_argument("--fuse", action="store_true", help="segment tile-loop fusion (M
 ap.add_argument("--redm", type=int, default=1, help="1: pair adjacent independent global sums into one reduction (same values, fewer all-gathers); 0: one per sum")
 ap.add_argument("--owner", help="npz with key parts: the global core of every cell (drivaer part2d), in place of rcb")
 ap.add_argument("--strips", action="store_true", help="chip blocks as strips along the longest axis on any R x C mesh (snake placement)")
-ap.add_argument("--block2d", action="store_true", help="R x C is the chips' own physical shape (a .110 tray of 8 is 2,4); without it a 2D mesh is refused, because a view the chips do not have (4,2 on a 2x4 tray) routes over hops that are not links and wedged all eight (.110 0-7, 2026-10-10)")
+ap.add_argument("--sysfs-nodes", default=None, help="comma list: the /sys/class/tenstorrent node of each visible chip, "
+                "for the AICLK sampler (default: the TT_VISIBLE_DEVICES indices)")
+ap.add_argument("--block2d", action="store_true", help="R x C is the chips' own physical shape (a Wormhole Galaxy tray of 8 is 2,4); without it a 2D mesh is refused, because a view the chips do not have (4,2 on a 2x4 tray) routes over hops that are not links and wedged all eight (.110 0-7, 2026-10-10)")
 ap.add_argument("--page", type=int, default=0, help="as run_vm.py: compute code paged from DRAM through this many 1-KB pages")
 ap.add_argument("--nwin", type=int, default=0, help="as run_vm.py: N code window in L1 (words, multiple of 256)")
 ap.add_argument("--l1-check", action="store_true", help="open the mesh, size every CB, build the program and enqueue it with no work (limit 0, no upload): exit 4 if it is over the kernel config buffer")
@@ -705,13 +707,11 @@ def chip_program(rc):
 
 
 class Aiclk:
-    """tt_aiclk of every chip of the mesh every 20 ms (.110: UMD 0-15 are nodes 16-31, 16-23 8-15, 24-31 0-7; another
-    host names the sysfs node of each visible chip in CFD_TT_NODES, e.g. qb1 logical 0,1 are nodes 1,2)."""
-    NODE = {u: (u + 16 if u < 16 else (u - 8 if u < 24 else u - 24)) for u in range(32)}
+    """tt_aiclk of every chip of the mesh every 20 ms, read from /sys/class/tenstorrent. The sysfs node of a visible chip
+    is its TT_VISIBLE_DEVICES index unless --sysfs-nodes names them (the two numberings differ on some hosts)."""
 
     def __enter__(self):
-        nodes = os.environ.get("CFD_TT_NODES")
-        nodes = [int(x) for x in nodes.split(",")] if nodes else [self.NODE[u] for u in umd]
+        nodes = [int(x) for x in a.sysfs_nodes.split(",")] if a.sysfs_nodes else umd
         self.paths = [f"/sys/class/tenstorrent/tenstorrent!{n}/tt_aiclk" for n in nodes]
         self.vals, self.stop = [], threading.Event()
 

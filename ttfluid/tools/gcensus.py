@@ -15,7 +15,6 @@ property holds; MESH.npz (gprice.py mesh) supplies face counts and centres.
 """
 import argparse
 import json
-import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -149,7 +148,7 @@ def main():
     rows = sorted({k for v in res.values() for k in v})
     for key in sorted(res):
         v = res[key]
-        print("%-16s %-6s ngc%d  outer %8.0f  | " % (key + (), ) if False else "%-16s %-6s ngc%d  outer %8.0f  | " % (
+        print("%-16s %-6s ngc%d  outer %8.0f  | " % (
             key[0], key[1], key[2], v["_all_outer"] / nc) + " ".join("%s %.0f" % (r, v[r] / nc) for r in rows
                                                                     if not r.startswith("_") and v[r]), flush=True)
     for key in sorted(per_core):

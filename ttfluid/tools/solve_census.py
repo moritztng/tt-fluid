@@ -14,7 +14,6 @@ Homes of the loop's vector registers: dram, ovl (wplace 2: on the one-tile pool)
 import argparse
 import io
 import json
-import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 

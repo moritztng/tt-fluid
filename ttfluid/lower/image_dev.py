@@ -181,7 +181,7 @@ def host_shards(md, K, DEVBLK, f):
         x = np.ascontiguousarray(f(DEVBLK[d]))
         assert x.dtype == np.uint32, (x.shape, x.dtype)
         # tagged int32, not uint32: the same bytes, and from_torch builds an int32 host tensor at ~2 GB/s against ~1 GB/s
-        # for uint32 (xferbench, .103 2026-10-13); the program reads the buffer as raw words either way
+        # for uint32 (measured with a host-to-device transfer benchmark); the program reads the buffer as raw words either way
         return ttnn.from_torch(torch.from_numpy(x.view(np.int32)), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT)
     with ThreadPoolExecutor(int(os.environ.get("CFD_IMG_THREADS", min(K, 16)))) as ex:
         hs = list(ex.map(shard, range(K)))

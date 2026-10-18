@@ -1,9 +1,7 @@
 """Control flow, liveness and footprint of a traced program."""
 from collections import Counter
 
-import numpy as np
 
-from .trace import SCALAR
 
 
 PURE = ("ew", "gather", "bsum", "reduce", "copy")     # instructions whose only effect is their result register

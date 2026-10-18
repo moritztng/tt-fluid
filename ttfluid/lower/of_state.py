@@ -15,7 +15,6 @@ owned values are exact, halo values are never read). Without it, one SimpleFoam 
 import argparse
 import copy
 import multiprocessing as mp
-import sys
 import time
 from pathlib import Path
 
