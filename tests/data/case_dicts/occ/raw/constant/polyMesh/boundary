@@ -1,0 +1,406 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2406                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      binary;
+    arch        "LSB;label=32;scalar=64";
+    class       polyBoundaryMesh;
+    location    "constant/polyMesh";
+    object      boundary;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+55
+(
+    inlet
+    {
+        type            patch;
+        nFaces          390;
+        startFace       197353234;
+    }
+    outlet
+    {
+        type            patch;
+        nFaces          546;
+        startFace       197353624;
+    }
+    freestream
+    {
+        type            symmetry;
+        inGroups        1(symmetry);
+        nFaces          3864;
+        startFace       197354170;
+    }
+    ground
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          3564;
+        startFace       197358034;
+    }
+    BodyA-Pillar
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          24580;
+        startFace       197361598;
+    }
+    BodyDoorhandles
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          30018;
+        startFace       197386178;
+    }
+    BodyFasciafront1
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          120913;
+        startFace       197416196;
+    }
+    BodyFasciafront2
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          35600;
+        startFace       197537109;
+    }
+    BodyFender
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          82008;
+        startFace       197572709;
+    }
+    BodyHeadlamps
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          16739;
+        startFace       197654717;
+    }
+    BodyHood
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          103971;
+        startFace       197671456;
+    }
+    BodyRear
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          178067;
+        startFace       197775427;
+    }
+    BodyRearAccess
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          34042;
+        startFace       197953494;
+    }
+    BodyRocker
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          47814;
+        startFace       197987536;
+    }
+    BodyRoof
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          33143;
+        startFace       198035350;
+    }
+    BodySide
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          253537;
+        startFace       198068493;
+    }
+    BodyWindowfront
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          80471;
+        startFace       198322030;
+    }
+    BodyWindowfrontframe
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          24842;
+        startFace       198402501;
+    }
+    BodyWindowSide
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          37956;
+        startFace       198427343;
+    }
+    BodyWindowsideframe
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          20008;
+        startFace       198465299;
+    }
+    Mirrors1
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          40815;
+        startFace       198485307;
+    }
+    Mirrors2
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          7230;
+        startFace       198526122;
+    }
+    ClosedGrillLowerInsert
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          32527;
+        startFace       198533352;
+    }
+    ClosedGrillUpperInsert
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          43604;
+        startFace       198565879;
+    }
+    OCDADetailedUnderbody
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          1519399;
+        startFace       198609483;
+    }
+    EngineUndershield
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          56013;
+        startFace       200128882;
+    }
+    Tiresfront
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          314656;
+        startFace       200184895;
+    }
+    Tiresrear
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          315447;
+        startFace       200499551;
+    }
+    WheelSupportfront1
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          108360;
+        startFace       200814998;
+    }
+    WheelSupportfront2
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          49432;
+        startFace       200923358;
+    }
+    WheelSupportrear
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          38399;
+        startFace       200972790;
+    }
+    Powertrain
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          233881;
+        startFace       201011189;
+    }
+    ExhaustSystem1
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          1190;
+        startFace       201245070;
+    }
+    ExhaustSystem2
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          56356;
+        startFace       201246260;
+    }
+    ExhaustSystem3
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          13302;
+        startFace       201302616;
+    }
+    NotchbackB-Pillar
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          20697;
+        startFace       201315918;
+    }
+    NotchbackBodyside
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          28220;
+        startFace       201336615;
+    }
+    NotchbackC-Pillar
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          62354;
+        startFace       201364835;
+    }
+    NotchbackRoof
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          100580;
+        startFace       201427189;
+    }
+    NotchbackTrunk
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          72282;
+        startFace       201527769;
+    }
+    NotchbackWindowrear
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          59844;
+        startFace       201600051;
+    }
+    NotchbackWindowrearframe
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          7484;
+        startFace       201659895;
+    }
+    NotchbackWindowside
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          80461;
+        startFace       201667379;
+    }
+    NotchbackWindowsideframe
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          57828;
+        startFace       201747840;
+    }
+    CTRL_SURFACE_Outlet
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          20810;
+        startFace       201805668;
+    }
+    CTRL_SURFACE_Wheelhouse_LHS
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          5875;
+        startFace       201826478;
+    }
+    CTRL_SURFACE_Wheelshouse_RHS
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          5887;
+        startFace       201832353;
+    }
+    Rimsfront
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          312990;
+        startFace       201838240;
+    }
+    Rimsrear
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          312519;
+        startFace       202151230;
+    }
+    BrakeDiscfront
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          63080;
+        startFace       202463749;
+    }
+    BrakeDiscrear
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          64082;
+        startFace       202526829;
+    }
+    ground_noSlip
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          34239;
+        startFace       202590911;
+    }
+    ground_noSlip_layer
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          641990;
+        startFace       202625150;
+    }
+    Plinths_adapted_TirePlinthfront
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          2357;
+        startFace       203267140;
+    }
+    Plinths_adapted_TirePlinthrear
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          2371;
+        startFace       203269497;
+    }
+)
+
+// ************************************************************************* //

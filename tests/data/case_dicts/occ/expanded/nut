@@ -1,0 +1,143 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2412                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+//
+// "0/nut"
+//
+FoamFile
+{
+    version         2;
+    format          ascii;
+    class           volScalarField;
+    location        "0";
+    object          nut;
+}
+
+lref            2.78618;
+
+Aref            2.17;
+
+inletPatch      inlet;
+
+outletPatch     outlet;
+
+slipGroundPatch ground;
+
+fixedWallPatches "(Body.*|Closed.*|CTRL.*|Engine.*|Exhaust.*|Mirror.*|Notchback.*|OCDA.*|Powertrain|Wheel.*|Rims.*|Brake.*|Tires.*|Plinth.*|ground_noSlip.*)";
+
+symmPatches     freestream;
+
+forcesWallPatches "(Body.*|Closed.*|CTRL.*|Engine.*|Exhaust.*|Mirror.*|Notchback.*|OCDA.*|Powertrain|Wheel.*|Rimsfront|BrakeDiscfront|Tiresfront|Rimsrear|BrakeDiscrear|Tiresrear|Rimsfront_rota|Rimsrear_rota|BrakeDiscfront_rota|BrakeDiscrear_rota)";
+
+Uinf            ( 38.889 0 0 );
+
+UinfMag         38.889;
+
+nu              1.507e-05;
+
+pref            0;
+
+viscRatio       5;
+
+Tu              0.0026;
+
+RASturbModel    kOmegaSST;
+
+nCores          28;
+
+decompositionMethod hierarchical;
+
+nHierarchical   ( 7 2 2 );
+
+interpScheme    cellPatchConstrained;
+
+probeField      cp;
+
+nutref          7.535e-05;
+
+dimensions      [ 0 2 -1 0 0 0 0 ];
+
+internalField   uniform 7.535e-05;
+
+boundaryField
+{
+    cyclic
+    {
+        type            cyclic;
+    }
+    cyclicAMI
+    {
+        type            cyclicAMI;
+        value           uniform 7.535e-05;
+    }
+    cyclicACMI
+    {
+        type            cyclicACMI;
+        value           uniform 7.535e-05;
+    }
+    cyclicSlip
+    {
+        type            cyclicSlip;
+    }
+    empty
+    {
+        type            empty;
+    }
+    nonuniformTransformCyclic
+    {
+        type            nonuniformTransformCyclic;
+    }
+    processor
+    {
+        type            processor;
+    }
+    processorCyclic
+    {
+        type            processorCyclic;
+    }
+    symmetryPlane
+    {
+        type            symmetryPlane;
+    }
+    symmetry
+    {
+        type            symmetry;
+    }
+    wedge
+    {
+        type            wedge;
+    }
+    overset
+    {
+        type            overset;
+    }
+    inlet
+    {
+        type            calculated;
+        value           uniform 7.535e-05;
+    }
+    outlet
+    {
+        type            calculated;
+        value           uniform 7.535e-05;
+    }
+    ground
+    {
+        type            slip;
+    }
+    "(Body.*|Closed.*|CTRL.*|Engine.*|Exhaust.*|Mirror.*|Notchback.*|OCDA.*|Powertrain|Wheel.*|Rims.*|Brake.*|Tires.*|Plinth.*|ground_noSlip.*)"
+    {
+        type            nutUSpaldingWallFunction;
+        value           uniform 7.535e-05;
+        tolerance       1e-09;
+    }
+    freestream
+    {
+        type            symmetry;
+    }
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
