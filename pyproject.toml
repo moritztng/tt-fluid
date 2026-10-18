@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tt-fluid"
+version = "0.1.0"
+description = "Steady incompressible RANS (OpenFOAM simpleFoam, k-omega SST) on Tenstorrent Wormhole and Blackhole"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Moritz Thüning", email = "moritz.thuening@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "scipy>=1.11"]
+keywords = ["cfd", "openfoam", "rans", "tenstorrent", "blackhole", "wormhole"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.optional-dependencies]
+# The device runner needs ttnn (and the torch it brings); tested with the ttnn 0.68.0 wheel.
+tenstorrent = ["ttnn==0.68.0"]
+large = ["cloudpickle", "zstandard"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+ttfluid = "ttfluid.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/moritztng/tt-fluid"
+Issues = "https://github.com/moritztng/tt-fluid/issues"
+
+[tool.setuptools.packages.find]
+include = ["ttfluid*"]
+
+[tool.setuptools.package-data]
+"ttfluid.device" = ["kernels/*.cpp"]
+"ttfluid.solver" = ["etc/caseDicts/*"]
+
+[tool.ruff]
+line-length = 160
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "E9"]
+ignore = ["F841"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
