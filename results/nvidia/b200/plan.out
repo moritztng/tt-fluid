@@ -1,0 +1,24 @@
+index, name, pci.bus_id, clocks.max.sm [MHz], clocks.max.memory [MHz], power.limit [W], driver_version
+0, NVIDIA B200, 00000000:86:00.0, 1965 MHz, 3996 MHz, 1000.00 W, 580.126.09
+	[4mGPU0	CPU Affinity	NUMA Affinity	GPU NUMA ID[0m
+GPU0	 X 	48-95,144-191	1		N/A
+
+Legend:
+
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
+  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
+  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
+  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
+  PIX  = Connection traversing at most a single PCIe bridge
+  NV#  = Connection traversing a bonded set of # NVLinks
+CPU(s):                                  192
+Model name:                              Intel(R) Xeon(R) Platinum 8559C
+Socket(s):                               2
+[2026-10-15T06:56:05Z] A DP: 1 independent cases x 800 it, 3072s left
+[2026-10-15T07:08:26Z] A DP makespan 740.6 s
+$WORK/A_DP_g0 iters=800 wall=740.3s first_it=95.1s s/iter median=0.8000 mean=0.7930 min=0.7500 max=0.9800
+[2026-10-15T07:08:26Z] A SPDP: 1 independent cases x 800 it, 2331s left
+[2026-10-15T07:19:56Z] A SPDP makespan 690.5 s
+$WORK/A_SPDP_g0 iters=800 wall=690.3s first_it=68.7s s/iter median=0.7700 mean=0.7672 min=0.7500 max=0.8800
+[2026-10-15T07:19:56Z] PLAN-END
