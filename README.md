@@ -45,8 +45,8 @@ costs 4 % of the H100 server. GPU power is the measured board power while busy, 
 charged its full 1.3 kW system rating (not a measurement). NVIDIA gets its cheapest documented price and its
 fastest measured precision mode (SPDP: fp32 fields with fp64 solver sums).
 
-**Accuracy.** Cd oscillates by about 36 drag counts (1 count = 0.0001) from iteration to iteration on this case, so a
-single iteration says little. We compare window means over iterations 101-800 against OpenFOAM v2412 in fp64 on a CPU,
+**Accuracy.** On this case Cd keeps moving under SIMPLE (standard deviation 42 drag counts over iterations 101-800 in
+OpenFOAM's own run; 1 count = 0.0001), so single iterations say little. We compare window means over iterations 101-800 against OpenFOAM v2412 in fp64 on a CPU,
 from the same start ([method](docs/accuracy.md)):
 
 | run | Cd mean, its 101-800 | vs OpenFOAM fp64 | script |

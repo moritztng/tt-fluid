@@ -36,9 +36,9 @@ The two partitions give different numbers: after 3 pitzDaily iterations the 1-ch
 
 ## 3. Drag and lift against OpenFOAM fp64 (HPC_motorbike Small)
 
-HPC_motorbike Small (8.66 M cells, k-omega SST) does not settle to a steady state under SIMPLE: the drag coefficient
-oscillates by about 36 drag counts (1 count = 0.0001 in Cd) from one iteration to the next. A comparison of single
-iterations would mean nothing. Both sides are therefore averaged over a window of iterations, and the error of each mean
+HPC_motorbike Small (8.66 M cells, k-omega SST) does not settle to a steady state under SIMPLE: over iterations 101-800
+OpenFOAM's own drag coefficient has a standard deviation of 42 drag counts (1 count = 0.0001 in Cd). A comparison of
+single iterations would mean nothing. Both sides are therefore averaged over a window of iterations, and the error of each mean
 comes from batch means (blocks of 100 iterations). The OpenFOAM reference is v2412 in fp64 on a CPU from the same
 potentialFoam start (`results/openfoam/of1k.dat`, `of4k.dat`).
 
@@ -52,7 +52,12 @@ Iterations 101-800, all runs from the same start:
 | SPUMA SPDP on B200 | 0.42268 | +15.2 | 26.7 |
 
 Over iterations 101-1900 the Tenstorrent run gives Cd 0.42060, 12.8 counts below OpenFOAM over the same iterations.
-Lift (Cl) agrees within 3 counts in both windows. The spread of the eight H100 runs of one case (34 counts) shows how
+Lift (Cl) agrees within 3 counts in both windows.
+
+Against OpenFOAM's long-run mean instead (its iterations 501-3372, Cd 0.42226), iterations 101-800 are still partly
+transient for every run: tt-fluid is -21.3 counts (2 sigma 11.6), the eight H100 runs -14.7 to +19.3, the B200 +4.2.
+On that comparison the Tenstorrent run is the furthest from OpenFOAM. The last line `cdwindow.py` prints applies a
+3-count target to it, which this run does not meet. The spread of the eight H100 runs of one case (34 counts) shows how
 much a window mean moves with nothing but summation order. The Tenstorrent result sits inside that spread.
 
 Reproduce:

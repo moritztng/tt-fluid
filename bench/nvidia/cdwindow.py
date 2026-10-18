@@ -1,7 +1,7 @@
 """Windowed Cd/Cl gate: device per-iteration coefficients (run_mesh --forces history) vs OpenFOAM coefficient.dat.
 
-On a case whose Cd oscillates from iteration to iteration (HPC_motorbike Small: ~36 counts sd per it, 100-it block means
-spread ~20 counts), a single-iteration comparison says nothing. Both sides are averaged over a window and the error of
+On a case whose Cd oscillates from iteration to iteration (HPC_motorbike Small: sd ~42 counts over its 101-800 in
+OpenFOAM's own run), a single-iteration comparison says nothing. Both sides are averaged over a window and the error of
 each mean comes from batch means (blocks of --block its), so the verdict reads diff +- 2 sigma against the gate.
 
     python3 cdwindow.py --dev F8.hist.json:700 F9.hist.json:800 ... --of coefficient.dat [coefficient.dat ...]
@@ -73,9 +73,9 @@ def main():
         out[name] = dict(dev=dm, dev_se=de * 1e4, of_same=sm, of_same_se=se * 1e4, of_long=om, of_long_se=oe * 1e4,
                          diff_counts=diff, sigma_counts=sig, diff_same_counts=(dm - sm) * 1e4)
         print("%s dev its %d-%d mean %.5f +- %.1f counts (%d blocks) | OF same its %.5f +- %.1f | OF its %d-%d %.5f +- %.1f"
-              " (%d blocks) | dev - OF long %+.1f +- %.1f counts (1 sigma), same its %+.1f"
+              " (%d blocks) | dev - OF long %+.1f +- %.1f counts (1 sigma), same its %+.1f | OF sd over the window %.0f"
               % (name, its[0], its[-1], dm, de * 1e4, dn, sm, se * 1e4, oits[0], oits[-1], om, oe * 1e4, on, diff, sig,
-                 (dm - sm) * 1e4))
+                 (dm - sm) * 1e4, np.std([o[i][q] for i in its if i in o]) * 1e4))
     c = out["Cd"]
     verdict = ("PASS" if abs(c["diff_counts"]) + 2 * c["sigma_counts"] <= a.gate else
                "FAIL" if abs(c["diff_counts"]) - 2 * c["sigma_counts"] > a.gate else "UNRESOLVED")
