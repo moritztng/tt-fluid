@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use tt-fluid, please cite it as below."
+title: "tt-fluid: steady RANS (OpenFOAM simpleFoam, k-omega SST) on Tenstorrent chips"
+type: software
+authors:
+  - family-names: "Thüning"
+    given-names: "Moritz"
+version: 0.1.0
+date-released: 2026-10-19
+license: GPL-3.0-or-later
+repository-code: "https://github.com/moritztng/tt-fluid"
+keywords:
+  - computational fluid dynamics
+  - OpenFOAM
+  - RANS
+  - Tenstorrent
