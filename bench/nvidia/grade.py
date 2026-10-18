@@ -2,6 +2,7 @@
 
 Both sides are OpenFOAM coefficient.dat files from the same potentialFoam start; each window mean carries its batch-means
 error (blocks of --block its, cdwindow.py), and the verdict is diff against 2 sigma of the two errors combined.
+One count is 1e-4 in Cd or Cl (a drag count), as in cdwindow.py.
 
     python3 grade.py --run B_DP/postProcessing/forceCoeffsAll/0/coefficient.dat --of of1k.dat of4k.dat [--from 101 --to 3000]
 """
@@ -26,9 +27,9 @@ def main():
     for k, name in enumerate(("Cd", "Cl")):
         mr, er, nb = batch([run[i][k] for i in its], a.block)
         mo, eo, _ = batch([ref[i][k] for i in its], a.block)
-        d, s2 = (mr - mo) * 1e3, 2e3 * math.hypot(er, eo)
+        d, s2 = (mr - mo) * 1e4, 2e4 * math.hypot(er, eo)
         verdict = "PASS" if abs(d) <= s2 else "FAIL"
-        print(f"{name}: run {mr:.5f} +- {2e3*er:.1f} counts, OpenFOAM {mo:.5f} +- {2e3*eo:.1f}; "
+        print(f"{name}: run {mr:.5f} +- {2e4*er:.1f} counts, OpenFOAM {mo:.5f} +- {2e4*eo:.1f}; "
               f"diff {d:+.1f} counts, 2 sigma {s2:.1f} ({nb} blocks) {verdict}")
 
 
