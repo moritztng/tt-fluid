@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 330" width="1040" height="330" role="img" aria-label="Cost per case and drag coefficient versus OpenFOAM">
+<style>
+  .s { --bg:#fcfcfb; --t1:#0b0b0b; --t2:#52514e; --t3:#8a8984; --grid:#e4e3df; --band:#ecebe7; --c1:#2a78d6; --c2:#eb6834; }
+  @media (prefers-color-scheme: dark) {
+    .s { --bg:#1a1a19; --t1:#f0efec; --t2:#c3c2b7; --t3:#8f8e88; --grid:#33332f; --band:#2a2a27; --c1:#3987e5; --c2:#d95926; }
+  }
+  .s text { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; fill: var(--t1); }
+  .h { font-size: 15px; font-weight: 600; } .sub { font-size: 12px; fill: var(--t2) !important; }
+  .l { font-size: 12px; } .v { font-size: 12px; font-weight: 600; } .ax { font-size: 11px; fill: var(--t3) !important; }
+</style>
+<g class="s">
+<rect width="1040" height="330" rx="8" fill="var(--bg)"/>
+<text class="h" x="24" y="34">Cost per case, HPC_motorbike Small (8.66 M cells)</text>
+<text class="sub" x="24" y="54">US$ per 800-iteration case, 3-year TCO; lower is better</text>
+<line x1="210.0" y1="78" x2="210.0" y2="234" stroke="var(--grid)"/>
+<text class="ax" x="210.0" y="250" text-anchor="middle">0.0</text>
+<line x1="270.0" y1="78" x2="270.0" y2="234" stroke="var(--grid)"/>
+<text class="ax" x="270.0" y="250" text-anchor="middle">0.1</text>
+<line x1="330.0" y1="78" x2="330.0" y2="234" stroke="var(--grid)"/>
+<text class="ax" x="330.0" y="250" text-anchor="middle">0.2</text>
+<line x1="390.0" y1="78" x2="390.0" y2="234" stroke="var(--grid)"/>
+<text class="ax" x="390.0" y="250" text-anchor="middle">0.3</text>
+<line x1="450.0" y1="78" x2="450.0" y2="234" stroke="var(--grid)"/>
+<text class="ax" x="450.0" y="250" text-anchor="middle">0.4</text>
+<text class="l" x="200" y="107" text-anchor="end">QuietBox 2 (4 Blackhole chips)</text>
+<path d="M210.0,92.0 H275.2 Q279.2,92.0 279.2,96.0 V110.0 Q279.2,114.0 275.2,114.0 H210.0 Z" fill="var(--c1)"/>
+<text class="v" x="287.2" y="107">$0.115</text>
+<text class="l" x="200" y="163" text-anchor="end">8x H100 SXM</text>
+<path d="M210.0,148.0 H368.2 Q372.2,148.0 372.2,152.0 V166.0 Q372.2,170.0 368.2,170.0 H210.0 Z" fill="var(--c2)"/>
+<text class="v" x="380.2" y="163">$0.270  (2.34x the cost)</text>
+<text class="l" x="200" y="219" text-anchor="end">8x B200 (derived)</text>
+<path d="M210.0,204.0 H426.7 Q430.7,204.0 430.7,208.0 V222.0 Q430.7,226.0 426.7,226.0 H210.0 Z" fill="var(--c2)"/>
+<text class="v" x="438.7" y="219">$0.368  (3.19x the cost)</text>
+<text class="ax" x="24" y="290">bench/per_dollar.py on results/: batch wall x $/h / cases per batch.</text>
+<text class="ax" x="24" y="306">Blue: Tenstorrent, fp32. Orange: NVIDIA, SPUMA mixed precision.</text>
+<text class="h" x="540" y="34">Drag coefficient vs OpenFOAM fp64</text>
+<text class="sub" x="540" y="54">mean over iterations 101-800, drag counts (0.0001)</text>
+<rect x="744.9" y="80" width="110.2" height="160" fill="var(--band)"/>
+<line x1="700.0" y1="80" x2="700.0" y2="240" stroke="var(--grid)"/>
+<text class="ax" x="700.0" y="256" text-anchor="middle">-40</text>
+<line x1="750.0" y1="80" x2="750.0" y2="240" stroke="var(--grid)"/>
+<text class="ax" x="750.0" y="256" text-anchor="middle">-20</text>
+<line x1="800.0" y1="80" x2="800.0" y2="240" stroke="var(--grid)"/>
+<text class="ax" x="800.0" y="256" text-anchor="middle">0</text>
+<line x1="850.0" y1="80" x2="850.0" y2="240" stroke="var(--grid)"/>
+<text class="ax" x="850.0" y="256" text-anchor="middle">+20</text>
+<line x1="900.0" y1="80" x2="900.0" y2="240" stroke="var(--grid)"/>
+<text class="ax" x="900.0" y="256" text-anchor="middle">+40</text>
+<line x1="800.0" y1="80" x2="800.0" y2="240" stroke="var(--t3)" stroke-width="1.5"/>
+<text class="ax" x="804.0" y="92">OpenFOAM</text>
+<text class="l" x="690" y="118" text-anchor="end">tt-fluid, QuietBox 2</text>
+<circle cx="774.3" cy="114" r="5" fill="var(--c1)" stroke="var(--bg)" stroke-width="2"/>
+<text class="v" x="912" y="118">-10.3</text>
+<text class="l" x="690" y="164" text-anchor="end">8x H100, 8 runs</text>
+<circle cx="875.7" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="825.1" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="843.6" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="826.0" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="790.8" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="826.0" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="839.3" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="849.0" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<text class="v" x="912" y="164">-3.7 to +30.3</text>
+<text class="l" x="690" y="210" text-anchor="end">B200</text>
+<circle cx="838.0" cy="206" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<text class="v" x="912" y="210">+15.2</text>
+<text class="ax" x="540" y="290">bench/nvidia/cdwindow.py and grade.py on results/; same potentialFoam start.</text>
+<text class="ax" x="540" y="306">Shaded: +-22 counts, the 2-sigma error of OpenFOAM's own window mean.</text>
+</g></svg>
