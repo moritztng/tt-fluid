@@ -17,12 +17,14 @@ every linear solve converged to 1e-13, so the comparison measures the discretisa
 | laminar SIMPLEC, face backend, 3 iterations | `test_laminar[face]` | 1e-9 | 1.4e-11 |
 | laminar SIMPLEC, device-layout backend, 3 iterations | `test_laminar[ell]` | 1e-9 | about 1e-11 |
 | wall distance (meshWave) | `test_wall_distance` | 1e-5 | 4.9e-6 |
+| k-omega SST iterations 2-3 from OpenFOAM's iteration-1 fields, both backends | `test_sst_from_openfoam_state` | 1e-8 | 5.8e-10 (nut), 5.4e-11 (k) |
 
-With k-omega SST, every SST step started from OpenFOAM's own state agrees to about 1e-9 to 1e-11 (k, omega, nut).
+With k-omega SST, a step started from OpenFOAM's own state agrees to about 1e-9 to 1e-11 (k, omega, nut); the test
+starts from OpenFOAM's fields after iteration 1 (`tests/data/sst_t1`) and checks iterations 2 and 3.
 The first step from the initial conditions does not agree yet: U and p match to 1e-13, but k differs by up to 2.6e-3
 and nut by up to 8.9e-3 in about 150 of the 12,225 cells. Those cells form a few contiguous runs about 13 mm above the
 lower wall, near where OpenFOAM bounds a negative omega on that step ("bounding omega, min: -3614"). The difference is
-local to the first step and is not yet explained, which is why the test suite does not yet hold an SST exactness test.
+local to the first step and is not yet explained, which is why the SST test starts after it.
 
 ## 2. The device against the emulator
 
