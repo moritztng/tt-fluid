@@ -23,7 +23,7 @@ Steady RANS is still most of the CFD that engineering teams run, and GPU ports o
 bandwidth. A Tenstorrent chip is a grid of more than a hundred small cores, each with its own SRAM, linked by a network on chip,
 and chips link to each other over Ethernet. tt-fluid keeps the whole iteration resident on that grid: each core owns a
 block of cells, exchanges halos with its neighbours directly, and never returns to the host inside a run. The result is
-a cheaper box doing the same job, with the accuracy checked against OpenFOAM at every step.
+a cheaper box doing the same job, with its accuracy checked against OpenFOAM.
 
 ## Results
 
@@ -57,7 +57,9 @@ from the same start ([method](docs/accuracy.md)):
 | SPUMA SPDP, B200 | 0.42268 | +15.2 counts | `bench/nvidia/grade.py` |
 
 Over a longer window (iterations 101-1900) the Tenstorrent run's Cd is 0.42060, 12.8 counts below OpenFOAM over the same
-iterations. Lift agrees to within 3 counts.
+iterations. Lift agrees to within 3 counts. Against OpenFOAM's long-run mean (iterations 501-3372) instead, every
+window above is still partly transient and the Tenstorrent run is the furthest off, at -21 counts;
+[docs/accuracy.md](docs/accuracy.md) has all of it.
 
 ## Install
 
