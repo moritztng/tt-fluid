@@ -22,13 +22,15 @@ The emulator runs first (it is the slow part here: just under a second per itera
 line of the output is the result row, also appended to `ttfluid_runs.jsonl`. `rows` is the number of iterations run before residualControl stopped it.
 `vs_emu` compares the device with the emulator; it is small but not 0 (see [accuracy.md](accuracy.md)).
 
+On one p300 chip the device stopped at iteration 355 (2 chips: 400) and its fields lie within 0.4 % (U) and 0.8 % (p) of OpenFOAM v2412's converged solution ([accuracy.md](accuracy.md#2a-converged-pitzdaily-against-openfoam)).
+
 Without a card, run the same thing on the emulator alone:
 
 ```bash
 ttfluid check cases/pitzDaily -n 1000
 ```
 
-On our machine that took 323 s and ended at iteration 371 with initial residuals U 9.9e-4, p 1.7e-3, k 1.5e-4,
+On our machine the emulator took 323 s and ended at iteration 371 with initial residuals U 9.9e-4, p 1.7e-3, k 1.5e-4,
 omega 3.6e-4.
 
 ### Look at the result

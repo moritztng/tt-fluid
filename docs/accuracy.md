@@ -36,8 +36,9 @@ in the result row (`vs_emu.worst_rel` over the residual history, `vs_emu.state` 
 
 Measured for this release on one Blackhole p300 chip (AICLK 1350 MHz, stock `ttnn` 0.68.0 wheel, pitzDaily, k-omega
 SST): the first iteration agrees in U, p and k and in every solver iteration count, and the omega residual differs by
-4e-5. SIMPLE carries that forward: at iteration 2 the p residual differs by 5 % and one solve takes two more
-iterations, and after 300 iterations, still in the transient, the fields differ by up to 27 % (U, max-norm). The device itself is deterministic: two runs of the same case
+4e-5. SIMPLE carries such differences forward without amplifying them: after 300 iterations, still in the transient,
+the device's fields differ from the emulator's by 0.6 % in U, 2.8 % in p and 9 % in omega (max-norm, relative to the
+field's largest value), and both converge to the same solution (section 2a). The device itself is deterministic: two runs of the same case
 gave bitwise identical fields and histories, and so did the stock wheel and a custom ttnn 0.68.0 build. The emulator is
 therefore the reference for what the program computes, and the
 answer is graded against OpenFOAM on the device's own output (section 3). The emulator itself is regression-tested in
@@ -45,6 +46,23 @@ answer is graded against OpenFOAM on the device's own output (section 3). The em
 
 The two partitions give different numbers: after 3 pitzDaily iterations the 1-chip and 2-chip residuals differ by about
 1 %. That is fp32 summation order, not an error. Each partition is deterministic, run after run.
+
+## 2a. Converged pitzDaily against OpenFOAM
+
+The comparison that matters is the converged answer. OpenFOAM v2412 (simpleFoam, kOmegaSST, fp64) stops pitzDaily by
+residualControl at iteration 381. `ttfluid run cases/pitzDaily -n 1000 --no-check --write DIR` on the same case stops
+at iteration 355 on one p300 chip and at 400 on two (AICLK 1350 MHz); the emulator stops at 371. Differences of the
+converged cell fields to OpenFOAM, relative to the field's largest value:
+
+| run | U max / rms | p max / rms | k rms | omega rms | nut rms |
+|---|---|---|---|---|---|
+| device, 1 chip (355 its) | 0.40 % / 0.03 % | 0.76 % / 0.37 % | 0.09 % | 0.11 % | 0.18 % |
+| device, 2 chips (400 its) | 0.46 % / 0.05 % | 1.6 % / 0.90 % | 0.16 % | 0.11 % | 0.26 % |
+| emulator (371 its) | 0.71 % / 0.09 % | 3.1 % / 1.7 % | 0.24 % | 0.03 % | 0.39 % |
+
+The largest single-cell omega and nut differences (up to 10 % and 9 %) sit in the few near-wall cells where omega is
+largest; their rms is the column above. All three runs stop at a residual level of 1e-3, so differences of this size
+are what the convergence criterion leaves open, not what the arithmetic adds.
 
 ## 3. Drag and lift against OpenFOAM fp64 (HPC_motorbike Small)
 
