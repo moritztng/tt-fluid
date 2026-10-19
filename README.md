@@ -84,11 +84,13 @@ and the turbulence model set to k-omega SST.
 ```bash
 ttfluid check cases/pitzDaily -n 3                 # CPU emulator only, no card: ~5 s
 ttfluid run cases/pitzDaily -n 300 --chips 1 --write out/pitzDaily    # ~4 min
-ttfluid run cases/pitzDaily -n 300 --chips 2       # both chips of a p300 board, ~6 min
+ttfluid run cases/pitzDaily -n 300 --chips 2       # both chips of a p300 board, ~7 min
 ```
 
 Almost all of that time is the CPU emulator, which `run` executes first as a reference: on a p300 the device part of
-the one-chip run takes 3.5 s, compile included. Add `--no-check` to skip the emulator.
+the one-chip run takes 3.5 s, compile included. Add `--no-check` to skip the emulator. Run to convergence (`-n 1000`; residualControl stops it at iteration 355 on one
+chip), the device's fields lie within 0.4 % (U) and 0.8 % (p) of OpenFOAM v2412's converged solution
+([accuracy.md](docs/accuracy.md#2a-converged-pitzdaily-against-openfoam)).
 
 `run` first runs the emulator, then the device, and records both in `ttfluid_runs.jsonl`; the `vs_emu` entry of that
 row is the largest relative difference between the two residual histories. It is small but not 0: the chip's vector unit
@@ -118,7 +120,7 @@ in [docs/architecture.md](docs/architecture.md).
 
 ```bash
 pip install -e '.[dev]'
-pytest -q          # 33 tests, about a minute, CPU only
+pytest -q          # 34 tests, about a minute, CPU only
 ```
 
 The tests compare the solver against stored OpenFOAM v2412 results on pitzDaily (mesh geometry to 1e-12, laminar
