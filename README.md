@@ -70,7 +70,8 @@ Python 3.10 or newer, Linux x86-64. On a machine with Tenstorrent cards (driver 
 git clone https://github.com/moritztng/tt-fluid.git
 cd tt-fluid
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e '.[tenstorrent]'      # pulls ttnn 0.68.0 (and torch) from PyPI; about a minute
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu   # CPU torch, ~200 MB
+pip install -e '.[tenstorrent]'      # adds ttnn 0.68.0 from PyPI
 ```
 
 Without a card, `pip install -e .` is enough to run the emulator and the tests.

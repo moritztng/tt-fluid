@@ -21,8 +21,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# The device runner needs ttnn (and the torch it brings); tested with the ttnn 0.68.0 wheel.
-tenstorrent = ["ttnn==0.68.0"]
+# The device runner needs ttnn and torch (ttnn moves tensors through torch; its wheel does not depend on it).
+# Tested with the ttnn 0.68.0 wheel and torch 2.8.0 (CPU build).
+tenstorrent = ["ttnn==0.68.0", "torch>=2.4"]
 large = ["cloudpickle", "zstandard"]
 dev = ["pytest>=8", "ruff>=0.6"]
 

@@ -14,7 +14,8 @@
 git clone https://github.com/moritztng/tt-fluid.git
 cd tt-fluid
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e '.[tenstorrent]'      # with a card: adds ttnn 0.68.0 and torch
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu   # with a card: CPU torch first
+pip install -e '.[tenstorrent]'      # with a card: adds ttnn 0.68.0
 # pip install -e .                   # without a card: emulator and tests only
 ```
 
@@ -91,7 +92,8 @@ the [tutorial](tutorial.md).
 
 ## Troubleshooting
 
-- **`ModuleNotFoundError: ttnn`**: install with `pip install -e '.[tenstorrent]'`.
+- **`ModuleNotFoundError: ttnn`** or **`torch`**: install with `pip install -e '.[tenstorrent]'`. Install the CPU
+  build of torch first (as above), or pip fetches the much larger CUDA build.
 - **The run exits with status 3 and `abort.cores` > 0**: some cores gave up on a bounded wait, and the program ended
   without hanging the chip. Reset the card (`tt-smi -r`) and rerun. If it repeats, open an issue with the log.
 - **Unsupported boundary condition**: the run stops while reading the case. Open an issue with the patch type; most
