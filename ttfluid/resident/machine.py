@@ -1894,13 +1894,15 @@ class Machine:
                         if a != b and ((not self.span_homes and not (self.space[a] is SCRATCH and self.space[b] is SCRATCH))
                                        or not (span[a][1] <= span[b][0] or span[b][1] <= span[a][0])):
                             adj[a].add(b)
-        # a gather between two spaces never runs in place: N writes destination lanes while it still reads source
-        # lanes, and two spaces' lane maps overlap (a multigrid prolongation amg1 -> cells into its own source tile
-        # overwrote aggregates before reading them; MachineEmu builds the result aside and could not see it)
+        # a gather never runs in place: N writes destination lanes while it still reads source lanes. Between two
+        # spaces the lane maps overlap (a multigrid prolongation amg1 -> cells overwrote aggregates before reading
+        # them); within one space a neighbour permutation does the same (a cells -> cells gather whose source died at
+        # it took the source's tile once _lsched moved its consumer up, and pitzDaily stalled on the device). The
+        # emulator builds the result aside, so only this rule keeps the two apart
         for ins in mir:
             if ins[0] == "gather":
                 for src, _ in ins[3]:
-                    if src != ins[1] and self.space[src] is not self.space[ins[1]]:
+                    if src != ins[1]:
                         adj[ins[1]].add(src)
                         adj[src].add(ins[1])
         # everything live at entry (preloaded consts, state, masks) is live together
@@ -1938,6 +1940,8 @@ class Machine:
                 self.vsize0.append(n)
         voff = np.concatenate([[0], np.cumsum(self.vsize0)]).astype(int)
         phys = {r: (nsmall + int(voff[gid[cls(r), c]]) if pool(r) else c) for r, c in slot.items()}
+        assert not [i[1] for i in mir if i[0] == "gather" for x, _ in i[3] if x != i[1] and phys[x] == phys[i[1]]], \
+            "a gather shares a tile with its source"
         self.ntiles = nsmall + int(voff[-1])
         self.nsmall, self.nvec = nsmall, len(self.vsize0)
         self.vslots = [(nsmall + int(o), n) for o, n in zip(voff, self.vsize0)]
