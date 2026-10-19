@@ -11,7 +11,7 @@ Steady incompressible SIMPLE/SIMPLEC (simpleFoam) with k-omega SST on the device
 See the README's limitations for boundary conditions.
 
 **Do I need a Tenstorrent card to try it?**
-No. `pip install -e .` and `ttfluid check` run the exact device program on a CPU emulator. It is slow (about a second
+No. `pip install -e .` and `ttfluid check` run the device program on a CPU emulator. It is slow (about a second
 per pitzDaily iteration). It runs the same instruction streams as the chip and follows it closely, not bit for bit (the chip
 approximates division and the elementary functions); see [accuracy.md](accuracy.md).
 

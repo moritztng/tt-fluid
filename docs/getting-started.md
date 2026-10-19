@@ -19,7 +19,7 @@ pip install -e '.[tenstorrent]'      # with a card: adds ttnn 0.68.0
 # pip install -e .                   # without a card: emulator and tests only
 ```
 
-On our test machine (fresh venv, packages cached by pip) the install took 32 s.
+On a QuietBox 2 (fresh venv, packages already in pip's cache) the device install took 31 s.
 
 ## First run without hardware
 
@@ -54,7 +54,8 @@ How to read it:
 ttfluid run cases/pitzDaily -n 300 --chips 1 --write out/pitzDaily
 ```
 
-This runs the emulator, then the device, then writes the final fields into `out/pitzDaily/<N>/`, N being the number of iterations
+This runs the emulator (about 3.5 minutes on one CPU core), then the device (3.5 s on a p300 chip at 1350 MHz,
+compile included), then writes the final fields into `out/pitzDaily/<N>/`, N being the number of iterations
 run, inside a copy of the case. Open `out/pitzDaily` in ParaView, or run any OpenFOAM utility on it.
 
 Each run appends one JSON row to `ttfluid_runs.jsonl` (`--out` to change). Useful keys:

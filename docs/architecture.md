@@ -14,7 +14,7 @@ ttfluid.solver.SimpleFoam        SIMPLE/SIMPLEC + k-omega SST, numpy, fp64 or fp
    v
 ttfluid.resident.machine         partition cells over chips and cores (RCB), schedule, lower to per-core MIR
    │  ttfluid.resident.encode    three uint32 instruction streams per core + constant tables
-   ├─> ttfluid.resident.memu     CPU emulator: the exact reference of the device run
+   ├─> ttfluid.resident.memu     CPU emulator: the reference of the device run (not bitwise)
    v
 ttfluid.device.run_mesh          ttnn generic_op: kernels/vm_{brisc,ncrisc,compute}.cpp, one persistent program per core
    │                             loops over SIMPLE iterations on the device, stops on residualControl or the cap

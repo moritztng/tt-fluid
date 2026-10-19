@@ -76,15 +76,18 @@ pip install -e '.[tenstorrent]'      # adds ttnn 0.68.0 from PyPI
 
 Without a card, `pip install -e .` is enough to run the emulator and the tests.
 
-## Quickstart (5 minutes)
+## Quickstart (about 10 minutes)
 
 The repository ships OpenFOAM's pitzDaily tutorial (a backward-facing step, 12,225 cells) with its mesh already built.
 
 ```bash
 ttfluid check cases/pitzDaily -n 3                 # CPU emulator only, no card: ~5 s
-ttfluid run cases/pitzDaily -n 300 --chips 1 --write out/pitzDaily
-ttfluid run cases/pitzDaily -n 300 --chips 2       # both chips of a p300 board
+ttfluid run cases/pitzDaily -n 300 --chips 1 --write out/pitzDaily    # ~4 min
+ttfluid run cases/pitzDaily -n 300 --chips 2       # both chips of a p300 board, ~6 min
 ```
+
+Almost all of that time is the CPU emulator, which `run` executes first as a reference: on a p300 the device part of
+the one-chip run takes 3.5 s, compile included. Add `--no-check` to skip the emulator.
 
 `run` first runs the emulator, then the device, and records both in `ttfluid_runs.jsonl`; the `vs_emu` entry of that
 row is the largest relative difference between the two residual histories. It is small but not 0: the chip's vector unit
