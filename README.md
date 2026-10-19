@@ -112,11 +112,11 @@ in [docs/architecture.md](docs/architecture.md).
 
 ```bash
 pip install -e '.[dev]'
-pytest -q          # 31 tests, ~20 s, CPU only
+pytest -q          # 33 tests, about a minute, CPU only
 ```
 
 The tests compare the solver against stored OpenFOAM v2412 results on pitzDaily (mesh geometry to 1e-12, laminar
-SIMPLE to 1e-9, wall distance to 1e-5) and run the emulator on one and two chips. CI runs them on Python 3.10 and 3.12
+SIMPLE to 1e-9, wall distance to 1e-5, k-omega SST from OpenFOAM's own first-iteration state to 1e-8) and run the emulator on one and two chips. CI runs them on Python 3.10 and 3.12
 with `ruff` and a full-history `gitleaks` scan.
 
 ## Limitations
@@ -128,8 +128,8 @@ with `ruff` and a full-history `gitleaks` scan.
 - The device works in fp32. Results differ from OpenFOAM's fp64 at the level shown in the accuracy table, and a
   one-chip run differs from a two-chip run by about 1 % in residuals after 3 iterations because the partition changes
   the order of fp32 sums. Each partition is deterministic.
-- On pitzDaily the first SST iteration agrees with OpenFOAM v2412 to about 1e-2 in k and omega (all later steps,
-  started from OpenFOAM's own state, agree to about 1e-9); see [docs/accuracy.md](docs/accuracy.md).
+- On pitzDaily the first SST iteration agrees with OpenFOAM v2412 to about 1e-2 in k and omega (the next steps,
+  started from OpenFOAM's own state, agree to better than 1e-9 and are tested); see [docs/accuracy.md](docs/accuracy.md).
 - Lowering a case of several million cells takes host RAM: about 220 GB for HPC_motorbike Small.
 - Tested with the ttnn 0.68.0 wheel. This release was verified on a Blackhole p300 board; the same device program ran
   on Blackhole p150 cards and a Wormhole Galaxy during development.
