@@ -79,7 +79,8 @@ def main(argv=None):
     r = ["case", str(a.iterations), "--case", str(case), "--arch", a.arch, "--mesh", mesh_shape(a.chips),
          "--out", a.out, "--runs", "1", *SRAM]
     if a.chips == 2 and a.arch == "bh":
-        r += ["--gw", "1"]
+        # a p300 board links its two chips with Ethernet links 0 and 1: halos on 0, the reductions on 1
+        r += ["--gw", "1", "--links", "0", "--rlink", "1"]
     if a.cmd == "check":
         r.append("--emuonly")
     else:
