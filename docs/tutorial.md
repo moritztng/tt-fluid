@@ -17,8 +17,8 @@ omega 1e-3). The device evaluates the same test after every iteration, so give i
 ttfluid run cases/pitzDaily -n 1000 --chips 1 --write out/pitzDaily
 ```
 
-The emulator runs first (it is the slow part here: about 1.3 s per iteration on one CPU core), then the device. The last
-line of the output is the result row, also appended to `ttfluid_runs.jsonl`. `rows` is the number of iterations run.
+The emulator runs first (it is the slow part here: just under a second per iteration on one CPU core), then the device. The last
+line of the output is the result row, also appended to `ttfluid_runs.jsonl`. `rows` is the number of iterations run: on one chip, residualControl stops the run after 371 iterations.
 `vs_emu.worst_rel` should be 0.
 
 Without a card, run the same thing on the emulator alone:
@@ -26,6 +26,9 @@ Without a card, run the same thing on the emulator alone:
 ```bash
 ttfluid check cases/pitzDaily -n 1000
 ```
+
+On our machine that took 323 s and ended at iteration 371 with initial residuals U 9.9e-4, p 1.7e-3, k 1.5e-4,
+omega 3.6e-4.
 
 ### Look at the result
 
