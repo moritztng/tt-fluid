@@ -15,8 +15,9 @@ ruff check . && pytest -q          # what CI runs, ~20 s
 
 1. **The solver stays OpenFOAM's.** A change to `ttfluid/solver` keeps the tests in `tests/test_vs_openfoam.py` green.
    A new feature (a boundary condition, a scheme) comes with a reference from OpenFOAM v2412 on a small case.
-2. **The device matches the emulator bit for bit.** A change to the lowering, the encoding or the kernels keeps
-   `tests/test_emulator.py` green, and a device run of the changed program reports `vs_emu.worst_rel` 0.
+2. **The device follows the emulator.** A change to the lowering, the encoding or the kernels keeps
+   `tests/test_emulator.py` green, and a device run of the changed program (`ttfluid run cases/pitzDaily -n 3`) reports
+   a `vs_emu.worst_rel` no larger than before the change.
 3. **A performance change says what it does to the answer.** Either the final state is bitwise unchanged (say so and
    how you checked), or the change is graded like any other: windowed Cd/Cl against OpenFOAM, `bench/nvidia/cdwindow.py`.
 4. **Every number has its data.** A claim in the docs points at a script and the raw files it reads, with the chip clock

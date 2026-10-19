@@ -2,8 +2,8 @@
 
 tt-fluid has three layers. A numpy solver defines the discretisation, a register machine turns one SIMPLE iteration of
 that solver into a program for every core, and a persistent device kernel runs the program. The CPU emulator of that
-program is the bridge between the two worlds: it is checked against the numpy solver, and the device must reproduce it
-bit for bit.
+program is the bridge between the two worlds: it is checked against the numpy solver, and every device run is compared
+with it.
 
 ```
 OpenFOAM case

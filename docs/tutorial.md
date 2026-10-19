@@ -18,8 +18,8 @@ ttfluid run cases/pitzDaily -n 1000 --chips 1 --write out/pitzDaily
 ```
 
 The emulator runs first (it is the slow part here: just under a second per iteration on one CPU core), then the device. The last
-line of the output is the result row, also appended to `ttfluid_runs.jsonl`. `rows` is the number of iterations run: on one chip, residualControl stops the run after 371 iterations.
-`vs_emu.worst_rel` should be 0.
+line of the output is the result row, also appended to `ttfluid_runs.jsonl`. `rows` is the number of iterations run before residualControl stopped it.
+`vs_emu` compares the device with the emulator; it is small but not 0 (see [accuracy.md](accuracy.md)).
 
 Without a card, run the same thing on the emulator alone:
 

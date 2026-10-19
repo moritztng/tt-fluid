@@ -67,7 +67,7 @@ Each run appends one JSON row to `ttfluid_runs.jsonl` (`--out` to change). Usefu
 | `written` | where `--write` put the fields |
 | `walls` | wall time of the device run, seconds |
 | `aiclk` | the chip clock read during the run, per chip (min, max) |
-| `vs_emu` | device against emulator: `worst_rel` over the residual history and `state` per field; 0 means bitwise equal |
+| `vs_emu` | device against emulator: `worst_rel` over the residual history and `state` per field (max-norm, relative); small, not 0 ([accuracy.md](accuracy.md)) |
 
 Other options:
 

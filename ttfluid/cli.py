@@ -5,7 +5,7 @@
 
 Both commands lower the case the same way and hand it to ttfluid.device.run_mesh (every runner flag passes through
 after `--`). `run` executes on the device and, unless --no-check, first runs the CPU emulator, which is the exact
-reference of the device program: the two must agree bitwise. `check` runs the emulator only and needs no card.
+reference of the device program (close to the device, not bitwise: the chip approximates division and the elementary functions). `check` runs the emulator only and needs no card.
 """
 import argparse
 import os

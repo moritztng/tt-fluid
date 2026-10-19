@@ -3,7 +3,7 @@
 Three questions, three kinds of check:
 
 1. Does the solver discretise like OpenFOAM? The numpy solver is checked against OpenFOAM v2412 field by field.
-2. Does the device run the program it was given? The device must match the CPU emulator of the same program bit for bit.
+2. Does the device run the program it was given? The device is compared with the CPU emulator of the same program.
 3. Is the fp32 answer good enough? Drag and lift of a motorbike are compared with OpenFOAM in fp64 over windows of iterations.
 
 ## 1. The solver against OpenFOAM v2412 (pitzDaily)
@@ -29,9 +29,17 @@ local to the first step and is not yet explained, which is why the SST test star
 ## 2. The device against the emulator
 
 `ttfluid.resident.memu` interprets the same instruction streams as the device kernels, with the same fp32 operations
-in the same order. `ttfluid run` runs it first and stores the largest relative difference to the device in the result
-row (`vs_emu.worst_rel` over the residual history, `vs_emu.state` per field). On the hardware used for this release the
-difference is 0. The emulator itself is regression-tested in `tests/test_emulator.py` on one and two chips.
+in the same order and the same fixed order for folding per-core partial sums. It is not bitwise: the chip's vector unit
+computes division, square roots, exp, log and tanh with its own approximations (`ttfluid/device/kernels/vm_compute.cpp`),
+the emulator with numpy. `ttfluid run` runs the emulator first and stores the largest relative difference to the device
+in the result row (`vs_emu.worst_rel` over the residual history, `vs_emu.state` per field, max-norm).
+
+Measured for this release on one Blackhole p300 chip (AICLK 1350 MHz, stock `ttnn` 0.68.0 wheel, pitzDaily, k-omega
+SST): the first iteration agrees in U, p and k and in every solver iteration count, and the omega residual differs by
+4e-5. SIMPLE carries that forward: at iteration 2 the p residual differs by 5 % and one solve takes two more
+iterations, and after 300 iterations, still in the transient, the fields differ by up to 27 % (U, max-norm). The emulator is therefore the reference for what the program computes, and the
+answer is graded against OpenFOAM on the device's own output (section 3). The emulator itself is regression-tested in
+`tests/test_emulator.py` on one and two chips.
 
 The two partitions give different numbers: after 3 pitzDaily iterations the 1-chip and 2-chip residuals differ by about
 1 %. That is fp32 summation order, not an error. Each partition is deterministic, run after run.

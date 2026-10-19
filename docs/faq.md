@@ -12,7 +12,8 @@ See the README's limitations for boundary conditions.
 
 **Do I need a Tenstorrent card to try it?**
 No. `pip install -e .` and `ttfluid check` run the exact device program on a CPU emulator. It is slow (about a second
-per pitzDaily iteration) but gives the same numbers, bit for bit, that the chip produces.
+per pitzDaily iteration). It runs the same instruction streams as the chip and follows it closely, not bit for bit (the chip
+approximates division and the elementary functions); see [accuracy.md](accuracy.md).
 
 **Why fp32? OpenFOAM runs in fp64.**
 The chip's vector unit works in fp32. On the benchmark case the drag coefficient is 10 counts (0.2 %) below OpenFOAM's fp64

@@ -6,8 +6,8 @@
 **tt-fluid runs OpenFOAM's steady incompressible solver (simpleFoam, k-omega SST) entirely on Tenstorrent chips.** It
 reads an ordinary OpenFOAM case directory and runs every SIMPLE iteration on the device: momentum assembly, the
 turbulence model, all four linear solves and the flux correction. It writes the fields back as OpenFOAM time directories.
-OpenFOAM is not needed at run time. The same program also runs on a CPU emulator, which reproduces the device result bit
-for bit and needs no hardware.
+OpenFOAM is not needed at run time. The same program also runs on a CPU emulator, which needs no hardware and follows the
+device closely but not bit for bit.
 
 On the OpenFOAM HPC benchmark's motorbike case (HPC_motorbike Small: 8.66 M cells, 800 SIMPLE iterations), a $9,999 Tenstorrent QuietBox 2
 costs **$0.115 per case, 2.34x less than an 8x H100 SXM server** running the GPU port of OpenFOAM (SPUMA) at its
@@ -87,7 +87,8 @@ ttfluid run cases/pitzDaily -n 300 --chips 2       # both chips of a p300 board
 ```
 
 `run` first runs the emulator, then the device, and records both in `ttfluid_runs.jsonl`; the `vs_emu` entry of that
-row is the largest relative difference between the two (0 when they agree bitwise). `--write` puts the final U, p, k,
+row is the largest relative difference between the two residual histories. It is small but not 0: the chip's vector unit
+computes division, square roots and exp/log/tanh with its own approximations, the emulator with numpy ([accuracy.md](docs/accuracy.md)). `--write` puts the final U, p, k,
 omega and nut into a copy of the case that ParaView or any OpenFOAM tool can open. Wormhole cards take `--arch wh`.
 The [getting-started guide](docs/getting-started.md) walks through the output line by line; the
 [tutorial](docs/tutorial.md) goes from pitzDaily to the motorbike run behind the table above.
@@ -100,7 +101,7 @@ OpenFOAM case ──> ttfluid.solver  (SimpleFoam in numpy: the reference discre
                      v
                   ttfluid.resident (program: a register machine; partition cells over cores and chips;
                      │              lower and encode into three instruction streams per core)
-                     ├──> CPU emulator (memu): bitwise reference of the device run
+                     ├──> CPU emulator (memu): reference of the device run, to fp32 rounding
                      v
                   ttfluid.device   (one persistent kernel per core interprets the streams; halos over the NoC
                                     and the chip-to-chip Ethernet fabric; fields return at the end)
