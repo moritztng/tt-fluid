@@ -24,5 +24,9 @@ First public release.
 - `pip install -e '.[tenstorrent]'` now installs torch: the ttnn 0.68.0 wheel does not depend on it, and the device
   runner needs it.
 - `ttfluid run --chips 2` on a p300 uses Ethernet links 0 and 1; the Wormhole default asked for link 3 and failed.
+- pitzDaily did not converge on the device: the register allocator could place a neighbour gather's result on the
+  tile it was still reading from, which the emulator cannot see. A gather's result now never shares a tile with a
+  source, and lowering asserts it.
+- A case whose `turbulenceProperties` selects a model other than kOmegaSST is refused; it used to run as SST.
 
 [0.1.0]: https://github.com/moritztng/tt-fluid/releases/tag/v0.1.0
