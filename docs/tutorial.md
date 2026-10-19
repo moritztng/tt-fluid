@@ -6,7 +6,8 @@ recipe behind the cost table in the README: an 8.66 M-cell motorbike on a QuietB
 ## Part 1: pitzDaily
 
 pitzDaily is a backward-facing step: air enters at 10 m/s on the left, separates at the step and reattaches
-downstream. The shipped case is OpenFOAM v2412's tutorial, unchanged, with the 12,225-cell blockMesh mesh included.
+downstream. The shipped case is OpenFOAM v2412's tutorial with the turbulence model set to kOmegaSST (the tutorial selects
+kEpsilon), and with the 12,225-cell blockMesh mesh included.
 
 ### Run to convergence
 

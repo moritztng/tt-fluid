@@ -93,6 +93,20 @@ class Case:
 
 # ---- the solver ------------------------------------------------------------------------------------------------
 
+def turbulence_model(case):
+    """The RAS model a case asks for (constant/turbulenceProperties or momentumTransport), or 'laminar'."""
+    from . import foamio
+    for name in ("turbulenceProperties", "momentumTransport"):
+        f = Path(case) / "constant" / name
+        if f.exists():
+            d = foamio.read_dict(f)
+            if d.get("simulationType", ["RAS"])[0] != "RAS":
+                return d["simulationType"][0]
+            ras = d.get("RAS", d)
+            return (ras.get("RASModel") or ras.get("model") or ["?"])[0]
+    return "laminar"
+
+
 class SimpleFoam:
     """simpleFoam on a chosen operator backend: backend='face' (OpenFOAM's face loops, fp64 oracle) or 'ell' (the
     device form, fp64 or fp32)."""
@@ -127,6 +141,10 @@ class SimpleFoam:
         self.nu = float(nu[-1]) if isinstance(nu, list) else float(nu)
         self.turb = None
         if turbulence:
+            model = turbulence_model(self.case.path)
+            if model != "kOmegaSST":
+                raise ValueError(f"{self.case.path}: constant/turbulenceProperties asks for {model}; tt-fluid implements "
+                                 "RAS kOmegaSST only (set RASModel kOmegaSST, with 0/k, 0/omega and 0/nut)")
             from .turbulence import KOmegaSST
             self.turb = KOmegaSST(m, self.U, self.nu, self.case.path, ops=self.ops,
                                   relax={n: self.case.relax(n) for n in ("k", "omega")},

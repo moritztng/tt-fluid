@@ -8,7 +8,7 @@ Three questions, three kinds of check:
 
 ## 1. The solver against OpenFOAM v2412 (pitzDaily)
 
-The references in `tests/data/pitzDaily_v2412.npz` come from OpenFOAM v2412 runs of the stock pitzDaily tutorial with
+The references in `tests/data/pitzDaily_v2412.npz` come from OpenFOAM v2412 runs of the pitzDaily tutorial (k-omega SST, as shipped in `cases/`) with
 every linear solve converged to 1e-13, so the comparison measures the discretisation and not solver tolerances.
 
 | check | test | tolerance | measured |
@@ -37,7 +37,9 @@ in the result row (`vs_emu.worst_rel` over the residual history, `vs_emu.state` 
 Measured for this release on one Blackhole p300 chip (AICLK 1350 MHz, stock `ttnn` 0.68.0 wheel, pitzDaily, k-omega
 SST): the first iteration agrees in U, p and k and in every solver iteration count, and the omega residual differs by
 4e-5. SIMPLE carries that forward: at iteration 2 the p residual differs by 5 % and one solve takes two more
-iterations, and after 300 iterations, still in the transient, the fields differ by up to 27 % (U, max-norm). The emulator is therefore the reference for what the program computes, and the
+iterations, and after 300 iterations, still in the transient, the fields differ by up to 27 % (U, max-norm). The device itself is deterministic: two runs of the same case
+gave bitwise identical fields and histories, and so did the stock wheel and a custom ttnn 0.68.0 build. The emulator is
+therefore the reference for what the program computes, and the
 answer is graded against OpenFOAM on the device's own output (section 3). The emulator itself is regression-tested in
 `tests/test_emulator.py` on one and two chips.
 

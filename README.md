@@ -78,7 +78,8 @@ Without a card, `pip install -e .` is enough to run the emulator and the tests.
 
 ## Quickstart (about 10 minutes)
 
-The repository ships OpenFOAM's pitzDaily tutorial (a backward-facing step, 12,225 cells) with its mesh already built.
+The repository ships OpenFOAM's pitzDaily tutorial (a backward-facing step, 12,225 cells) with its mesh already built
+and the turbulence model set to k-omega SST.
 
 ```bash
 ttfluid check cases/pitzDaily -n 3                 # CPU emulator only, no card: ~5 s

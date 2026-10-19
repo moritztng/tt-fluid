@@ -100,3 +100,16 @@ def test_verbatim_code_block():
     d = parse_dict_text('f { a { type coded; codeData #{ int x; struct s { int y; }; #}; } b { type forces; n 2; } }')
     assert list(d["f"]) == ["a", "b"] and d["f"]["b"]["n"] == ["2"]
     assert d["f"]["a"]["codeData"] == ["#{ int x; struct s { int y; }; #}"]
+
+
+def test_refuses_other_turbulence_models(tmp_path):
+    """A case that asks for a model tt-fluid does not implement is refused, not silently run as k-omega SST."""
+    import shutil
+
+    from ttfluid.solver.simple import SimpleFoam
+    case = tmp_path / "pitzDaily"
+    shutil.copytree(Path(__file__).parents[1] / "cases" / "pitzDaily", case)
+    tp = case / "constant" / "turbulenceProperties"
+    tp.write_text(tp.read_text().replace("kOmegaSST", "kEpsilon"))
+    with pytest.raises(ValueError, match="kEpsilon"):
+        SimpleFoam(case)
