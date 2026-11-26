@@ -43,10 +43,14 @@ cp system/fvSolution.fixedTol system/fvSolution
 sed -i -e "s/^nCores .*/nCores              $NP;/" -e "s/^decompositionMethod .*/decompositionMethod scotch;/" \
   system/include/caseDefinition
 
-# 4. Initial state, as the case's Allrun: potentialFoam, then a boundary layer in U, k, omega
+# 4. Initial state, as the case's Allrun: potentialFoam, then a boundary layer in U. The potential solve is converged
+#    fully (the reference Cd history starts from this state), not to the case's relTol 0.01.
 cp -r 0.orig 0
 run decomposePar decomposePar -force
+cp system/fvSolution system/fvSolution.run
+for e in tolerance:1e-10 relTol:0 maxIter:5000; do foamDictionary -entry "solvers.Phi.${e%%:*}" -set "${e#*:}" system/fvSolution >/dev/null; done
 run potentialFoam mpirun -np "$NP" potentialFoam -initialiseUBCs -parallel
+mv system/fvSolution.run system/fvSolution
 run applyBoundaryLayer mpirun -np "$NP" applyBoundaryLayer -ybl 0.0450244 -parallel
 rm -rf 0; run reconstructPar reconstructPar -withZero -time 0
 rm -rf processor*

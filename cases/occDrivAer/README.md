@@ -13,13 +13,14 @@ the 65 M case's own (`fvSolution.fixedTol`); only the mesh is coarser.
 Needs OpenFOAM v2412 in the environment, git, and about 40 GB of free RAM for snappyHexMesh.
 
 ```bash
-cases/occDrivAer/setup.sh work 8     # 8 MPI ranks; writes work/occDrivAer, about 15 minutes
+cases/occDrivAer/setup.sh work 8     # 8 MPI ranks; writes work/occDrivAer in about 4 minutes
 ```
 
 The script clones the committee repository at a pinned commit, writes a snappyHexMesh case from the
 `occDrivAerRotMesh` meshing dicts with every refinement level four steps coarser (`coarsen.py` lists each change),
 meshes it, copies the static case's dicts onto that mesh, and initialises the fields as the case's `Allrun` does
-(`potentialFoam -initialiseUBCs`, then `applyBoundaryLayer`). Lower and run `work/occDrivAer` like the motorbike case in
+(`potentialFoam -initialiseUBCs`, solved to 1e-10, then `applyBoundaryLayer`). With 8 ranks the result is bit-identical, mesh and
+fields, to the starting state of the reference OpenFOAM run. Lower and run `work/occDrivAer` like the motorbike case in
 the [tutorial](../../docs/tutorial.md); a single Blackhole chip holds it.
 
 ## Licence
