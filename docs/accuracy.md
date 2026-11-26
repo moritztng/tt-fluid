@@ -85,7 +85,7 @@ Over iterations 101-1900 the Tenstorrent run gives Cd 0.42060, 12.8 counts below
 Lift (Cl) agrees within 3 counts in both windows.
 
 Against OpenFOAM's long-run mean instead (its iterations 501-3372, Cd 0.42226), iterations 101-800 are still partly
-transient for every run: tt-fluid is -21.3 counts (2 sigma 11.6), the eight H100 runs -14.7 to +19.3, the B200 +4.2.
+transient for every run: tt-fluid is -21.4 counts (2 sigma 11.9), the eight H100 runs -14.7 to +19.3, the B200 +4.2.
 On that comparison the Tenstorrent run is the furthest from OpenFOAM. The last line `cdwindow.py` prints applies a
 3-count target to it, which this run does not meet.
 
@@ -97,8 +97,8 @@ Reproduce:
 
 ```bash
 Q=results/tenstorrent/quietbox2-p300x4; O=results/openfoam
-python3 bench/nvidia/cdwindow.py --dev $Q/qb2k2_D1A.hist.json:1 --of $O/of1k.dat $O/of4k.dat --from 101 --to 800
-python3 bench/nvidia/cdwindow.py --dev $Q/qb2k2_D1A.hist.json:1 $Q/qb2k2_D2A.hist.json:801 --of $O/of1k.dat $O/of4k.dat --from 101 --to 1900
+python3 bench/nvidia/cdwindow.py --dev $Q/qb2k2_D1A.hist.json:0 --of $O/of1k.dat $O/of4k.dat --from 101 --to 799
+python3 bench/nvidia/cdwindow.py --dev $Q/qb2k2_D1A.hist.json:0 $Q/qb2k2_D2A.hist.json:800 --of $O/of1k.dat $O/of4k.dat --from 101 --to 1899
 for g in 0 1 2 3 4 5 6 7; do python3 bench/nvidia/grade.py --of $O/of1k.dat $O/of4k.dat --to 800 \
     --run results/nvidia/dgx-h100/A_SPDP_g$g/coefficient.dat; done
 ```
