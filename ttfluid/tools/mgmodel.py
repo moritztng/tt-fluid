@@ -58,10 +58,11 @@ def pairwise(A, core, rounds=12):
     for _ in range(rounds):
         if not len(i):
             break
-        order = np.lexsort((w, i))
-        io = i[order]
-        last = np.flatnonzero(np.r_[io[1:] != io[:-1], True])
-        bi, bj = io[last], j[order][last]
+        start = np.flatnonzero(np.r_[True, i[1:] != i[:-1]])           # the entries stay grouped by row
+        top = np.repeat(np.maximum.reduceat(w, start), np.diff(np.r_[start, len(i)]))
+        hit = np.flatnonzero(w == top)
+        hit = hit[np.r_[True, i[hit][1:] != i[hit][:-1]]]              # one per row
+        bi, bj = i[hit], j[hit]
         best = np.full(n, -1, np.int64)
         best[bi] = bj
         mutual = bi[best[bj] == bi]
