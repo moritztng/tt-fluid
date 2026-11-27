@@ -12,6 +12,9 @@ polyMesh alone, so the census needs no lowering. An order is SLOTS/LANES:
            geo    face count, then refinement level and integer position of the cell centre on that level's grid
            topo   face count, then coordinates propagated through opposite faces of cells that have exactly one face per
                   direction, each connected piece ordered with its longest extent fastest
+           box[q][:FILL[:NMIN]]  the pieces of topo cut into boxes filled to FILL (0.9), each laid out as the full
+                  lattice of its bounding box with unused lanes at the holes; boxq deals a box out as four interleaved
+                  quarters so that its shifts are multiples of 4 lanes
 
 A slot entry is one (cell, slot): local (the neighbour is on the same core), halo, or boundary. For every core, slot and
 destination tile the census takes the most common shift `src lane - destination lane` of its local entries (REGULAR),
@@ -150,6 +153,119 @@ def topo_keys(rows, other, dc, own, nC, P, log):
     return [k0, k1, k2, k3]
 
 
+def boxes(X, fill, nmin):
+    """Split integer points X (n, 3) into boxes: a set whose tight bounding box is filled to `fill` is a box, any other
+    is cut by the plane (any axis) that leaves the two smallest bounding boxes, the median plane of the longest axis
+    when no plane shrinks them. Sets under nmin points that do not fill their box are left loose. Returns a list of
+    (index array, lo, dims) and the loose indices."""
+    out, loose, stack = [], [], [np.arange(len(X))]
+    while stack:
+        idx = stack.pop()
+        x = X[idx]
+        lo, hi = x.min(0), x.max(0)
+        dims = hi - lo + 1
+        vol = int(dims.prod())
+        if len(idx) >= fill * vol:
+            out.append((idx, lo, dims))
+            continue
+        if len(idx) < nmin:
+            loose.append(idx)
+            continue
+        best = None
+        for a in range(3):
+            if dims[a] < 2:
+                continue
+            o = np.argsort(x[:, a], kind="stable")
+            xs = x[o]
+            cut = np.flatnonzero(xs[1:, a] != xs[:-1, a]) + 1          # left = xs[:c], right = xs[c:]
+            if not len(cut):
+                continue
+            pmin, pmax = np.minimum.accumulate(xs, 0), np.maximum.accumulate(xs, 0)
+            smin, smax = np.minimum.accumulate(xs[::-1], 0)[::-1], np.maximum.accumulate(xs[::-1], 0)[::-1]
+            v = (pmax[cut - 1] - pmin[cut - 1] + 1).prod(1) + (smax[cut] - smin[cut] + 1).prod(1)
+            k = int(np.argmin(v))
+            if best is None or v[k] < best[0]:
+                best = (int(v[k]), o, int(cut[k]))
+        if best is None or best[0] >= vol:      # a hole inside: halve the longest axis
+            a = int(np.argmax(dims))
+            o = np.argsort(x[:, a], kind="stable")
+            xs = x[o, a]
+            cut = np.flatnonzero(xs[1:] != xs[:-1]) + 1
+            c = int(cut[np.argmin(np.abs(cut - len(idx) // 2))])
+            best = (vol, o, c)
+        _, o, c = best
+        stack.append(idx[o[:c]])
+        stack.append(idx[o[c:]])
+    return out, (np.concatenate(loose) if loose else np.zeros(0, np.int64))
+
+
+def box_lanes(comp, xyz, own, fc, P, log, fill=0.9, nmin=64, quarter=False):
+    """Lanes of a padded box layout. Per core: the cells with more than six faces first (widest first), then every
+    box of every piece as a full lattice of its bounding box, longest extent fastest, a hole being a lane no cell
+    uses, then the other cells. Inside a box every neighbour along an axis is one constant lane shift away.
+    quarter: a box's positions are dealt out as four interleaved quarters (lane 4 * (m % q) + m // q), so every shift
+    inside a quarter is a multiple of 4 lanes. Returns the lane of every cell and the lanes used per core."""
+    nC = len(own)
+    lane = np.full(nC, -1, np.int64)
+    used = np.zeros(P, np.int64)
+    order = np.lexsort((np.arange(nC), -fc, own))
+    start = np.r_[0, np.cumsum(np.bincount(own, minlength=P))]
+    nbox = vbox = cbox = ndup = 0
+    hist = np.zeros(5, np.int64)           # cells in boxes of < 256, < 1024, < 4096, < 16384, more positions
+    for c in range(P):
+        cells = order[start[c]:start[c + 1]]
+        wide = cells[fc[cells] > 6]
+        lane[wide] = np.arange(len(wide))
+        at = len(wide)
+        rest = cells[fc[cells] <= 6]
+        inp = rest[comp[rest] >= 0]
+        o = np.argsort(comp[inp], kind="stable")
+        inp = inp[o]
+        cuts = np.flatnonzero(np.r_[True, comp[inp][1:] != comp[inp][:-1], True])
+        loose = [rest[comp[rest] < 0]]
+        got = []
+        for a, b in zip(cuts[:-1], cuts[1:]):
+            ids = inp[a:b]
+            # a walk that closes around the body can give two cells of one piece the same (i, j, k): only the first
+            # keeps its place in a box, or two cells would share a lane
+            x = xyz[ids].astype(np.int64)
+            x -= x.min(0)
+            first = np.unique((x[:, 0] << 42) | (x[:, 1] << 21) | x[:, 2], return_index=True)[1]
+            if len(first) < len(ids):
+                dup = np.ones(len(ids), bool)
+                dup[first] = False
+                loose.append(ids[dup])
+                ndup += int(dup.sum())
+                ids = ids[np.sort(first)]
+            bx, ls = boxes(xyz[ids].astype(np.int64), fill, nmin)
+            loose.append(ids[ls])
+            got += [(ids[i], lo, d) for i, lo, d in bx]
+        got.sort(key=lambda g: -int(g[2].prod()))
+        for ids, lo, d in got:
+            ax = np.argsort(-d, kind="stable")
+            r = xyz[ids].astype(np.int64) - lo
+            m = r[:, ax[0]] + d[ax[0]] * (r[:, ax[1]] + d[ax[1]] * r[:, ax[2]])
+            vol = int(d.prod())
+            if quarter and vol >= 16:
+                q = -(-vol // 4)
+                m = 4 * (m % q) + m // q
+                vol = 4 * q
+            lane[ids] = at + m
+            at += vol
+            nbox += 1; vbox += vol; cbox += len(ids)
+            hist[np.searchsorted([256, 1024, 4096, 16384], vol, side="right")] += len(ids)
+        ls = np.concatenate(loose)
+        ls = ls[np.lexsort((ls, -fc[ls]))]
+        lane[ls] = at + np.arange(len(ls))
+        used[c] = at + len(ls)
+    assert (lane >= 0).all() and len(np.unique(own * (1 << 20) + lane)) == nC, "two cells share a lane"
+    log(f"boxes (fill {fill}, nmin {nmin}, quarter {quarter}): {nbox / P:.1f} per core, {cbox / nC:.4f} of cells in boxes, "
+        f"padding {100 * (vbox - cbox) / nC:.2f} % of cells, {100 * ndup / nC:.2f} % left out as repeated (i, j, k); lanes per core mean {used.mean():.0f} max {used.max()} "
+        f"(T {-(-int(used.max()) // LANES)}); cells by box size <256/<1024/<4096/<16384/more: "
+        + "/".join(f"{100 * x / nC:.1f}" for x in hist))
+    return lane, used
+
+
 def census(rows, other, slot, own, lane, P, log):
     nC = len(own)
     S = int(slot.max()) + 1
@@ -158,7 +274,7 @@ def census(rows, other, slot, own, lane, P, log):
     loc[loc] = own[other[loc]] == ec[loc]
     halo = (other >= 0) & ~loc
     N = len(rows)
-    T = int(-(-(np.bincount(own, minlength=P).max()) // LANES))
+    T = int(lane.max()) // LANES + 1
     # slot extents: tiles each slot spans on its widest core (what --sliced sizes its registers by)
     ext = np.zeros(S, np.int64)
     np.maximum.at(ext, slot, dl // LANES + 1)
@@ -221,12 +337,18 @@ def main():
     rows, other, fid, dc = entries(D)
     fc = np.bincount(rows, minlength=nC)
     log(f"{nC} cells, {P} cores ({a.own}), {len(rows)} slot entries")
-    res, lane_cache, slot_cache = {}, {}, {}
+    res, lane_cache, slot_cache, pieces = {}, {}, {}, None
     for od in a.orders.split(","):
         so, lo = od.split("/")
         if so not in slot_cache:
             slot_cache[so] = slots(rows, fid, dc, so, nC)
-        if lo not in lane_cache:
+        if lo not in lane_cache and lo.startswith("box"):      # box[q][:fill[:nmin]]
+            if pieces is None:
+                pieces = topo_pieces(rows, other, dc, own, nC, P, log)
+            f = lo.split(":")
+            lane_cache[lo] = box_lanes(pieces[0], pieces[1], own, fc, P, log, fill=float(f[1]) if len(f) > 1 else 0.9,
+                                       nmin=int(f[2]) if len(f) > 2 else 64, quarter=f[0] == "boxq")[0]
+        elif lo not in lane_cache:
             keys = [] if lo == "sliced" else geo_keys(D) if lo == "geo" else topo_keys(rows, other, dc, own, nC, P, log)
             lane_cache[lo] = lanes_of(own, [-fc] + keys + [np.arange(nC)], P)
         res[od] = census(rows, other, slot_cache[so], own, lane_cache[lo], P, log)
