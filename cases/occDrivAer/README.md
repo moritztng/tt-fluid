@@ -23,6 +23,9 @@ meshes it, copies the static case's dicts onto that mesh, and initialises the fi
 fields, to the starting state of the reference OpenFOAM run. Lower and run `work/occDrivAer` like the motorbike case in
 the [tutorial](../../docs/tutorial.md); a single Blackhole chip holds it.
 
+Cd from 3999 device iterations matches an 8-rank OpenFOAM run to 0.5 counts and a serial one to 15 counts, which is
+how far the two OpenFOAM runs are apart ([accuracy](../../docs/accuracy.md#4-drag-and-lift-against-openfoam-occdrivaer-coarse-mesh)).
+
 ## Licence
 
 The case dicts and geometry come from the HPC committee repository, which publishes them under CC BY-SA 4.0 (Upstream
