@@ -446,7 +446,10 @@ stamp("mesh + fabric up")
 # per-arch constant
 L1_CB = sum(ttnn._ttnn.device.GetMemoryView(md, b).total_bytes_per_bank for b in (ttnn.BufferType.L1, ttnn.BufferType.L1_SMALL))
 gsz = md.compute_with_storage_grid_size()
-assert (gsz.x, gsz.y) == GRID, ((gsz.x, gsz.y), GRID, "--arch names the wrong grid")
+# the program is lowered for the arch's grid; a chip with a larger one (a Galaxy Blackhole is 12x10, a p300 11x10) runs
+# it on the arch grid's corner, the same logical cores as on the smaller board
+assert gsz.x >= GRID[0] and gsz.y >= GRID[1], ((gsz.x, gsz.y), GRID, "--arch names the wrong grid")
+gsz = ttnn.CoreCoord(*GRID)
 cores = [(i % gsz.x, i // gsz.x) for i in range(P)]
 grid = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gsz.x - 1, gsz.y - 1))])
 phys = lambda x, y: md.worker_core_from_logical_core(ttnn.CoreCoord(x, y))
