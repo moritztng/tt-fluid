@@ -1,8 +1,9 @@
 #!/bin/bash
 # Box-side plan: k independent SPUMA SPDP cases at once on ONE GPU, HPC_motorbike Small (8,662,309 cells), forceCoeffs
 # on, from the potentialFoam start, each case through spuma_run.sh exactly as the one-case-per-GPU baseline ran.
-# A cell is <k>:<mode>; mode "mps" shares the GPU through CUDA MPS (kernels of different cases overlap), "off" leaves
-# the default time-slicing. "auto" picks the next k from the two MPS cells before it: 8 (or 6) while packing still
+# A cell is <k>:<mode>[:<variant>]. Mode "mps" shares the GPU through CUDA MPS (kernels of different cases overlap),
+# "off" leaves the default time-slicing. A variant runs fvSolution.spuma.mbs.<variant> instead of the baseline
+# dictionary (tag P_<mode>_k<k>_<variant>). "auto" picks the next k from the two MPS cells before it: 8 (or 6) while packing still
 # pays and host RAM allows, else 3. The batch makespan (launch of the first case to exit of the last) is the number:
 # cases per GPU-hour = k x 3600 / makespan.
 # Usage: pack_plan.sh <work-dir> <deadline-seconds>    env CELLS ("1:off 2:mps 4:mps auto 2:off"), IT (800), GPU (0)
@@ -19,7 +20,7 @@ lscpu | grep -E "Model name|^CPU\(s\)|Socket"; nproc; free -g | head -2
 : > $W/cells.tsv
 
 cell() {
-  local k=$1 mode=$2 tag=P_${2}_k$1 L pool i pids=() ta tb
+  local k=$1 mode=$2 tag=P_${2}_k$1${3:+_$3} fvs=$H/fvSolution.spuma.mbs${3:+.$3} L pool i pids=() ta tb
   L=$(left); [ $L -lt $(( ${NEED:-$(( 400 + 500 * k ))} )) ] && { stamp "$tag skipped, ${L}s left"; return; }
   pool=$(( 72 / k )); [ $pool -gt 60 ] && pool=60   # GiB of managed memory per case; a case touches ~6.2 GiB
   unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY
@@ -32,7 +33,7 @@ cell() {
   for i in $(seq 0 $((k-1))); do
     R=$W/${tag}_c$i; rm -rf $R; mkdir -p $R; cp -al $W/mbs_np1/constant $W/mbs_np1/0 $R/; cp -r $W/mbs_np1/system $R/
     CUDA_VISIBLE_DEVICES=$G SPUMA=spumaS BFX=$W/libspumaBoundFix_spdp.so timeout -s TERM $L \
-      bash $H/spuma_run.sh $R $IT $pool $H/fvSolution.spuma.mbs 1 > $W/run_${tag}_c$i.out 2>&1 &
+      bash $H/spuma_run.sh $R $IT $pool $fvs 1 > $W/run_${tag}_c$i.out 2>&1 &
     pids+=($!)
   done
   ta=$(date +%s.%N)
@@ -91,7 +92,7 @@ print(k)")
     stamp "auto -> k=$k (mps k2 ${m2:-none} s, k4 ${m4:-none} s)"
     cell $k mps; unset NEED
   else
-    cell ${c%:*} ${c#*:}
+    IFS=: read -r ck cm cv <<< "$c"; cell $ck $cm $cv
   fi
 done
 stamp "PLAN-END"
