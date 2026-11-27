@@ -87,6 +87,13 @@ cmc = re.sub(r"\n\s*blockLevel\s+\d+\s*;", "", cmc)
 sd = sd[:a] + cmc + sd[b:]
 (dst / "system" / "snappyHexMeshDict").write_text(sd)
 
+# Below SHIFT 4 the upstream averageNeighbour geometry scheme divides by zero while snapping (FPE in rank 2, SHIFT 3,
+# 2026-11-27); basic geometry only changes snappy's motion-quality metrics. SHIFT 4 keeps the upstream scheme so the
+# 1,606,238-cell mesh stays reproducible.
+if shift < 4:
+    for f in ("fvSchemes", "fvSchemes.mesh"):
+        q = dst / "system" / f
+        q.write_text(re.sub(r"(\bgeometry\s*\{[^{}]*\btype\s+)averageNeighbour", r"\1basic", q.read_text()))
 (dst / "system" / "decomposeParDict").write_text(f"""FoamFile {{ version 2.0; format ascii; class dictionary; object decomposeParDict; }}
 numberOfSubdomains {nproc};
 method scotch;
