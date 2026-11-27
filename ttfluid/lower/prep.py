@@ -35,8 +35,8 @@ def log(*a):
 def owners(m, P, K, chip_line, owner_npz):
     if owner_npz:
         return np.load(owner_npz)["parts"].astype(np.int64)
-    from ttfluid.resident.machine import rcb
-    return rcb(m.C, P, chips=K if chip_line else None)
+    from ttfluid.resident.machine import mesh_faces, rcb
+    return rcb(m.C, P, chips=K if chip_line else None, faces=mesh_faces(m))
 
 
 def submesh(m, g, loc):

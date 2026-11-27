@@ -262,7 +262,7 @@ else:
         if a.layout == "rcb" and K > 1:   # chip placement first (seconds): an unplaceable partition used to surface at plan(), an hour in
             import ttfluid.resident.machine
             from ttfluid.resident import chipplan
-            core = ttfluid.resident.machine.rcb(s.mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None)
+            core = ttfluid.resident.machine.rcb(s.mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None, faces=ttfluid.resident.machine.mesh_faces(s.mesh))
             nI = s.mesh.nInternalFaces
             chipplan.place_blocks(chipplan.chip_adjacency(core // P, s.mesh.owner[:nI], s.mesh.neighbour, K), K, R, C)
             print("placement ok: %d chip blocks one-hop on %dx%d" % (K, R, C), flush=True)
@@ -275,7 +275,7 @@ else:
         elif a.amg:
             import ttfluid.resident.machine
             assert a.layout == "rcb", "--amg: rcb (the owner below is Machine's rcb)"
-            owner = core if core is not None else ttfluid.resident.machine.rcb(s.mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None)
+            owner = core if core is not None else ttfluid.resident.machine.rcb(s.mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None, faces=ttfluid.resident.machine.mesh_faces(s.mesh))
             prog = build(s, a.n, phase=a.phase, amg_owner=owner, amg_kind=a.amg_kind, amg_smoothed=a.amg_smoothed, amg_stack=a.amg_stack,
                          amg_lag=a.amg_lag, amg_lag_warm=a.amg_lag_warm, amg_chip_cores=None if a.amg_global else P,
                          amg_depth=a.amg_depth, amg_min_core=a.amg_min_core,
@@ -382,6 +382,11 @@ else:
                 gw_load={g: (v["gP"], v["gR"], len(v["rec"])) for g, v in gtab.items()},
                 cells_per_chip=[int(np.sum(m.lay.owner[prog.cells.name] // P == k)) for k in range(K)])
     print("plan", json.dumps(info), flush=True)
+    if cb_bytes(E) > a.l1_bytes:   # images that cannot fit L1 fail only at launch, after the whole lowering: refuse them here
+        msg = "CB bytes %d over --l1-bytes %d (halo %d B): more chips or a smaller case" % (cb_bytes(E), a.l1_bytes, E.m.hwords * 4)
+        if a.images:
+            raise SystemExit("error: " + msg)
+        print("warning: " + msg, flush=True)
     if a.images:
         from ttfluid.lower.image import Image
         t1 = time.time()
@@ -393,8 +398,6 @@ else:
         sys.exit(0)
 
 
-    if cb_bytes(E) > a.l1_bytes:
-        print("warning: CB bytes %d over --l1-bytes %d" % (cb_bytes(E), a.l1_bytes), flush=True)
     print("lowered + encoded in %.1f s" % (time.time() - t0), E.sizes(), flush=True)
     if a.plan:
         sys.exit(print("cb_bytes estimate %d" % cb_bytes(E)))

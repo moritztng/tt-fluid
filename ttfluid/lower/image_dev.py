@@ -38,12 +38,23 @@ def set_outer(c, n_old, n_new):
     return c
 
 
+def flag_value(k, v):
+    """A lowering flag as the images are matched on. --forces "CONTROLDICT:FUNC" names a file of the case, and the case may
+    sit elsewhere on the device host (another home, a relative path): the lowering baked the coefficients in, so only the
+    file name and the function identify it."""
+    if k == "forces" and v and ":" in v:
+        path, func = v.rsplit(":", 1)
+        return os.path.basename(path) + ":" + func
+    return v
+
+
 def setup(d, LOWER, K, P, R, C):
     img = Image.load(d)
     s, sh = img.s, img.shared
     flags = dict(sh["flags"])
     # the case directory may sit elsewhere on the device host: the images carry everything the run reads from it
-    diff = {k: (flags.get(k), LOWER[k]) for k in LOWER if k not in ("case", "n") and flags.get(k) != LOWER[k]}
+    diff = {k: (flags.get(k), LOWER[k]) for k in LOWER
+            if k not in ("case", "n") and flag_value(k, flags.get(k)) != flag_value(k, LOWER[k])}
     # --phase: the images' markers are in the code, so images lowered with it run with it (run_mesh turns it on);
     # --phase on images without markers is refused above (flags phase None vs True)
     assert not diff, ("--from-images: lowering flags differ from the images'", diff)
