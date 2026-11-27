@@ -658,7 +658,7 @@ class Encoded:
             elif op in (N_JMP, N_CODEAT):
                 ln = 2
             else:
-                assert op <= N_WAITB, op
+                assert op <= N_WAITB or op == N_PH, op
                 ln = 1
             mx, pc = max(mx, ln), pc + ln
         assert pc == len(n)
