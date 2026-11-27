@@ -382,6 +382,11 @@ else:
                 gw_load={g: (v["gP"], v["gR"], len(v["rec"])) for g, v in gtab.items()},
                 cells_per_chip=[int(np.sum(m.lay.owner[prog.cells.name] // P == k)) for k in range(K)])
     print("plan", json.dumps(info), flush=True)
+    if cb_bytes(E) > a.l1_bytes:   # images that cannot fit L1 fail only at launch, after the whole lowering: refuse them here
+        msg = "CB bytes %d over --l1-bytes %d (halo %d B): more chips or a smaller case" % (cb_bytes(E), a.l1_bytes, E.m.hwords * 4)
+        if a.images:
+            raise SystemExit("error: " + msg)
+        print("warning: " + msg, flush=True)
     if a.images:
         from ttfluid.lower.image import Image
         t1 = time.time()
@@ -393,8 +398,6 @@ else:
         sys.exit(0)
 
 
-    if cb_bytes(E) > a.l1_bytes:
-        print("warning: CB bytes %d over --l1-bytes %d" % (cb_bytes(E), a.l1_bytes), flush=True)
     print("lowered + encoded in %.1f s" % (time.time() - t0), E.sizes(), flush=True)
     if a.plan:
         sys.exit(print("cb_bytes estimate %d" % cb_bytes(E)))
