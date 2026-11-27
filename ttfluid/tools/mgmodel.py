@@ -17,6 +17,7 @@ A --cfg is a list of key=value:
   gamma  cycles per coarse level visit (1 = V, 2 = W)
   kc, ac the coarsest level's Chebyshev solve (default 16, 30)
   depth  levels below the fine one (default: until --coarsest)
+  w      weight of every coarse correction (piecewise-constant aggregation under-corrects; 1 = none)
   local  levels from this one down drop their couplings between cores, so their SpMVs need no halo exchange
          (1 = every coarse level is solved inside its core; default: none)
   fp32   1 = vectors and matrices in fp32
@@ -205,7 +206,7 @@ class Cycle:
         def corr(res):
             W.R[l] += 1
             W.P[l] += 1
-            return self.coarse(l + 1, np.bincount(L.agg, res, nc).astype(res.dtype))[L.agg]
+            return c["w"] * self.coarse(l + 1, np.bincount(L.agg, res, nc).astype(res.dtype))[L.agg]
         if mode == "add":
             return cheb(L, r, k, a, W, l, A) + corr(r)
         if mode == "post":
@@ -249,7 +250,7 @@ def fpcg(A, b, x0, M, ctl, W):
 
 # ---- driver --------------------------------------------------------------------------------------------------------
 
-DEF = dict(agg="3", mode="post", k=1, a=4.0, cmode="sym", ck=2, ca=4.0, gamma=1, kc=16, ac=30.0, depth=None, local=99, fp32=0)
+DEF = dict(agg="3", mode="post", k=1, a=4.0, cmode="sym", ck=2, ca=4.0, gamma=1, kc=16, ac=30.0, depth=None, local=99, w=1.0, fp32=0)
 
 
 def parse_cfg(s):
@@ -257,7 +258,7 @@ def parse_cfg(s):
     for kv in s.split():
         k, v = kv.split("=")
         assert k in DEF, k
-        c[k] = v if k in ("agg", "mode", "cmode") else float(v) if k in ("a", "ca", "ac") else int(v)
+        c[k] = v if k in ("agg", "mode", "cmode") else float(v) if k in ("a", "ca", "ac", "w") else int(v)
     c["name"] = s
     return c
 
