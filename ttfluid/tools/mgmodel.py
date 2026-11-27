@@ -4,8 +4,8 @@
 
 DIR is a tools/pcapture.py output. The cells are split over cores as the device splits them (machine.rcb), and every
 aggregate stays inside one core, so each core holds its own part of every level. A level is built by `agg` passes of
-pairwise matching along the strongest coupling (aggregates of up to 2^agg cells, piecewise-constant prolongation,
-Galerkin coarse operator), until a level has at most --coarsest rows. The preconditioner is one cycle from the fine
+pairwise matching along the strongest couplings plus --extra passes that merge leftovers (aggregates of up to 2^agg cells,
+piecewise-constant prolongation, Galerkin coarse operator), until a level has at most --coarsest rows. The preconditioner is one cycle from the fine
 level, inside flexible PCG with OpenFOAM's normalised residual and the system's own tolerance and relTol.
 
 A --cfg is a list of key=value:
@@ -43,29 +43,34 @@ def log(*a):
 
 # ---- aggregation ---------------------------------------------------------------------------------------------------
 
-def pairwise(A, core, rounds=12):
-    """One pass of heavy-edge matching inside each core: every node pairs with its strongest negative coupling when
-    that choice is mutual. Returns the aggregate of every node (aggregates of 1 or 2 nodes) and their count."""
+def pairwise(A, core, size, cap, q=4.0, rounds=40):
+    """One matching pass inside each core. An edge is a candidate while both ends are free and the pair would hold at
+    most cap cells. Every node takes its candidate of highest priority and mutual choices pair. The priority is the
+    coupling in steps of 2^(1/q) with a hash of the edge inside a step: with the bare coupling, a mesh whose
+    coefficients grow smoothly in one direction pairs one cell per round along each chain and the pass stalls.
+    Returns the aggregate of every node and their count."""
     n = A.shape[0]
     i = np.repeat(np.arange(n, dtype=np.int32), np.diff(A.indptr))
     j = A.indices
-    keep = (A.data < 0) & (core[i] == core[j])
+    keep = (A.data < 0) & (core[i] == core[j]) & (size[i] + size[j] <= cap)
     i, j, w = i[keep], j[keep], -A.data[keep].astype(np.float64)
     lo, hi = np.minimum(i, j).astype(np.uint64), np.maximum(i, j).astype(np.uint64)
-    h = ((lo * np.uint64(2654435761) + hi * np.uint64(40503)) & np.uint64(0xFFFF)).astype(np.float64)
-    w *= 1.0 + 1e-7 * h / 65536.0                     # symmetric tie-break: a uniform lattice has no unique maximum
+    h = (lo * np.uint64(0x9E3779B97F4A7C15)) ^ (hi * np.uint64(0xC2B2AE3D27D4EB4F))
+    h = ((h ^ (h >> np.uint64(29))) * np.uint64(0xBF58476D1CE4E5B9)) >> np.uint64(40)
+    w = np.floor(q * np.log2(w)) + h.astype(np.float64) / float(1 << 24)
     mate = np.full(n, -1, np.int64)
     for _ in range(rounds):
         if not len(i):
             break
         start = np.flatnonzero(np.r_[True, i[1:] != i[:-1]])           # the entries stay grouped by row
-        top = np.repeat(np.maximum.reduceat(w, start), np.diff(np.r_[start, len(i)]))
-        hit = np.flatnonzero(w == top)
+        hit = np.flatnonzero(w == np.repeat(np.maximum.reduceat(w, start), np.diff(np.r_[start, len(i)])))
         hit = hit[np.r_[True, i[hit][1:] != i[hit][:-1]]]              # one per row
         bi, bj = i[hit], j[hit]
         best = np.full(n, -1, np.int64)
         best[bi] = bj
         mutual = bi[best[bj] == bi]
+        if 2000 * len(mutual) < len(bi):                               # the tail: chains that pair one cell per round
+            break
         mate[mutual] = best[mutual]
         free = (mate[i] < 0) & (mate[j] < 0)
         i, j, w = i[free], j[free], w[free]
@@ -102,7 +107,7 @@ class Level:
         return self._own
 
 
-def hierarchy(A, core, passes, coarsest, cache=None):
+def hierarchy(A, core, passes, coarsest, cache=None, extra=2, q=4.0):
     """Levels from the fine one down. cache: an .npz with the aggregate of every node per level, written when absent."""
     aggs = None
     if cache is not None and cache.exists():
@@ -117,14 +122,15 @@ def hierarchy(A, core, passes, coarsest, cache=None):
             first[agg] = np.arange(L.n)
             Ac, cc = galerkin(L.A, agg, len(first)), L.core[first]
         else:
-            agg, Ac, cc = np.arange(L.n), L.A, L.core
-            for _ in range(passes[min(len(lev) - 1, len(passes) - 1)]):
-                a, nc = pairwise(Ac, cc)
+            agg, Ac, cc, size = np.arange(L.n), L.A, L.core, np.ones(L.n, np.int64)
+            p = passes[min(len(lev) - 1, len(passes) - 1)]
+            for _ in range(p + extra):                                 # the extra passes merge what was left over
+                a, nc = pairwise(Ac, cc, size, 1 << p, q)
                 if nc == len(a):
                     break
                 first = np.zeros(nc, np.int64)
                 first[a] = np.arange(len(a))
-                Ac, cc, agg = galerkin(Ac, a, nc), cc[first], a[agg]
+                Ac, cc, agg, size = galerkin(Ac, a, nc), cc[first], a[agg], np.bincount(a, size, nc).astype(np.int64)
             if Ac.shape[0] == L.n:
                 break
         L.agg = agg
@@ -282,6 +288,8 @@ def main():
     ap.add_argument("--cores", type=int, default=220, help="cores over all chips")
     ap.add_argument("--chips", type=int, default=2)
     ap.add_argument("--coarsest", type=int, default=4000, help="stop coarsening at this many rows")
+    ap.add_argument("--extra", type=int, default=2, help="matching passes per level after the first `agg`")
+    ap.add_argument("--q", type=float, default=4.0, help="matching priority: coupling steps per factor of 2")
     ap.add_argument("--cfg", action="append", default=[])
     ap.add_argument("--json", help="append one row per solve")
     a = ap.parse_args()
@@ -306,7 +314,8 @@ def main():
                 else:
                     t1 = time.time()
                     h = hierarchy(Af, core, [int(v) for v in c["agg"].split(",")], a.coarsest,
-                                  d / f"agg_{label}_{c['agg'].replace(',', '-')}_{a.cores}_{a.chips}_{a.coarsest}.npz")
+                                  d / f"agg_{label}_{c['agg'].replace(',', '-')}_{a.cores}_{a.chips}_{a.coarsest}_{a.extra}_{a.q:g}.npz",
+                                  a.extra, a.q)
                     built[key] = h, [stats(L, a.cores, a.chips) for L in h]
                     log(f"  hierarchy agg={c['agg']}: rows {[L.n for L in h]} nnz {[L.A.nnz for L in h]} "
                         f"lmax {[round(L.lmax, 3) for L in h]} ({time.time() - t1:.0f} s)")
