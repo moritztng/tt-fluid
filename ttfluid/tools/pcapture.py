@@ -4,9 +4,9 @@
 
 The solver is built as run_mesh builds it (SimpleFoam, ell, fp32, face order). Each STATE (a run_mesh _state.npz or a
 lower/of_state.py start state: the fields after some SIMPLE iteration; "-" keeps the case's own 0/ fields) is put into
-the solver, one SIMPLE iteration runs up to the p solve, and the system handed to the Krylov solver is written to OUT/sys_LABEL.npz: the matrix in CSR
-with the sign that makes it positive definite, b with the same sign, x0 and the case's solver controls. OUT/mesh.npz
-holds what a partition needs: cell centres, faces per cell and the internal faces.
+the solver, one SIMPLE iteration runs up to the p solve, and the system handed to the Krylov solver is written to
+OUT/sys_LABEL.npz: the matrix in CSR with the sign that makes it positive definite, b with the same sign, x0 and the
+case's solver controls. OUT/mesh.npz holds what a partition needs: cell centres, faces per cell and the internal faces.
 """
 import argparse
 import time
