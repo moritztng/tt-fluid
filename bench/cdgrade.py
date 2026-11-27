@@ -18,7 +18,7 @@ S100 / sqrt(n).
 
 The window starts at 201 because iterations 101-200 still carry a start-up transient that depends on the linear
 solvers. With --base the same window of a baseline run is compared too: two correct runs that differ only in the order
-of their floating-point sums sit sqrt(2) S100 / sqrt(n) apart (the floor), so a shift inside twice that is no change.
+of their floating-point sums sit sqrt(2) S100 / sqrt(n) apart (the floor); 1 such pair in 20 is over twice that apart.
 """
 import argparse
 import json
@@ -102,11 +102,11 @@ def main():
               f"{c['ref']:.5f} +- {c['ref_se']:.1f} | diff {c['diff']:+.1f} counts{same} | band {c['band']:.1f} "
               f"{'inside' if c['ok'] else 'OUTSIDE'}")
         if not c["steady"]:
-            print(f"   block means spread {c['block_sd']:.1f} counts, the record has {S100[name]:.0f}: this run is less "
-                  "steady than the runs the band was set from")
+            print(f"   block means spread {c['block_sd']:.1f} counts against {S100[name]:.0f} in the runs the band was "
+                  "set from: this run is less steady")
         if "shift" in c:
             print(f"   vs base {c['shift']:+.1f} counts, floor {c['floor']:.1f} (1 sigma): "
-                  f"{'no change' if abs(c['shift']) <= 2 * c['floor'] else 'CHANGED'}")
+                  f"{'inside' if abs(c['shift']) <= 2 * c['floor'] else 'OUTSIDE'} 2 sigma")
     c = g["Cd"]
     print(f"GRADE: {g['grade']}  Cd {c['diff']:+.1f} counts against a band of {c['band']:.1f} on {lo}-{hi}; a bias of "
           f"{c['detects']:.0f} counts fails 9 times in 10")

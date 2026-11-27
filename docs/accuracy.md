@@ -154,7 +154,7 @@ Three choices behind it:
 
 With `--base` the tool also reports the shift against a baseline run over the same window. Two correct runs that differ
 only in the order of their floating-point sums sit 11.5 counts apart (one standard deviation) on 201-800: the 28 pairs
-of identical SPUMA SPDP runs measure 16.1, the 28 double-precision pairs 8.8. A shift inside twice that is no change.
+of identical SPUMA SPDP runs measure 16.1, the 28 double-precision pairs 8.8. A shift inside twice that is no change; about 1 pair in 20 of correct runs lies outside.
 
 What the runs in `results/` grade as:
 
