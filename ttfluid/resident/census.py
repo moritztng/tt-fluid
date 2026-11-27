@@ -148,7 +148,7 @@ class Census:
         return ["%s %-24s %10.1f" % (rw, x, n / self.n) for (rw, x), n in c.most_common()]
 
 
-def prof(hdr, log=print):
+def prof(hdr, log=print, unit=16):
     """CFD_PROF device census from the per-core headers (run_vm / run_mesh --prof): means over cores of the cycles and
     counts per op of every interpreter thread and agent, their share of the run, and the parts of STREAM, GATHER, HALO."""
     import json
@@ -159,8 +159,10 @@ def prof(hdr, log=print):
     BN = ["SCAL", "SIGC", "WAITC", "SIGN", "WAITN", "HALO", "RED", "OUT", "FETCH", "JMP", "BRT", "SINK"]
     NN = ["END", "SIGC", "WAITC", "SIGB", "WAITB", "GATHER", "HALO", "JMP", "BRT", "STREAM"]
     h = hdr.astype(np.float64)
-    for lo, hi in ((64, 80), (96, 112), (128, 248), (288, 296)):   # cycle words are stored in 16-cycle units
-        h[:, lo:hi] *= 16
+    # cycle words are stored in `unit`-cycle units (16, or 2^CFD_PROF_SH: a word of 16-cycle units wraps at 6.9e10
+    # cycles, 51 s of one op at 1350 MHz, and a wrapped slot reads as a small one)
+    for lo, hi in ((64, 80), (96, 112), (128, 248), (288, 296)):
+        h[:, lo:hi] *= unit
     def tab(base, cbase, names):
         cyc, cnt = h[:, base:base + len(names)].mean(0), h[:, cbase:cbase + len(names)].mean(0)
         tot = cyc.sum()

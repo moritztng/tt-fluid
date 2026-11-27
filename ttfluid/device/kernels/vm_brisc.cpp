@@ -521,6 +521,29 @@ void kernel_main() {
     uint32_t cnt[16];            // and counts per op, to hdr 64 + op / 80 + op
     for (uint32_t i = 0; i < 16; ++i) cyc[i] = cnt[i] = 0;
     uint32_t tprev = get_timestamp_32b();
+#ifdef CFD_PROF_PH
+    // run_mesh --prof-phase K: the census keeps what this thread spent between its own marker of phase K and the next
+    // marker. At every marker the counters since the last one are added to the kept set when that stretch was K, then cleared
+    uint64_t kcyc[16];
+    uint32_t kcnt[16], kph = 15;
+    for (uint32_t i = 0; i < 16; ++i) kcyc[i] = kcnt[i] = 0;
+#define PROF_PH(next)                                          \
+    {                                                          \
+        for (uint32_t i_ = 0; i_ < 16; ++i_) {               \
+            if (kph == CFD_PROF_PH) kcyc[i_] += cyc[i_], kcnt[i_] += cnt[i_]; \
+            cyc[i_] = cnt[i_] = 0;                             \
+        }                                                      \
+        kph = (next);                                          \
+    }
+#define PROF_PH_END()                                          \
+    {                                                          \
+        PROF_PH(15);                                           \
+        for (uint32_t i_ = 0; i_ < 16; ++i_) cyc[i_] = kcyc[i_], cnt[i_] = kcnt[i_]; \
+    }
+#else
+#define PROF_PH(next)
+#define PROF_PH_END()
+#endif
     // inside HALO (hdr 64 + 12..14): waiting for the receivers' credits, the copy into the stage, the write barrier
 #define PSUB(i, x)                                     \
     {                                                  \
@@ -989,6 +1012,9 @@ void kernel_main() {
             }
 #endif
             case B_PH:
+#ifdef CFD_PROF
+                PROF_PH((w >> 8) & 15);
+#endif
 #ifdef CFD_PHASE
             {
                 const uint64_t t_ = get_timestamp();
@@ -1029,8 +1055,12 @@ void kernel_main() {
 #endif
     }
 #ifdef CFD_PROF
+#ifndef CFD_PROF_SH
+#define CFD_PROF_SH 4   // census cycle words leave in units of 2^CFD_PROF_SH cycles (run_mesh --prof-shift)
+#endif
+    PROF_PH_END();
     for (uint32_t i = 0; i < 16; ++i) {
-        hdr[64 + i] = static_cast<uint32_t>(cyc[i] >> 4);
+        hdr[64 + i] = static_cast<uint32_t>(cyc[i] >> CFD_PROF_SH);
         hdr[80 + i] = cnt[i];
     }
 #endif

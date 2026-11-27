@@ -41,6 +41,7 @@ B_PH = 17       # phase marker, phase id in bits 8-11 (vm_brisc CFD_PHASE)
 B_GATHER = 15   # bgather: a local-only gather on BRISC (prof slots 12..14 are HALO's parts)
 # NCRISC
 N_END, N_SIGC, N_WAITC, N_SIGB, N_WAITB, N_GATHER, N_HALO, N_JMP, N_BRT, N_STREAM, N_CODE, N_CODEAT = range(12)
+N_PH = 12       # phase marker (Encoded(nphase=True)), phase id in bits 8-11: a no-op, vm_ncrisc CFD_PROF_PH reads it
 PW = 256        # paged compute code: words per page (1 KB)
 NONE16 = 0xFFFF
 
@@ -154,7 +155,7 @@ def hrun_words(lane, idx, rmin=8):
 
 class Encoded:
     def __init__(self, m, page=False, pdev=None, tab_stream=False, look=False, cores=None, tab_sort=False, phase=None,
-                 gtile=False):
+                 gtile=False, nphase=False):
         """page: the compute stream is paged from DRAM through a ring NCRISC fills (vm_ncrisc N_CODE): every basic
         block starts on a PW-word page, the padding is C_JMP (in paged mode JMP and BRT end a block and compute moves
         on to the next delivered page), and NCRISC pushes the pages of a MIR instruction before any of its own ops
@@ -167,6 +168,8 @@ class Encoded:
         per-chip lowering (lower/spmd.py) builds one chip's.
         phase: {label: phase id} (Program.phase_at, build(phase=True)): a C_PH and a B_PH right after each such label.
         None or {}: no marker, the streams are the ones without the option.
+        nphase: with phase, an N_PH in NCRISC's stream at each such label too (after the label's N_CODEAT), so the
+        census can be cut by phase on every thread (run_mesh --prof-phase). Off: NCRISC's stream is unchanged.
         gtile: with tab_stream, a gather followed by its N -> C sync and a tile loop that reads the gathered vector
         plainly hands it over per tile: N_GATHER carries the loop's tile count Tb in bits 16-23 and NCRISC posts a
         token after each of its first Tb - 1 tiles (the N_SIGC is the last), compute waits once per pass right after
@@ -463,6 +466,8 @@ class Encoded:
                     pad()
                     seal(len(c.w) // PW)
                     ncur = None     # only a label follows
+            if nphase and op == "label" and ins[1] in phase:
+                n(W(N_PH, phase[ins[1]]))
         c(W(C_END))
         if page:
             n(W(N_CODE), -(-len(c.w) // PW), -(-len(c.w) // PW))

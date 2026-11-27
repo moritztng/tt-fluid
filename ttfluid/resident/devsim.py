@@ -381,6 +381,8 @@ class DevSim:
             pcs[ag] = int(S[pc + 1])
         elif op == E.N_BRT:
             pcs[ag] = int(S[pc + 2]) if self._branch(ag, bri, f0) else pc + 3
+        elif op == E.N_PH:
+            pcs[ag] = pc + 1
         else:
             raise AssertionError(f"bad ncrisc op {op} at {pc}")
         return "ok"

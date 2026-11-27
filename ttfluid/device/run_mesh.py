@@ -134,6 +134,12 @@ ap.add_argument("--cap", type=int, default=32, help="as run_vm.py: scratch cap, 
 ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3, 4 need --tabstream (mesh has no trid). Default 0 keeps the built images unchanged")
 ap.add_argument("--os", type=int, default=0, help="1: BRISC built for size (#pragma GCC optimize Os), 2: NCRISC too, for a program over the kernel config buffer")
 ap.add_argument("--prof", action="store_true", help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores")
+ap.add_argument("--prof-shift", type=int, default=8, help="with --prof: census cycle words in units of 2^N cycles (CFD_PROF_SH). A 32-bit word of 16-cycle units "
+                "wraps after 51 s of one op at 1350 MHz, inside a 100-it Small run; 8 holds 814 s")
+ap.add_argument("--nphase", action="store_true", help="lowering, with --phase: a phase marker in NCRISC's stream too (N_PH), so --prof-phase can cut the census on every thread")
+ap.add_argument("--prof-phase", type=int, default=-1, help="with --prof on images lowered with --nphase: the census keeps only what each thread spent inside "
+                "SIMPLE phase K (index into program.PHASES, 15 = before the first marker), cut at the thread's own markers (CFD_PROF_PH). One leg per phase; "
+                "the legs sum to the plain --prof census")
 ap.add_argument("--plan", action="store_true", help="CPU only: lower, place the chips, print the plan")
 ap.add_argument("--gruns", help="CPU only: lower and encode (--tabstream), write the gather run census (lower/gruns.py) of the "
                 "cores of --gruns-chips to this json and exit")
@@ -198,6 +204,9 @@ LOWER = {k: getattr(a, k) for k in ("what", "n", "case", "mesh", "layout", "tile
                                     "bgather", "bscal", "bjoint", "cap")}
 if a.phase:
     LOWER["phase"] = True
+if a.nphase:
+    assert a.phase, "--nphase marks the phases of --phase"
+    LOWER["nphase"] = True
 if a.tsort:   # images and --save files from before the flag have unsorted tables, so 0 stays out of LOWER
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
@@ -338,7 +347,7 @@ else:
     assert a.tabstream or not ttfluid.resident.encode.WIDE, "T=%d > 64 needs --tabstream" % m.T
     assert not (ttfluid.resident.encode.WIDE and (a.tgts or a.gtile)), "--tgts / --gtile hand over 16-bit gather entries (vm_compute tsvc): not with wide ones"
     if not a.load:
-        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
+        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), nphase=a.nphase)
         if a.tscheck:   # as run_vm.py: NCRISC's streamed walk replayed against the cursor tables, every core
             from ttfluid.resident.tabstream import check
             check(E, E.tab_stream, E.tab_cursor)
@@ -347,7 +356,7 @@ else:
             k = max(0, int((a.l1_bytes - (cb_bytes(E) - m.ntiles * 4096)) // 4096 - m.nsmall) // m.T)
             while True:
                 m.place(k, print)
-                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
+                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), nphase=a.nphase)
                 print("l1 auto: %d vector slots in L1, CB bytes %d" % (k, cb_bytes(E)), flush=True)
                 if cb_bytes(E) <= a.l1_bytes or k == 0:
                     break
@@ -625,7 +634,7 @@ else:
     if E.tab_stream:
         blob.reshape(K * P, TBP * 1024)[:, :E.tab_blob.shape[1]] = E.tab_blob
     t_blob = to_dev(blob)
-defs = [("CFD_PROF", "1")] * a.prof + [("CFD_STOP", str(a.stop))] * bool(a.stop) + [("CFD_CP", str(m.cpages)), ("CFD_MESH", str(K)), ("CFD_NSH", str(NSH)), ("CFD_SYNCB", str(SYNCB)), ("CFD_GB", str(GB)), ("CFD_RB", str(RB)), ("CFD_CONS", str(E0 + 512))] + ([("CFD_RED2", "1")] if m.red2 else []) + \
+defs = [("CFD_PROF", "1"), ("CFD_PROF_SH", str(a.prof_shift))] * a.prof + [("CFD_PROF_PH", str(a.prof_phase))] * (a.prof_phase >= 0) + [("CFD_STOP", str(a.stop))] * bool(a.stop) + [("CFD_CP", str(m.cpages)), ("CFD_MESH", str(K)), ("CFD_NSH", str(NSH)), ("CFD_SYNCB", str(SYNCB)), ("CFD_GB", str(GB)), ("CFD_RB", str(RB)), ("CFD_CONS", str(E0 + 512))] + ([("CFD_RED2", "1")] if m.red2 else []) + \
        ([("CFD_TABSTREAM", str(CB_TS))] if a.tabstream else []) + ([("CFD_WIDE", "1")] if ttfluid.resident.encode.WIDE else []) + ([("CFD_BSCAL", "1")] if a.bscal else []) + ([("CFD_OS", str(a.os))] if a.os else [])
 
 
@@ -984,7 +993,10 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         res["phase"] = ph
     if a.prof:
         from ttfluid.resident.census import prof
-        res["census"] = prof(hdr)
+        res["census"] = prof(hdr, unit=1 << a.prof_shift)
+        if a.prof_phase >= 0:
+            from ttfluid.resident.program import PHASES
+            res["census_phase"] = PHASES[a.prof_phase] if a.prof_phase < len(PHASES) else "init"
     if ref is not None:
         eh, es = ref
         worst = 0.0
