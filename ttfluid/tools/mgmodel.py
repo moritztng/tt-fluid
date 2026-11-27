@@ -17,6 +17,8 @@ A --cfg is a list of key=value:
   gamma  cycles per coarse level visit (1 = V, 2 = W)
   kc, ac the coarsest level's Chebyshev solve (default 16, 30)
   depth  levels below the fine one (default: until --coarsest)
+  local  levels from this one down drop their couplings between cores, so their SpMVs need no halo exchange
+         (1 = every coarse level is solved inside its core; default: none)
   fp32   1 = vectors and matrices in fp32
 
 Per solve it prints the PCG iterations and the work: SpMVs, restrictions and prolongations per level, reductions.
@@ -86,6 +88,16 @@ class Level:
         self.dinv = (1.0 / d).astype(A.dtype)
         self.lmax = float((np.abs(A).sum(axis=1).A1 / d).max())       # Gershgorin bound of D^-1 A: one reduction
         self.agg = None                                               # node -> node of the next level
+        self._own = None
+
+    @property
+    def own(self):
+        """The level without its couplings between cores: what a core can apply with no halo exchange."""
+        if self._own is None:
+            i = np.repeat(np.arange(self.n), np.diff(self.A.indptr))
+            keep = self.core[i] == self.core[self.A.indices]
+            self._own = sp.csr_matrix((self.A.data[keep], (i[keep], self.A.indices[keep])), shape=self.A.shape)
+        return self._own
 
 
 def hierarchy(A, core, passes, coarsest, cache=None):
@@ -147,8 +159,9 @@ class Work:
         self.red = 0
 
 
-def cheb(L, r, k, a, W, l):
+def cheb(L, r, k, a, W, l, A=None):
     """k Chebyshev steps for A z = r from z = 0 on [lmax / a, lmax] of D^-1 A: k - 1 SpMVs."""
+    A = L.A if A is None else A
     theta, delta = 0.5 * L.lmax * (1 + 1 / a), 0.5 * L.lmax * (1 - 1 / a)
     sigma = theta / delta
     rho = 1 / sigma
@@ -156,7 +169,7 @@ def cheb(L, r, k, a, W, l):
     z = d.copy()
     rr = r
     for _ in range(k - 1):
-        rr = rr - L.A @ d
+        rr = rr - A @ d
         W.spmv[l] += 1
         rho1 = 1 / (2 * sigma - rho)
         d = rho1 * rho * d + (2 * rho1 / delta) * (L.dinv * rr)
@@ -169,20 +182,23 @@ class Cycle:
     def __init__(self, lev, c, W):
         self.lev, self.c, self.W = lev, c, W
 
+    def A(self, l):
+        return self.lev[l].own if l >= self.c["local"] else self.lev[l].A
+
     def coarse(self, l, r):
         """The correction of level l - 1 from level l: gamma cycles."""
-        L, W = self.lev[l], self.W
+        W = self.W
         z = self(l, r)
         for _ in range(self.c["gamma"] - 1 if l < len(self.lev) - 1 else 0):
             W.spmv[l] += 1
-            z = z + self(l, r - L.A @ z)
+            z = z + self(l, r - self.A(l) @ z)
         return z
 
     def __call__(self, l, r):
         lev, c, W = self.lev, self.c, self.W
-        L = lev[l]
+        L, A = lev[l], self.A(l)
         if l == len(lev) - 1:
-            return cheb(L, r, c["kc"], c["ac"], W, l)
+            return cheb(L, r, c["kc"], c["ac"], W, l, A)
         mode, k, a = (c["mode"], c["k"], c["a"]) if l == 0 else (c["cmode"], c["ck"], c["ca"])
         nc = lev[l + 1].n
 
@@ -191,17 +207,17 @@ class Cycle:
             W.P[l] += 1
             return self.coarse(l + 1, np.bincount(L.agg, res, nc).astype(res.dtype))[L.agg]
         if mode == "add":
-            return cheb(L, r, k, a, W, l) + corr(r)
+            return cheb(L, r, k, a, W, l, A) + corr(r)
         if mode == "post":
             z = corr(r)
             W.spmv[l] += 1
-            return z + cheb(L, r - L.A @ z, k, a, W, l)
+            return z + cheb(L, r - A @ z, k, a, W, l, A)
         assert mode == "sym", mode
-        z = cheb(L, r, k, a, W, l)
+        z = cheb(L, r, k, a, W, l, A)
         W.spmv[l] += 1
-        z = z + corr(r - L.A @ z)
+        z = z + corr(r - A @ z)
         W.spmv[l] += 1
-        return z + cheb(L, r - L.A @ z, k, a, W, l)
+        return z + cheb(L, r - A @ z, k, a, W, l, A)
 
 
 def fpcg(A, b, x0, M, ctl, W):
@@ -233,7 +249,7 @@ def fpcg(A, b, x0, M, ctl, W):
 
 # ---- driver --------------------------------------------------------------------------------------------------------
 
-DEF = dict(agg="3", mode="post", k=1, a=4.0, cmode="sym", ck=2, ca=4.0, gamma=1, kc=16, ac=30.0, depth=None, fp32=0)
+DEF = dict(agg="3", mode="post", k=1, a=4.0, cmode="sym", ck=2, ca=4.0, gamma=1, kc=16, ac=30.0, depth=None, local=99, fp32=0)
 
 
 def parse_cfg(s):
