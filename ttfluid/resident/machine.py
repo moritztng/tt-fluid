@@ -64,34 +64,73 @@ UNARY = ("neg", "abs", "sqrt", "tanh", "log", "exp")
 # =================================================================================================================
 # partition
 # =================================================================================================================
-def rcb(xyz, P, chips=None):
+def rcb(xyz, P, chips=None, faces=None):
     """Recursive coordinate bisection of points into P parts of near-equal size. chips = K > 1: chip first, for a
     line of K chips: K equal strips along the longest axis (strip k on chip k, neighbours one hop apart), then
-    bisection of each strip into its P / K cores."""
+    bisection of each strip into its P / K cores. faces = (owner, neighbour) of the internal faces: each bisection
+    cuts along the axis that cuts the fewest faces, not the longest one. On a mesh with a thin dense layer (the
+    refinement above occDrivAer's ground) the longest axis slices the layer into parts 2-3 cells thick, almost all
+    halo: the worst core's halo, which sizes every core's halo buffer, drops 3.3x on the coarse occDrivAer."""
     if chips and chips > 1:
         d = int(np.argmax(xyz.max(0) - xyz.min(0)))
         order = np.argsort(xyz[:, d], kind="stable")
-        parts = np.zeros(len(xyz), np.int64)
+        parts = np.full(len(xyz), -1, np.int64)
         cut = [int(round(len(xyz) * k / chips)) for k in range(chips + 1)]
         for k in range(chips):
-            sel = order[cut[k]:cut[k + 1]]
-            parts[sel] = rcb(xyz[sel], P // chips) + k * (P // chips)
+            parts[order[cut[k]:cut[k + 1]]] = k
+        strip = parts.copy()
+        for k in range(chips):
+            sel = np.nonzero(strip == k)[0]
+            sub = None
+            if faces is not None:   # the strip's internal faces, renumbered to the strip
+                fo, fn = faces
+                inner = (strip[fo] == k) & (strip[fn] == k)
+                loc = np.full(len(xyz), -1, np.int64)
+                loc[sel] = np.arange(len(sel))
+                sub = (loc[fo[inner]], loc[fn[inner]])
+            parts[sel] = rcb(xyz[sel], P // chips, faces=sub) + k * (P // chips)
         return parts
     parts = np.zeros(len(xyz), np.int64)
+    left = np.zeros(len(xyz), bool)
 
-    def rec(idx, p0, k):
+    def rec(idx, fo, fn, p0, k):
         if k == 1:
             parts[idx] = p0
             return
         k1 = k // 2
         pts = xyz[idx]
-        d = int(np.argmax(pts.max(0) - pts.min(0)))
-        order = idx[np.argsort(pts[:, d], kind="stable")]
         m = int(round(len(idx) * k1 / k))
-        rec(order[:m], p0, k1)
-        rec(order[m:], p0 + k1, k - k1)
-    rec(np.arange(len(xyz)), 0, P)
+        if fo is None:
+            axes = [int(np.argmax(pts.max(0) - pts.min(0)))]
+        else:
+            axes = range(xyz.shape[1])
+        best = None
+        for d in axes:
+            order = idx[np.argsort(pts[:, d], kind="stable")]
+            if fo is None:
+                best = (0, order)
+                break
+            left[order[:m]], left[order[m:]] = True, False
+            c = int(np.count_nonzero(left[fo] != left[fn]))
+            if best is None or c < best[0]:
+                best = (c, order)
+        order = best[1]
+        if fo is None:
+            rec(order[:m], None, None, p0, k1)
+            rec(order[m:], None, None, p0 + k1, k - k1)
+            return
+        left[order[:m]], left[order[m:]] = True, False
+        lf, rf = left[fo] & left[fn], ~left[fo] & ~left[fn]
+        rec(order[:m], fo[lf], fn[lf], p0, k1)
+        rec(order[m:], fo[rf], fn[rf], p0 + k1, k - k1)
+    fo, fn = (None, None) if faces is None else (np.asarray(faces[0]), np.asarray(faces[1]))
+    rec(np.arange(len(xyz)), fo, fn, 0, P)
     return parts
+
+
+def mesh_faces(mesh):
+    """(owner, neighbour) of a mesh's internal faces, rcb's faces argument."""
+    return mesh.owner[:mesh.nInternalFaces], mesh.neighbour
 
 
 def _quarter(m, r, Q):
@@ -980,10 +1019,10 @@ class Machine:
             own = strip_owner(X, P, int(layout[4:] or 1))
             self.lay = Layout(prog, own, P, row_lanes(X, own, P), amg_vec=amg_vec, ptiles=ptiles)
         elif layout.startswith("rcbq") and not sliced:   # rcbq<Q>: rcb cores, quarter-interleaved lanes (quarter_lanes)
-            own = rcb(mesh.C, P)
+            own = rcb(mesh.C, P, faces=mesh_faces(mesh))
             self.lay = Layout(prog, own, P, quarter_lanes(own, P, int(layout[4:])), amg_vec=amg_vec, ptiles=ptiles)
         else:
-            own = self._own if sliced else rcb(mesh.C, P, chips=P // chip_cores if chip_cores and chip_line else None)
+            own = self._own if sliced else rcb(mesh.C, P, chips=P // chip_cores if chip_cores and chip_line else None, faces=mesh_faces(mesh))
             Q = int(layout[4:]) if layout.startswith("rcbq") else 0
             self.lay = Layout(prog, own, P, sliced_lanes(own, face_counts(mesh), P, Q) if sliced else None, amg_vec=amg_vec, ptiles=ptiles)
         self.T = max(self.lay.T, tiles or 1)   # tiles: force more tiles per vector than needed (testing)
@@ -1045,7 +1084,7 @@ class Machine:
         """--sliced: each core's cells sorted widest first, so ELL slot k is a lane prefix of L_k tiles; every cells
         register gets the tiles it is read over (slot_extents), and a fold step over a slot narrower than its result
         becomes copy + in-place update of the first L_k tiles (the copy coalesces away when the accumulator dies there)."""
-        self._own = own = rcb(mesh.C, P, chips=P // chips if chips else None)
+        self._own = own = rcb(mesh.C, P, chips=P // chips if chips else None, faces=mesh_faces(mesh))
         fc = face_counts(mesh)
         T = max(-(-gmax(int(np.bincount(own, minlength=P).max())) // LANES), tiles or 1)
         self.slotL = L = [max(1, -(-gmax(int(np.bincount(own[fc > k], minlength=P).max())) // LANES))
