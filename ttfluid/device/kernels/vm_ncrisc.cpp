@@ -36,7 +36,7 @@ constexpr uint32_t SS = 16, SM = 0xfff;
 #pragma GCC optimize("Os")
 #endif
 
-enum : uint32_t { N_END = 0, N_SIGC, N_WAITC, N_SIGB, N_WAITB, N_GATHER, N_HALO, N_JMP, N_BRT, N_STREAM, N_CODE, N_CODEAT };
+enum : uint32_t { N_END = 0, N_SIGC, N_WAITC, N_SIGB, N_WAITB, N_GATHER, N_HALO, N_JMP, N_BRT, N_STREAM, N_CODE, N_CODEAT, N_PH };
 enum : uint32_t { W_NDONE = 1000, W_ABORT = 1004, W_CDONE = 1008, NH = 32 };   // vm_brisc.cpp sync layout
 
 // hsplit: BRISC sends a halo to receivers [0, h), NCRISC to [h, nrecv); h splits the values about in half. t = the
@@ -561,6 +561,29 @@ void kernel_main() {
     uint32_t cnt[24];   // census: cycles and counts per op, to hdr 96 + op / 112 + op; parts 16.. to 288 / 296
     for (uint32_t i = 0; i < 24; ++i) cyc[i] = cnt[i] = 0;
     uint32_t tprev = get_timestamp_32b();
+#ifdef CFD_PROF_PH
+    // run_mesh --prof-phase K: the census keeps what this thread spent between its own marker of phase K and the next
+    // marker. At every marker the counters since the last one are added to the kept set when that stretch was K, then cleared
+    uint64_t kcyc[24];
+    uint32_t kcnt[24], kph = 15;
+    for (uint32_t i = 0; i < 24; ++i) kcyc[i] = kcnt[i] = 0;
+#define PROF_PH(next)                                          \
+    {                                                          \
+        for (uint32_t i_ = 0; i_ < 24; ++i_) {               \
+            if (kph == CFD_PROF_PH) kcyc[i_] += cyc[i_], kcnt[i_] += cnt[i_]; \
+            cyc[i_] = cnt[i_] = 0;                             \
+        }                                                      \
+        kph = (next);                                          \
+    }
+#define PROF_PH_END()                                          \
+    {                                                          \
+        PROF_PH(15);                                           \
+        for (uint32_t i_ = 0; i_ < 24; ++i_) cyc[i_] = kcyc[i_], cnt[i_] = kcnt[i_]; \
+    }
+#else
+#define PROF_PH(next)
+#define PROF_PH_END()
+#endif
     // inside STREAM (hdr 96 + 10..12): waiting for a free cb_in slot, read barriers, the patch; parts 16..17: the
     // patch's barrier and residue entries; inside GATHER (parts 18..19): waiting for the halo, the local and halo scatters
 #define PSUB(i, x)                                     \
@@ -1186,6 +1209,11 @@ void kernel_main() {
             }
             case N_CODEAT: ccur = N[pc++]; break;
             case N_JMP: pc = N[pc]; break;
+            case N_PH:   // phase marker (encode.py nphase), id in bits 8-11: nothing to do but cut the census
+#ifdef CFD_PROF
+                PROF_PH((w >> 8) & 15);
+#endif
+                break;
             case N_BRT: {
                 const uint32_t v = reinterpret_cast<volatile uint32_t*>(A)[N[pc] * 1024], target = N[pc + 1];
                 pc += 2;
@@ -1201,19 +1229,25 @@ void kernel_main() {
 #ifdef CFD_PROF
         {
             const uint32_t t = get_timestamp_32b();
-            cyc[op & 15] += t - tprev;
-            ++cnt[op & 15];
-            tprev = t;
+            if (op != N_PH) {   // the marker has no census slot: its few cycles go to the op after it
+                cyc[op & 15] += t - tprev;
+                ++cnt[op & 15];
+                tprev = t;
+            }
         }
 #endif
     }
 #ifdef CFD_PROF
+#ifndef CFD_PROF_SH
+#define CFD_PROF_SH 4   // census cycle words leave in units of 2^CFD_PROF_SH cycles (run_mesh --prof-shift)
+#endif
+    PROF_PH_END();
     for (uint32_t i = 0; i < 16; ++i) {
-        hdr[96 + i] = static_cast<uint32_t>(cyc[i] >> 4);
+        hdr[96 + i] = static_cast<uint32_t>(cyc[i] >> CFD_PROF_SH);
         hdr[112 + i] = cnt[i];
     }
     for (uint32_t i = 0; i < 8; ++i) {
-        hdr[288 + i] = static_cast<uint32_t>(cyc[16 + i] >> 4);
+        hdr[288 + i] = static_cast<uint32_t>(cyc[16 + i] >> CFD_PROF_SH);
         hdr[296 + i] = cnt[16 + i];
     }
 #endif

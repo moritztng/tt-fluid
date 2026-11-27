@@ -107,6 +107,29 @@ void kernel_main() {
     uint32_t cnt[40];
     for (uint32_t i = 0; i < 40; ++i) cyc[i] = cnt[i] = 0;
     uint32_t tprev = static_cast<uint32_t>(ckernel::read_wall_clock());
+#ifdef CFD_PROF_PH
+    // run_mesh --prof-phase K: the census keeps what this thread spent between its own marker of phase K and the next
+    // marker. At every marker the counters since the last one are added to the kept set when that stretch was K, then cleared
+    uint64_t kcyc[40];
+    uint32_t kcnt[40], kph = 15;
+    for (uint32_t i = 0; i < 40; ++i) kcyc[i] = kcnt[i] = 0;
+#define PROF_PH(next)                                          \
+    {                                                          \
+        for (uint32_t i_ = 0; i_ < 40; ++i_) {               \
+            if (kph == CFD_PROF_PH) kcyc[i_] += cyc[i_], kcnt[i_] += cnt[i_]; \
+            cyc[i_] = cnt[i_] = 0;                             \
+        }                                                      \
+        kph = (next);                                          \
+    }
+#define PROF_PH_END()                                          \
+    {                                                          \
+        PROF_PH(15);                                           \
+        for (uint32_t i_ = 0; i_ < 40; ++i_) cyc[i_] = kcyc[i_], cnt[i_] = kcnt[i_]; \
+    }
+#else
+#define PROF_PH(next)
+#define PROF_PH_END()
+#endif
 #endif
 #ifdef CFD_PHASE
     // run_mesh --phase: wall-clock cycles of this thread per SIMPLE phase (C_PH opens phase id = w >> 16; id 15 = before
@@ -243,6 +266,9 @@ void kernel_main() {
                 cb_push_back(cb_out, 1);
                 break;
             case C_PH:
+#ifdef CFD_PROF
+                PROF_PH((w >> 16) & 15);
+#endif
 #ifdef CFD_PHASE
                 MATH(({
                     const uint64_t t_ = ckernel::read_wall_clock();
@@ -334,10 +360,14 @@ void kernel_main() {
 #endif
     }
 #ifdef CFD_PROF
+#ifndef CFD_PROF_SH
+#define CFD_PROF_SH 4   // census cycle words leave in units of 2^CFD_PROF_SH cycles (run_mesh --prof-shift)
+#endif
+    PROF_PH_END();
     // hdr words 128 + 40 * thread + op (UNPACK, MATH, PACK), op counts at 248 + op
-    UNPACK(for (uint32_t i = 0; i < 40; ++i) hw[128 + i] = static_cast<uint32_t>(cyc[i] >> 4));
-    MATH(for (uint32_t i = 0; i < 40; ++i) hw[168 + i] = static_cast<uint32_t>(cyc[i] >> 4));
-    PACK(for (uint32_t i = 0; i < 40; ++i) hw[208 + i] = static_cast<uint32_t>(cyc[i] >> 4));
+    UNPACK(for (uint32_t i = 0; i < 40; ++i) hw[128 + i] = static_cast<uint32_t>(cyc[i] >> CFD_PROF_SH));
+    MATH(for (uint32_t i = 0; i < 40; ++i) hw[168 + i] = static_cast<uint32_t>(cyc[i] >> CFD_PROF_SH));
+    PACK(for (uint32_t i = 0; i < 40; ++i) hw[208 + i] = static_cast<uint32_t>(cyc[i] >> CFD_PROF_SH));
     UNPACK(for (uint32_t i = 0; i < 40; ++i) hw[248 + i] = cnt[i]);
 #endif
 #ifdef CFD_PHASE
