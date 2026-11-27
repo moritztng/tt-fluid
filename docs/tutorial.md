@@ -119,7 +119,7 @@ python -c "import numpy as np; open('motorbike.hist.json', 'w').write(str(np.loa
 ### 5. Grade and price it
 
 ```bash
-python3 bench/nvidia/cdwindow.py --dev motorbike.hist.json:1 --of coefficient.dat --from 101 --to 800
+python3 bench/nvidia/cdwindow.py --dev motorbike.hist.json:0 --of coefficient.dat --from 101 --to 799
 python3 bench/per_dollar.py
 ```
 
