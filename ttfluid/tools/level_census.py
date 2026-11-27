@@ -53,6 +53,17 @@ def pieces(mir):
     return out
 
 
+def pertile(m, r):
+    """A value with one instance per tile: a vector, or a fused run's scratch register."""
+    return isinstance(r, int) and (m.is_vec(r) or m.space[r].name == "scratch")
+
+
+def loop(m, x):
+    """Tile-loop count of a block: Machine.tiles, 1 for a block of one-tile values only."""
+    regs = [u[2] for u in x[1] if u[0] in ("ld", "lds", "rvf", "ldr") and u[2] is not None] + [r for _, r in x[2]]
+    return m.tiles([x]) if any(pertile(m, r) for r in regs) or any(u[0] == "ldr" for u in x[1]) else 1
+
+
 def units_of(m, mir, idxs):
     """[(j, k, x, level, reads, writes)] of one straight-line piece. x: a block (k-th of a fused run), a gather, halo,
     red, red2, fetch or out. reads and writes are VALUES (register, version): version 0 is the piece's input, every
@@ -78,7 +89,7 @@ def units_of(m, mir, idxs):
                             if h is not None:
                                 rd.append((("H", h), False))
                 df = [r for _, r in x[2] if r != "__anchor__"]
-                acc = m.tiles([x]) > 1        # a one-tile value written by a tile loop is a sum over tiles
+                acc = loop(m, x) > 1          # a one-tile value written by a tile loop is a sum over tiles
             elif op == "gather":
                 for s, h in x[3]:
                     rd.append((s, True))
@@ -102,7 +113,7 @@ def units_of(m, mir, idxs):
             wv = []
             for r in df:
                 ver[r] = ver.get(r, 0) + 1
-                lvl[val(r)] = L + (1 if acc and not m.is_vec(r) else 0)
+                lvl[val(r)] = L + (1 if acc and not pertile(m, r) else 0)
                 wv.append(val(r))
             out.append((j, k, x, L, [v for v, _ in rv], wv))
     return out, ver
@@ -126,8 +137,12 @@ def census(prog, m, core, gcache, tsort, budgets):
             ph = labels_ph[ins[1]]
         ph_at.append(ph)
     ovl = getattr(m, "ovl", {})
-    home = lambda r: "ovl" if r in ovl else ("const" if m.phys[r] >= KBASE else "dram") if r in m.dram else "l1"
-    vec = lambda r: isinstance(r, int) and r in m.phys and m.is_vec(r)
+    # scr: a fused run's one-tile scratch; ovl and l1: vectors with an L1 home today, left where they are
+    home = lambda r: "scr" if m.space[r].name == "scratch" else "ovl" if r in ovl else \
+        ("const" if m.phys[r] >= KBASE else "dram") if r in m.dram else "l1"
+    vec = lambda r: isinstance(r, int) and r in m.phys and pertile(m, r)
+    vsz = {}
+    size = lambda v: m.size(v[0]) if m.is_vec(v[0]) else vsz.get(v, 1)
     tab = m.maps.tab
     gm = {}
 
@@ -173,7 +188,7 @@ def census(prog, m, core, gcache, tsort, budgets):
                 readers[(ri, v)].add(L)
             V = dict((v[0], v) for v in rv)       # register -> the value this unit reads
             if x[0] == "blk":
-                bt = m.tiles([x])
+                bt = loop(m, x)
                 c["blocks"] += bt
                 for u in x[1]:
                     if u[0] in ("ld", "rvf", "lds"):
@@ -198,6 +213,7 @@ def census(prog, m, core, gcache, tsort, budgets):
                         c["store" if r in m.dram else "st_l1"] += bt
                 for v in wv:
                     if vec(v[0]):
+                        vsz[v] = bt
                         g.ev.append(("d", v))
             elif x[0] == "gather":
                 if len(x) < 5 or x[4] in (1, 3, 4):
@@ -218,13 +234,13 @@ def census(prog, m, core, gcache, tsort, budgets):
         today = {k: c[k] for k in KINDS}
         fg = 0        # gather sources of the level, each read once through the cache in destination-tile order
         for (s, _), lst in g.gath.items():
-            if not vec(s) or home(s) == "l1":
+            if not vec(s) or home(s) in ("l1", "ovl", "scr"):
                 continue
             d = np.concatenate([entries(mid, k)[0] for mid, k in lst])
             st = np.concatenate([entries(mid, k)[1] for mid, k in lst])
             q = np.lexsort((st, d))
             fg += _misses(st[q].tolist(), gcache)
-        ev = [(k, v) for k, v in g.ev if home(v[0]) != "l1"]
+        ev = [(k, v) for k, v in g.ev if home(v[0]) not in ("l1", "ovl")]
         nxt = defaultdict(list)
         for i, (k, v) in enumerate(ev):
             if k == "u":
@@ -249,17 +265,17 @@ def census(prog, m, core, gcache, tsort, budgets):
                     del held[e]
                     if e in mine and e not in indram:     # a value of the level leaves scratch: stored once
                         indram.add(e)
-                        pages["spill"] += m.size(e[0])
+                        pages["spill"] += size(e)
             peak = 0
             for i, (k, v) in enumerate(ev):
                 if k == "u":
                     if v not in held:
-                        pages["spill" if v in mine else "const" if home(v[0]) == "const" else "vec"] += m.size(v[0])
+                        pages["spill" if v in mine else "const" if home(v[0]) == "const" else "vec"] += size(v)
                     keep(v, i)
                 else:
                     mine.add(v)
                     if v in outs:
-                        pages["store"] += m.size(v[0])
+                        pages["store"] += size(v)
                         indram.add(v)
                     keep(v, i)
                 peak = max(peak, len(held))
