@@ -69,7 +69,8 @@ on the chip exactly as OpenFOAM's `tolerance` and `relTol` would decide it.
 `ttfluid.resident.machine.Machine` then:
 
 1. partitions the cells over chips and cores with recursive coordinate bisection (`--layout rcb`), about 110 cores per
-   Blackhole chip;
+   Blackhole chip; each cut goes along the axis that cuts the fewest mesh faces, which keeps thin refinement layers
+   from being sliced into parts that are almost all halo (3.3x less worst-core halo on the coarse occDrivAer);
 2. turns every gather into local reads plus halo receives, and every reduction into a per-core partial sum followed by
    a tree over cores and chips;
 3. schedules the instructions (`--lsched`, `--phase`), fuses chains of element-wise work (`--fuse`, `--cse`), and
