@@ -111,6 +111,63 @@ gather tile cache and fused SpMV row products). Each change was accepted only if
 stayed bitwise equal, so the cost runs inherit this grade; `vq3.status` records the bitwise comparison of both boards'
 final states against two earlier builds.
 
+## 3a. Grading a new run
+
+`bench/cdgrade.py` turns the comparison above into a pass or fail for any new run of this case, on a device or on a GPU:
+
+```bash
+python3 bench/cdgrade.py --run results/tenstorrent/quietbox2-p300x4/qb2k2_D1A.hist.json:0 \
+    results/tenstorrent/quietbox2-p300x4/qb2k2_D2A.hist.json:800
+python3 bench/cdgrade.py --run results/nvidia/dgx-h100/A_SPDP_g1/coefficient.dat
+python3 bench/cdgrade.py --run new.hist.json:0 --base old.hist.json:0     # did a change move the answer?
+```
+
+It compares the mean Cd of a window with OpenFOAM's long-run mean (iterations 501-3372, Cd 0.42226 +- 3.5 counts) and
+passes the run if the difference is inside a band. The band is 12.5 counts, or two standard deviations of the
+difference where that is wider, and it is known before the run because the noise of a window mean is known:
+
+| measured on | standard deviation of a 100-iteration mean of Cd, counts |
+|---|---|
+| OpenFOAM v2412 fp64, iterations 201-3372 | 20.7 |
+| 18 SPUMA runs, across runs, iterations 301-800 | 16.5 |
+| tt-fluid on QuietBox 2, iterations 201-1899 | 15.2 |
+
+The tool uses 20. Blocks of 100 iterations are close to independent, so a window of n blocks has 20 / sqrt(n). The 18
+SPUMA runs check this directly: their means over iterations 201-800 have a standard deviation of 8.9 counts, and the
+rule gives 8.2.
+
+| window | band, counts | a bias this large fails 9 times in 10 |
+|---|---|---|
+| 201-800 (one 800-iteration run) | 17.8 | 29 |
+| 201-1800 and longer | 12.5 | 20 down to 18 |
+
+Three choices behind it:
+
+- The reference is OpenFOAM's long-run mean, not OpenFOAM over the same iterations. Two runs from the same start are
+  unrelated after about 300 iterations, so pairing them only adds the reference's own noise. OpenFOAM's mean over
+  101-800 happens to lie 11.8 counts below the average of the 18 SPUMA runs, while that average is 0.7 counts from
+  OpenFOAM's long-run mean.
+- The window starts at 201. Iterations 101-200 still carry a start-up transient whose size depends on the linear
+  solvers (the block mean ranges from -12 to -40 counts across the runs in `results/`).
+- An 800-iteration run is a screen for gross errors. It cannot tell a 15-count bias from chance. A change that
+  alters the trajectory needs iterations 201-1800 to be held to 12.5 counts.
+
+With `--base` the tool also reports the shift against a baseline run over the same window. Two correct runs that differ
+only in the order of their floating-point sums sit 11.5 counts apart (one standard deviation) on 201-800: the 28 pairs
+of identical SPUMA SPDP runs measure 16.1, the 28 double-precision pairs 8.8. A shift inside twice that is no change.
+
+What the runs in `results/` grade as:
+
+| run | window | Cd against OpenFOAM, counts | band | grade |
+|---|---|---|---|---|
+| 16 SPUMA runs on H100, 2 on B200 | 201-800 | -12.6 to +27.0, mean +5.3 | 17.8 | 17 pass, 1 fails (+27.0) |
+| tt-fluid, QuietBox 2 board A | 201-800 | -22.8 | 17.8 | fail |
+| tt-fluid, QuietBox 2 board A | 201-1899 | -17.0 | 12.5 | fail |
+
+One failure in 18 correct runs is what a two-sigma band gives. The QuietBox 2 run is low in 16 of its 18 blocks, which
+is 2.8 standard deviations over 201-1899: either a real low bias of 10 to 17 counts (0.2 to 0.4 % of Cd) or a rare
+draw. A 3,000-iteration run will decide; until then this run does not pass.
+
 ### A known behaviour of the case
 
 On long runs (about 2,200 iterations) HPC_motorbike Small can produce a NaN on the device. The same discretisation in fp64

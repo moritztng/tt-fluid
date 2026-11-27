@@ -8,7 +8,7 @@ from, which is OpenFOAM's row for that iteration) or an OpenFOAM coefficient.dat
 
 The case never settles under SIMPLE: Cd swings about 40 counts from iteration to iteration (1 count = 1e-4), and two
 runs from the same start are unrelated after about 300 iterations. So a run is graded on the mean over a window, and
-the noise of that mean is known in advance from the record (docs/accuracy.md, section 3a): the mean of 100 iterations
+the noise of that mean is known in advance from measured runs (docs/accuracy.md, section 3a): the mean of 100 iterations
 has a standard deviation of S100 counts, blocks of 100 are close to independent, so a window of n blocks has
 S100 / sqrt(n).
 
