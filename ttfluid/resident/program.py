@@ -61,7 +61,7 @@ class TracedOps(EllOps):
 
     def krylov(self, symmetric):
         f = krylov.pcg if symmetric else krylov.pbicgstab
-        if symmetric and getattr(self, "amg_levels", None) is not None:   # an empty SALevels (--amg-depth 0) is falsy
+        if symmetric and getattr(self, "amg_levels", None) is not None:
             levels = self.amg_levels
             f = lambda A, x, b, c: krylov.amg_pcg(A, x, b, c, levels)
 
@@ -202,6 +202,8 @@ def build(solver, max_outer=2000, amg_owner=None, amg_kind="pairwise", amg_smoot
             tr.index_space[id(p.faceCells)] = pspace[p.name]
     tr.index_space[id(ops.cnbr)] = cells
     tops = TracedOps(ops, tr, dict(pspace, __cells__=cells))
+    if amg_depth == 0:                     # no coarse level: Jacobi PCG, not a lone Chebyshev smoother
+        amg_owner = None
     if amg_owner is not None and amg_kind == "sa":
         from . import sa
         levels, lmax = sa_setup(ops, np.asarray(amg_owner), amg_smoothed, chip_cores=amg_chip_cores, depth=amg_depth, min_core=amg_min_core)
