@@ -61,6 +61,12 @@ iterations. Lift agrees to within 3 counts. Against OpenFOAM's long-run mean (it
 window above is still partly transient and the Tenstorrent run is the furthest off, at -21 counts;
 [docs/accuracy.md](docs/accuracy.md) has all of it.
 
+**occDrivAer.** The coarse occDrivAer car (1.6 M cells, [cases/occDrivAer](cases/occDrivAer)) ran iterations 1-3999 on
+one Blackhole chip. Its mean Cd over iterations 1001-3999 is 0.2738, 15.0 counts above a serial OpenFOAM v2412 fp64
+run and 0.5 counts from an 8-rank OpenFOAM run restarted from that run's iteration 1000. The two OpenFOAM runs differ
+from each other by 15.1 counts, so on this case the device is as close to OpenFOAM as OpenFOAM is to itself
+([details](docs/accuracy.md#4-drag-and-lift-against-openfoam-occdrivaer-coarse-mesh)).
+
 ## Install
 
 Python 3.10 or newer, Linux x86-64. On a machine with Tenstorrent cards (driver and firmware installed as for any
@@ -144,7 +150,7 @@ with `ruff` and a full-history `gitleaks` scan.
 
 ## Roadmap
 
-- A Blackhole Galaxy (32 chips) run of HPC_motorbike Small, and the 65 M-cell occDrivAer car case.
+- A Blackhole Galaxy (32 chips) run of HPC_motorbike Small, and the larger occDrivAer meshes (up to 65 M cells).
 - Lower large cases in parallel across chips (`ttfluid/lower/spmd.py`) so host RAM stops being the limit.
 - Close the first-iteration SST gap on pitzDaily.
 - More boundary conditions and the simpleFoam variants that keep the same structure (e.g. porosity, MRF).
