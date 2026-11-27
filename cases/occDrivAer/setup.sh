@@ -1,9 +1,10 @@
 #!/bin/bash
 # Build the 1,606,238-cell occDrivAer case from the OpenFOAM HPC committee repository, ready to lower with tt-fluid.
 # Needs OpenFOAM v2412 in the environment, git, about 40 GB of free RAM for snappyHexMesh, and NP cores.
-#   cases/occDrivAer/setup.sh DIR [NP]      ->  DIR/occDrivAer (constant/polyMesh, 0/ from potentialFoam, system/)
+#   cases/occDrivAer/setup.sh DIR [NP] [SHIFT]  ->  DIR/occDrivAer (constant/polyMesh, 0/ from potentialFoam, system/)
+# SHIFT (default 4) is how many refinement levels below the committee's dicts to mesh; 3 gives a finer mesh.
 set -euo pipefail
-DIR=${1:?usage: setup.sh DIR [NP]}; NP=${2:-8}
+DIR=${1:?usage: setup.sh DIR [NP] [SHIFT]}; NP=${2:-8}; SHIFT=${3:-4}
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=https://develop.openfoam.com/committees/hpc.git
 SHA=84c262431117f5c921db8335e368a12d0e9fa3f0
@@ -22,7 +23,7 @@ git -C "$DIR/hpc" checkout -q "$SHA"
 
 # 2. Coarse mesh: the RotMesh snappy dicts, four refinement levels down, one static region
 rm -rf "$DIR/mesh"
-python3 "$HERE/coarsen.py" "$DIR/hpc/$ROT/occDrivAerRotMesh.orig" "$DIR/mesh" 4 "$NP"
+python3 "$HERE/coarsen.py" "$DIR/hpc/$ROT/occDrivAerRotMesh.orig" "$DIR/mesh" "$SHIFT" "$NP"
 cd "$DIR/mesh"; mkdir -p logs
 cp system/fvSchemes.mesh system/fvSchemes
 run blockMesh blockMesh
