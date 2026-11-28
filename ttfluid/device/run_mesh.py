@@ -110,6 +110,10 @@ ap.add_argument("--tgts", type=int, default=None, help="J in 1..7: compute's UNP
 ap.add_argument("--tpat", type=int, default=0, help="J in 1..7: compute's UNPACK also takes J / 8 of the local L1-source lanes of every page "
                 "NCRISC patches or gathers in a STREAM op (dense or sparse), out of what --bpatch leaves NCRISC (CFD_TPAT, the --tgts "
                 "mailbox: UNPACK waits for that very page and copies from inside the wait); 0 off. A run flag. Data movement only: bit-exact")
+ap.add_argument("--dshare", default="", help="N,B,U,M,P (five non-negative ints summing to 64, 16-lane chunks): per-RISC shares of dense "
+                "GATHER tiles across NCRISC, BRISC, UNPACK, MATH, PACK (CFD_DSHARE). Empty: use --bgts/--tgts. Bit-exact")
+ap.add_argument("--pshare", default="", help="N,B,U,M,P (five non-negative ints summing to 64, 16-lane chunks): per-RISC shares of dense "
+                "STREAM tiles (CFD_PSHARE). Empty: same as --dshare when --dshare is set, else --bpatch/--tpat. Bit-exact")
 ap.add_argument("--amg", action="store_true", help="p PCG preconditioned by smoothed aggregation (ttfluid.resident.sa), aggregates on the K x 72 global cores; "
                 "the coarse levels are chip-local (sa.setup chip_cores): only the fine level exchanges between chips")
 ap.add_argument("--amg-kind", default="sa", choices=["sa"])
@@ -619,8 +623,22 @@ assert 0 <= a.bgts < 8 and not (a.bgts and not a.tabstream), "--bgts K: 1..7 wit
 assert not a.tsort or a.tabstream, "--tsort 1 needs --tabstream"
 assert 0 <= a.tgts < 8 and not (a.tgts and not a.tabstream) and a.tgts < (a.bgts or 8), "--tgts J: 1..7 with --tabstream, below --bgts"
 assert 0 <= a.tpat < (a.bpatch or 1) and not (a.tpat and not a.tgts), "--tpat J: 1..7 with --tgts (its mailbox), below --bpatch"
-# + the B-patch mailbox (vm_brisc.cpp bsvc) and the T-gather one before it (vm_compute.cpp tsvc)
-SYNCB = -(-(E0 + 1616 + (256 if a.bpatch or a.bgts or a.tgts else 0) + (256 if a.tgts else 0)) // 4096) * 4096
+def _parse_share(s, name):
+    if not s:
+        return None
+    v = tuple(int(x) for x in s.split(","))
+    assert len(v) == 5 and all(x >= 0 for x in v) and sum(v) == 64, "%s: five non-negative ints summing to 64" % name
+    return v
+dshare = _parse_share(a.dshare, "--dshare")
+pshare = _parse_share(a.pshare, "--pshare") if a.pshare else dshare
+assert not (dshare or pshare) or (a.tabstream and a.tabdense), "--dshare/--pshare need --tabstream and --tabdense"
+has_dm = bool((dshare and dshare[3]) or (pshare and pshare[3]))
+has_dp = bool((dshare and dshare[4]) or (pshare and pshare[4]))
+has_dmp = has_dm or has_dp
+need_mb = bool(a.bpatch or a.bgts or a.tgts or (dshare and (dshare[1] or dshare[2])) or (pshare and (pshare[1] or pshare[2])) or has_dmp)
+need_tmb = bool(a.tgts or (dshare and dshare[2]) or (pshare and pshare[2]) or has_dmp)
+# + the B-patch mailbox (vm_brisc.cpp), the T-gather one before it (vm_compute.cpp) and the 64-B D-gather mailbox
+SYNCB = -(-(E0 + 1616 + (256 if need_mb else 0) + (256 if need_tmb else 0) + (64 if has_dmp else 0)) // 4096) * 4096
 
 
 def cbd(i, pages, page, fmt=ttnn.uint32):
@@ -715,6 +733,15 @@ def kd(src, ct, cfg, rt=None, crt=None):
         ([("CFD_DENSE", "1")] if a.tabdense and src in ("vm_ncrisc.cpp", "vm_brisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_TGTS", str(a.tgts))] if a.tgts and src in ("vm_ncrisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_TPAT", str(a.tpat))] if a.tpat and src == "vm_ncrisc.cpp" else []) + \
+        ([("CFD_DSHARE", "1"), ("CFD_DN", str(dshare[0])), ("CFD_DB", str(dshare[1])), ("CFD_DU", str(dshare[2])), ("CFD_DM", str(dshare[3])), ("CFD_DP", str(dshare[4]))] if dshare and src == "vm_ncrisc.cpp" else []) + \
+        ([("CFD_DB", str(dshare[1]))] if dshare and dshare[1] and src == "vm_brisc.cpp" else []) + \
+        ([("CFD_DU", str(dshare[2]))] if dshare and dshare[2] and src == "vm_compute.cpp" else []) + \
+        ([("CFD_PSHARE", "1"), ("CFD_PN", str(pshare[0])), ("CFD_PB", str(pshare[1])), ("CFD_PU", str(pshare[2])), ("CFD_PM", str(pshare[3])), ("CFD_PP", str(pshare[4]))] if pshare and src == "vm_ncrisc.cpp" else []) + \
+        ([("CFD_PB", str(pshare[1]))] if pshare and pshare[1] and src == "vm_brisc.cpp" else []) + \
+        ([("CFD_PU", str(pshare[2]))] if pshare and pshare[2] and src == "vm_compute.cpp" else []) + \
+        ([("CFD_DMP", "1")] if has_dmp and src in ("vm_ncrisc.cpp", "vm_brisc.cpp", "vm_compute.cpp") else []) + \
+        ([("CFD_DMP_M", "1")] if has_dm and src in ("vm_ncrisc.cpp", "vm_compute.cpp") else []) + \
+        ([("CFD_DMP_P", "1")] if has_dp and src in ("vm_ncrisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_GTILE", "1")] if a.gtile and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_NARROW", str(CB_H))] if a.narrow and src == "vm_compute.cpp" else []) + \
         ([("CFD_NARROW_OUT", str(CB_OH))] if a.narrow >= 2 and src == "vm_compute.cpp" else [])
@@ -1020,7 +1047,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         h[:, w] += h[:, w + 400] << 32
     root = [k * P for k in range(K)]
     gws = sorted(gtab)
-    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, tpat=a.tpat, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
+    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, tpat=a.tpat, dshare=a.dshare, pshare=a.pshare, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
                plan=info, sizes=E.sizes(), l1=l1, rows=nrow, walls=walls, ticks=ticks,
                ms_device=[max(t) / amax / 1e3 for t in ticks], aiclk=clks,
                same_history_all_chips=bool(all(np.array_equal(hist_all[0, :nrow], hist_all[k, :nrow]) for k in range(K))),
