@@ -12,6 +12,9 @@ face takes decide how many residue entries exist. MESH.npz and the CLASS+KEY ord
             with the most cells in rows of 8 or more. The lattice: a cell with six faces, one per
             direction, is regular; regular cells joined by a face form a piece of one refinement level, and walking the
             faces gives every cell of a piece integer coordinates. Pieces by size, the other cells behind them (rcm).
+A class may carry q<Q> (clsq256+boxa): every stretch of 4Q lanes of a class is split into four interleaved quarters
+(machine._quarter; q0 the whole class, qp each lattice piece), so a neighbour s places on sits 4s lanes on and the
+shift is one the unpacker and the NoC can address (16 B).
 
 Slots: `face` (today: the k-th face of a cell in face order) and `dir` (the first face of direction c takes slot c,
 further faces of a direction take slots 6 and up).
@@ -41,6 +44,7 @@ import numpy as np
 
 from . import ordercensus as oc
 from .ordercensus import G, LANES
+from ..resident.machine import _quarter
 
 BIG = 1 << 20
 AX = {"x": (0, 1, 2), "y": (1, 2, 0), "z": (2, 0, 1)}     # fastest, middle, slowest
@@ -169,6 +173,7 @@ def core(c):
         out["brick"][f] = dict(tiles=tiles, lanes=int(tiles * LANES + (~inbox).sum()), covered=int(good.sum() - side.sum()))
     for how in G["orders"]:
         cls, _, key = how.rpartition("+")
+        cls, _, quart = cls.partition("q")
         cl = -fc if cls == "sliced" else L[fc - 1] if cls == "cls" else np.zeros(n, np.int64)
         lane = np.empty(n, np.int64)
         if cls.startswith("ch"):
@@ -176,7 +181,38 @@ def core(c):
             lane[np.lexsort((K[key], cl, K[key] // (int(cls[2:]) * LANES)))] = np.arange(n)
         else:
             lane[np.lexsort((K[key], cl))] = np.arange(n)
-        out["orders"][how] = {s: cover(lane, row, oth, loc, slots[s], nslot) for s in slots}
+        if quart:       # q<Q>: stretches of 4Q lanes of a class quartered (0: the whole class); qp: each lattice piece
+            od = np.argsort(lane)
+            run_of = cl[od] * (len(size) + 1) + crank[od] if quart == "p" else cl[od]
+            start = np.flatnonzero(np.r_[True, run_of[1:] != run_of[:-1]])
+            run = np.diff(np.r_[start, n])
+            m = np.arange(n) - np.repeat(start, run)
+            lane[od] = np.repeat(start, run) + _quarter(m, np.repeat(run, run), BIG if quart in "0p" else int(quart))
+            assert len(np.unique(lane)) == n
+        if G.get("shifts") is None:
+            out["orders"][how] = {s: cover(lane, row, oth, loc, slots[s], nslot) for s in slots}
+        else:
+            out["orders"][how] = {s: gmiss(lane, row, oth, loc, slots[s], G["shifts"][how][s], G["ngc"]) for s in slots}
+    return out
+
+
+def gmiss(lane, row, oth, loc, slot, shift, ngcs):
+    """ordercensus's page model (per slot, the (destination tile, source tile) pairs of the local entries walked by
+    destination tile through ngc round-robin 4-KB slots) for every local entry (`all`) and for the residue the map's
+    shift leaves (`res`, shift: slot -> lanes); `floor` is one page per source tile and slot, `at` the entries at
+    the shift."""
+    dl, sl, s = lane[row[loc]], lane[oth[loc]], slot[loc]
+    at = sl - dl == np.array([shift.get(k, BIG) for k in range(int(s.max()) + 1)])[s]
+    out = dict(at=int(at.sum()))
+    for name, keep in (("all", np.ones(len(dl), bool)), ("res", ~at)):
+        r = dict(floor=0, **{str(g): 0 for g in ngcs})
+        for k in np.unique(s[keep]):
+            e = keep & (s == k)
+            u = np.unique((dl[e] >> 10) * 64 + (sl[e] >> 10))
+            r["floor"] += len(np.unique(u % 64))
+            for g in ngcs:
+                r[str(g)] += oc.misses((u % 64).tolist(), g)
+        out[name] = r
     return out
 
 
@@ -188,6 +224,8 @@ def main():
     ap.add_argument("--cores", default="all")
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--json")
+    ap.add_argument("--misses", help="gather-cache sizes in tiles (14,40): add the page model, with and without the map's shift")
+    ap.add_argument("--sweeps", type=float, default=57.0, help="slot sweeps over DRAM-homed sources per core-it (ordercensus)")
     a = ap.parse_args()
     t0 = time.time()
     log = lambda *x: print("[%6.1f s]" % (time.time() - t0), *x, flush=True)
@@ -243,6 +281,26 @@ def main():
                     s["residue"]["core"], s["residue"]["tile24"], s["ntile24"], 100 * s["run4"], 100 * s["run8"], 100 * s["run32"],
                     s["nrun4"], s["nrun8"], s["nrun32"], 100 * s["free4"], 100 * s["free8"], 100 * s["free32"], s["nfree4"],
                     s["nfree8"], s["nfree32"], list(s["map_shifts"].values())[:6]), flush=True)
+    if a.misses:
+        G.update(ngc=[int(g) for g in a.misses.split(",")],
+                 shifts={how: {sl: {int(k): d for k, d in summ["orders"]["%s/%s/m4" % (how, sl)]["map_shifts"].items()}
+                               for sl in ("face", "dir")} for how in G["orders"]})
+        with Pool(a.jobs) as pool:
+            mres = sorted(pool.imap_unordered(core, cores), key=lambda r: r["core"])
+        log("page model done")
+        print("gather pages per slot sweep, mean of %d cores (x %.1f sweeps = pages per core-it on today's order)" % (len(res), a.sweeps))
+        print("order         slots | entries at the map's shift | every local entry gathered: floor, " + ", ".join("gcache %s" % g for g in G["ngc"]) +
+              " | residue of the shift only: floor, " + ", ".join("gcache %s" % g for g in G["ngc"]))
+        summ["pages"] = {}
+        for how in G["orders"]:
+            for sl in ("face", "dir"):
+                rs = [r["orders"][how][sl] for r in mres]
+                m = {w: {k: sum(r[w][k] for r in rs) / len(rs) for k in rs[0][w]} for w in ("all", "res")}
+                m["at"] = sum(r["at"] for r in rs) / loc
+                summ["pages"]["%s/%s" % (how, sl)] = m
+                print("%-13s %-4s | %5.1f %% | %s | %s" % (how, sl, 100 * m["at"], *(" ".join("%7.1f" % m[w][k] for k in m[w]) for w in ("all", "res"))), flush=True)
+        for r, mr in zip(res, mres):
+            r["pages"] = mr["orders"]
     if a.json:
         for r in res:
             for o in r["orders"].values():
