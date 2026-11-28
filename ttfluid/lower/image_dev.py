@@ -7,16 +7,21 @@ downloading chip by chip so the host never holds all K chips' arrays (an occDriv
     x = download_chip(t, d)                      # device d's shard of a mesh tensor, as numpy
 
 m and E are stand-ins carrying exactly the attributes run_mesh's device code reads. Upload: a mesh tensor is allocated
-on the device and written from one host buffer that holds only the bytes the image files store (host_shards);
-CFD_IMG_VERIFY=1 reads every uploaded tensor back chip by chip and compares it with the image.
+on the device and written from one host buffer that holds only the bytes the image files store (host_shards). The
+constants and the homes are mostly zero pages: the host writes only the pages that hold a value and the chips lay the
+arrays themselves (upload_placed). CFD_IMG_VERIFY=1 reads every uploaded tensor back chip by chip and compares it
+with the image.
 """
 import os
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 
 from ttfluid.lower.image import Image, LANES
+
+KERNELS = Path(__file__).resolve().parent.parent / "device" / "kernels"
 
 
 def set_outer(c, n_old, n_new):
@@ -126,22 +131,61 @@ def chip_shape(img, P, name):
     return (P, -(-n // P // 16) * 16) if name == "arena" else (n // LANES, LANES)
 
 
-def chip_fill(img, k, P, name, out, state=None):
+def chip_fill(img, k, P, name, out, state=None, row=None):
     """Chip k's device array `name` as run_mesh's device code builds it from E, written into out: a zeroed
     (rows, words) uint32 buffer of chip_shape. Only the bytes the image file stores are read, so the zero pages of
     the constants and the homes (80 % of a Small image) are never touched on the host. state: name -> global array
-    (Image.state's layout) written over the arena and the homes, so the run starts from it (run_mesh --state-in)."""
+    (Image.state's layout) written over the arena and the homes, so the run starts from it (run_mesh --state-in).
+    row: out holds only the pages chip_pages marks, page p in row row[p] (Staged)."""
     ch = img.chip(k)
     if name == "arena":
         a = np.asarray(ch["arena"]).reshape(P, -1).view(np.uint32)
         out[:, :a.shape[1]] = a
     elif name != "blob" or img.s["tab_stream"]:
-        ch.read_into(name, out)
+        ch.read_into(name, out, row)
     if state is not None and name in ("arena", "home"):
         f = out.view(np.float32)
         nt = img.s["ntiles"]
         img.put_state(k, f[:, :nt * LANES].reshape(P, nt, LANES) if name == "arena" else None,
-                      f.reshape(P, -1, LANES) if name == "home" else None, state)
+                      (f.reshape(P, -1, LANES) if row is None else f) if name == "home" else None, state,
+                      None if row is None else row.reshape(P, -1))
+
+
+def chip_pages(img, k, P, name, state=None):
+    """One bool per page of chip k's constants or homes: the page holds a value, because the image file stores it or
+    because the state is laid over it. Every other page is zero."""
+    on = img.chip(k).pages(name)
+    if state is not None and name == "home":
+        for lo, hi in state_pages(img):
+            on.reshape(P, -1)[:, lo:hi] = True
+    return on
+
+
+class Staged:
+    """An array of 4 KB pages as upload_placed sends it: only the pages that hold a value, in page order.
+    on(k): chip k's page marks; shape, fill: the staging buffer, as upload takes them (every chip's padded to the
+    longest); sparse: staging pays, the host writes less than half of the array."""
+
+    def __init__(self, DEVBLK, shape, fill, pages):
+        self.full, self.fill_full = shape, fill
+        self.on = {k: pages(k) for k in DEVBLK}
+        self.shape = (max(1, max(int(o.sum()) for o in self.on.values())), shape[1])
+        self.fill = lambda k, out: fill(k, out, np.cumsum(self.on[k]) - 1)
+        self.sparse = 2 * self.shape[0] < shape[0]
+
+    def work(self, k, W):
+        """Chip k's array split over W workers: (map, args). Worker w lays pages first .. first + count - 1; bit j of
+        its map row (uint32 words) says page first + j is staged, and its staged pages start at row start of the
+        staging buffer. args[w] = (w, first, count, start), what kernels/place.cpp takes."""
+        on = self.on[k]
+        n = -(-len(on) // W)
+        bits = np.zeros((W, -(-n // 512) * 512), bool)      # a map row is whole 64-byte DRAM reads
+        pad = np.zeros(W * n, bool)
+        pad[:len(on)] = on
+        bits[:, :n] = pad.reshape(W, n)
+        start = np.concatenate([[0], np.cumsum(pad)])[::n]
+        args = [(w, w * n, max(0, min(n, len(on) - w * n)), int(start[w])) for w in range(W)]
+        return np.packbits(bits, axis=1, bitorder="little").view(np.uint32), args
 
 
 def carry_arena(img, k, P, a_out):
@@ -185,11 +229,66 @@ def upload(md, K, DEVBLK, shape, fill, name=None, host=None):
         mb = shape[0] * shape[1] * 4 / 2**20
         print("upload %s: %d chips x %.0f MB, host shards %.2f s, write %.2f s (%.0f MB/s over the mesh), free %.2f s"
               % (name, K, mb, t1 - t0, t2 - t1, K * mb / max(t2 - t1, 1e-9), time.time() - t2), flush=True)
+    verify(t, K, DEVBLK, shape, fill, name)
+    return t
+
+
+def verify(t, K, DEVBLK, shape, fill, name):
+    """CFD_IMG_VERIFY: every chip's shard of t read back and compared with the array fill builds."""
     if os.environ.get("CFD_IMG_VERIFY"):
         for d in range(K):
             ref = np.zeros(shape, np.uint32)
             fill(DEVBLK[d], ref)
             assert np.array_equal(download_chip(t, d), ref), ("upload read back differs", name, d)
+
+
+def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, host=None):
+    """upload for a Staged array: the host writes the staged pages and a page map, and every core of a chip lays a
+    share of the array with both its data movement processors (kernels/place.cpp), copying the staged pages to their
+    places and writing the rest as zeros. The array ends up as upload leaves it; the PCIe write carries a fifth of
+    the bytes (zeros cost it what data costs) and the host never holds the zero pages. cells[d]: device d's mesh
+    coordinate; host: as upload, for the staging buffer."""
+    import ttnn
+    K, P, W, NB = len(DEVBLK), len(cores), 2 * len(cores), 16
+    prof = name and os.environ.get("CFD_UPLOAD_PROFILE")
+    t = ttnn.allocate_tensor_on_device(ttnn.Shape(list(sg.full)), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
+    t_stage = upload(md, K, DEVBLK, sg.shape, sg.fill, name and name + " staged", host)
+    t0 = time.time()
+    work = {k: sg.work(k, W) for k in DEVBLK}
+    mw = work[DEVBLK[0]][0].shape[1]
+    t_map = upload(md, K, DEVBLK, (W, mw), lambda k, out: np.copyto(out, work[k][0]))
+    acc = [a for x in (t, t_stage, t_map) for a in ttnn.TensorAccessorArgs(x).get_compile_time_args()]
+    l1 = 4 * mw + 4096 * (NB + 1)
+    mpd = ttnn.MeshProgramDescriptor()
+    for d, rc in enumerate(cells):
+        prog = ttnn.ProgramDescriptor()
+        prog.cbs = [ttnn.CBDescriptor(total_size=l1, core_ranges=grid, format_descriptors=[
+            ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.uint32, page_size=l1)]) for i in (0, 1)]
+        kernels = []
+        for i, (proc, noc) in enumerate(((ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0),
+                                         (ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1))):
+            kd = ttnn.KernelDescriptor(kernel_source=str(KERNELS / "place.cpp"), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                                       core_ranges=grid, compile_time_args=[i, 4 * mw, NB] + acc,
+                                       config=ttnn.DataMovementConfigDescriptor(processor=proc, noc=noc))
+            rt = ttnn.RuntimeArgs()
+            for c, (x, y) in enumerate(cores):
+                rt[x][y] = list(work[DEVBLK[d]][1][2 * c + i])
+            kd.runtime_args = rt
+            kd.common_runtime_args = [x.buffer_address() for x in (t, t_stage, t_map)]
+            kernels.append(kd)
+        prog.kernels = kernels
+        mc = ttnn.MeshCoordinate(*rc)
+        mpd[ttnn.MeshCoordinateRange(mc, mc)] = prog
+    t1 = time.time()
+    ttnn.generic_op([t_stage, t_map, t], mpd)
+    ttnn.synchronize_device(md)
+    t2 = time.time()
+    ttnn.deallocate(t_stage)
+    ttnn.deallocate(t_map)
+    if prof:
+        print("place %s: %d of %d pages per chip staged, map and program %.2f s, laid on the chips in %.2f s (compile included)"
+              % (name, sg.shape[0], sg.full[0], t1 - t0, t2 - t1), flush=True)
+    verify(t, K, DEVBLK, sg.full, sg.fill_full, name)
     return t
 
 
