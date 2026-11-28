@@ -25,13 +25,15 @@ DROP = int(os.environ.get("CFD_AMG_DROP", -1))
 class Level:
     """Static structure of one coarse level (host arrays)."""
 
-    def __init__(self, nbr, mask, agg, w=None, cap=None, owner=None, fmax=None):
+    def __init__(self, nbr, mask, agg, w=None, cap=None, owner=None, fmax=None, chip=None):
         """w (n, S): edge weights of the finer graph (strength); cap: at most this many coarse neighbours per row,
         kept by strength symmetrically (a pair survives only if it is in the top `cap` of BOTH rows); a dropped
         pair's coefficients are discarded (DROP = -1: symmetric, more diagonally dominant, lmax = 2 still bounds
         D^-1 A). Lumping them into the diagonal instead gave NaN at cap <= 16 on motorBike (rows left empty).
         owner (n,), fmax: the core of every finer row and the most lanes one core may hold of a flat coefficient
-        space; the coarse coefficients then go into several flat spaces (slot ranges), none wider than fmax."""
+        space; the coarse coefficients then go into several flat spaces (slot ranges), none wider than fmax.
+        chip (n,): the chip of every finer row. A coarse pair across two chips is dropped like a capped one, so the
+        coarse halo exchange stays inside a chip (the fine level keeps its couplings across chips)."""
         n, S = nbr.shape
         if w is None:
             w = mask.astype(np.float64)
@@ -53,6 +55,11 @@ class Level:
         valid = mask.ravel()
         I, J = agg[rows], agg[cols]
         off_pair = valid & (I != J)
+        self.cut = 0
+        if chip is not None:
+            same = np.asarray(chip)[rows] == np.asarray(chip)[cols]
+            self.cut = int((off_pair & ~same).sum())
+            off_pair &= same
         pairs, inv = np.unique(np.c_[I[off_pair], J[off_pair]], axis=0, return_inverse=True)
         pw = np.zeros(len(pairs))
         np.add.at(pw, inv.ravel(), np.abs(np.asarray(w, np.float64).ravel()[off_pair]))
@@ -325,15 +332,17 @@ class Levels(list):
     shape = None
 
 
-def build(nbr, mask, aggs, w=None, cap=CAP, shape=None, owner=None):
+def build(nbr, mask, aggs, w=None, cap=CAP, shape=None, owner=None, chip_cores=None):
     """aggs: one fine->coarse map per level (level l's map indexes level l-1's rows); w: fine edge weights (n, S),
     cap: coarse ELL width limit (Level), shape: the cycle Ops runs (Ops.cycle), owner: the core of every fine row
-    (the flat coefficient spaces then stay within the fullest core's cells, Level)."""
+    (the flat coefficient spaces then stay within the fullest core's cells, Level), chip_cores: cores per chip (the
+    coarse levels are then cut at the chip boundary, Level)."""
     levels = Levels()
     levels.shape = shape
     fmax = int(np.bincount(np.asarray(owner)).max()) if owner is not None else None
     for agg in aggs:
-        L = Level(nbr, mask, np.asarray(agg), w, cap, owner, fmax)
+        chip = np.asarray(owner) // chip_cores if owner is not None and chip_cores else None
+        L = Level(nbr, mask, np.asarray(agg), w, cap, owner, fmax, chip)
         levels.append(L)
         nbr, mask, w = L.nbr, L.mask, L.cw
         if owner is not None:
