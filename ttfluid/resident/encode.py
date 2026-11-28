@@ -226,6 +226,10 @@ class Encoded:
                 gt[j] = m.tiles([x])
             self.gtile_n = len(gt)
         waitn = [False, None]   # gtile: a C_WAITN owed after the next C_TBEG; where it went
+        # gather census (tabstream.gcensus): one row per patched reader page and per gather op in program order:
+        # (class, map, dense twin or None, parts, phase id or None)
+        self.gops, cur_ph = [], [None]
+        gsrc = lambda xs: "dram" if all(phys[x] >= DBASE for x in xs) else "mixed" if any(phys[x] >= DBASE for x in xs) else "l1"
 
         def head(blks):
             """Open the tile loop of one block or of a fused segment's blocks: TBEG, the reader's one stream of every
@@ -259,6 +263,11 @@ class Encoded:
                             and [x for x, _ in u[5]] == [u[2]]):
                         # window and residue from one L1 vector: this page reads the map's dense twin
                         mid = twin.setdefault((mid, u[3]), len(m.maps.tab) + len(twin))
+                    if u[4] is not None:
+                        xs = [y for y, _ in u[5]]
+                        self.gops.append(("page %d-part %s, window %s" % (len(xs), gsrc(xs), "none" if u[2] is None else
+                                          "dram" if phys[u[2]] >= DBASE else "same l1" if xs == [u[2]] else "other l1"),
+                                          u[4], mid if mid != u[4] else None, len(xs), cur_ph[0]))
                     assert -(1 << 31 - ss) <= u[3] < 1 << 31 - ss and (mid or 0) < (1 << 28 - ss) - 1, (u[3], mid)
                     n(desc(u[2]), (u[3] & (1 << 32 - ss) - 1) << ss | (0 if mid is None else mid + 1) << 4 | len(u[5]))
                     for x, h in u[5]:
@@ -380,17 +389,22 @@ class Encoded:
             elif op == "gather":
                 assert phys[ins[1]] < DBASE and len(ins[3]) < 16, "an N_GATHER carries at most 15 parts"
                 mid = ins[2]
-                if tab_dense and len(ins[3]) == 1 and not (len(ins) > 4 and ins[4]) and phys[ins[3][0][0]] < DBASE:
-                    # a split gather (machine.py _place): the block in front stored the source read at the map's
-                    # shift, this op patches the residue. From one L1 vector both halves are one dense table: the
-                    # op reads the twin and writes every lane of its tiles (the block's copy stays, overwritten)
-                    k = j - 1
-                    while k >= 0 and mir[k][0] in ("sync", "tok"):
-                        k -= 1
-                    x = mir[k] if k >= 0 else ("",)
-                    if (x[0] == "blk" and [r for _, r in x[2]] == [ins[1]] and x[1][-1][0] == "lds"
-                            and x[1][-1][2] == ins[3][0][0] and all(u[2] == "__anchor__" for u in x[1][:-1])):
-                        mid = twin.setdefault((mid, x[1][-1][3]), len(m.maps.tab) + len(twin))
+                # a split gather (machine.py _place): the block in front stored the source read at the map's shift,
+                # this op patches the residue
+                jb = j - 1
+                while jb >= 0 and mir[jb][0] in ("sync", "tok"):
+                    jb -= 1
+                xb = mir[jb] if jb >= 0 else ("",)
+                split = (len(ins[3]) == 1 and not (len(ins) > 4 and ins[4]) and xb[0] == "blk"
+                         and [r for _, r in xb[2]] == [ins[1]] and xb[1][-1][0] == "lds"
+                         and xb[1][-1][2] == ins[3][0][0] and all(u[2] == "__anchor__" for u in xb[1][:-1]))
+                if tab_dense and split and phys[ins[3][0][0]] < DBASE:
+                    # from one L1 vector both halves are one dense table: the op reads the twin and writes every
+                    # lane of its tiles (the block's copy stays, overwritten)
+                    mid = twin.setdefault((mid, xb[1][-1][3]), len(m.maps.tab) + len(twin))
+                xs = [y for y, _ in ins[3]]
+                self.gops.append(("gather %d-part %s%s%s" % (len(xs), gsrc(xs), ", split" if split else "",
+                                  ", mode %d" % ins[4] if len(ins) > 4 and ins[4] else ""), ins[2], mid if mid != ins[2] else None, len(xs), cur_ph[0]))
                 n(W(N_GATHER, len(ins[3]), ins[4] if len(ins) > 4 else 0) | gt.get(j, 0) << 16, phys[ins[1]], mid)
                 for src, h in ins[3]:
                     n(desc(src), NONE16 if h is None else halo_slot(h))
@@ -433,6 +447,7 @@ class Encoded:
                 for s in S.values():
                     s.label(ins[1])
                 if ins[1] in phase:
+                    cur_ph[0] = phase[ins[1]]
                     if page:
                         pad()   # the marker opens the label's page (the paged block below starts there)
                     assert 0 <= phase[ins[1]] < 15

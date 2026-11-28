@@ -185,6 +185,27 @@ def stream(E, sort=False, dense=None, brk=0):
                 today_words=E.tab.shape[1])
 
 
+def gcensus(E):
+    """Static census of the gathered values by path (encode.py gops), one execution of every op (the loop counts are
+    the reader's): {(phase id or None, class): [ops, local entries, of them through a dense table, halo entries]},
+    entries as means over the cores. Says which gathers a dense twin reaches and which it leaves on the entry loops."""
+    S, npt, P = E.tab_stream, E.tab_stream["nparts"], len(E.tab_stream["l1"])
+    cache, out = {}, {}
+    for cls, mid, tw, _, ph in E.gops:
+        if mid not in cache:
+            cnt = [_sections(E.tab_cursor[i], mid, npt[mid])[1] for i in range(P)]
+            cache[mid] = np.array([[sum(nl for nl, _ in c), sum(nh for _, nh in c)] for c in cnt], np.float64)
+        dn = np.zeros(P)
+        if tw is not None:
+            dn = np.array([float(int(L[(int(L[1 + tw]) & 0xfffff) + 1]) >> 31) for L in S["l1"]])
+        r = out.setdefault((ph, cls), [0, 0.0, 0.0, 0.0])
+        r[0] += 1
+        r[1] += cache[mid][:, 0].mean()
+        r[2] += (cache[mid][:, 0] * dn).mean()
+        r[3] += cache[mid][:, 1].mean()
+    return out
+
+
 def _walk_cursor(tab, mid, nparts, T):
     """NCRISC today: per section a cursor advanced while the entry's lane is below the tile's end."""
     secs, _ = _sections(tab, mid, nparts)

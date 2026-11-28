@@ -355,6 +355,12 @@ else:
             S_ = E.tab_stream
             print("tabdense %d: %d twin maps, %d of %d (core, twin) tables dense, L1 table %d words, blob %d words a core (staging %d)" % (
                 a.tabdense, len(S_["dense"]), S_["ndense"], len(S_["l1"]) * len(S_["dense"]), S_["l1_words"], S_["blob_words"], S_["staging_words"]), flush=True)
+            from ttfluid.resident.tabstream import gcensus
+            from ttfluid.resident.program import PHASES
+            gc_ = gcensus(E)   # which gathers the dense twin reaches, one execution of every op, means over the cores
+            for (ph, cls), (no, nl, nd, nh) in sorted(gc_.items(), key=lambda kv: (-1 if kv[0][0] is None else kv[0][0], -kv[1][1])):
+                print("gcensus %-11s %-40s ops %4d  local entries a core %9.0f  through a dense table %9.0f  halo %7.0f" % (
+                    "top" if ph is None else PHASES[ph], cls, no, nl, nd, nh), flush=True)
         if a.tscheck:   # as run_vm.py: NCRISC's streamed walk replayed against the cursor tables, every core
             from ttfluid.resident.tabstream import check
             check(E, E.tab_stream, E.tab_cursor)
