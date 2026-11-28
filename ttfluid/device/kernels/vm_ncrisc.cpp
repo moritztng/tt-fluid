@@ -933,9 +933,12 @@ void kernel_main() {
                 const uint32_t e0 = pc + 1;
                 // pe: the last patched entry's word offset. CFD_TABSTREAM without CFD_TRID patches any number of
                 // entries per stream (--pseg 3), each from its own tables; the other builds keep one (encode.py)
-                uint32_t p = e0, pe = 0;
+                uint32_t p = e0, pe = 0, p_first = 0;
                 for (uint32_t e = 0; e < ne; ++e) {
-                    if ((N[p + 1] >> 4) & SM) pe = p;
+                    if ((N[p + 1] >> 4) & SM) {
+                        if (!p_first) p_first = p;
+                        pe = p;
+                    }
                     p += 2 + 2 * (N[p + 1] & 0xf);
                 }
                 pc = p;
@@ -944,6 +947,26 @@ void kernel_main() {
                 uint32_t ql[8], nl[8], qh[8], nh[8], cl[8], ch[8], cz = 0;   // up to 8 gather parts (encode.py)
 #ifdef CFD_TABSTREAM
                 uint32_t qi = 0, tm = 0;
+#if defined(CFD_SPREFETCH) && !defined(CFD_TRID) && !defined(CFD_DEFER)
+                uint32_t pbuf = 0;
+                bool pflight = false, pre_win = false;
+                auto pf_load = [&](uint32_t pp, uint32_t tt, uint32_t b) {
+                    const uint32_t mw = N[pp + 1];
+                    const uint32_t npk = mw & 0xf;
+                    const uint32_t ent = T[(mw >> 4) & SM];
+                    load_tile(ent & 0xfffff, 2 * npk + 1, tt, b, ent >> 20);
+                    pflight = true;
+                };
+                auto next_pat_after = [&](uint32_t tc, uint32_t ec, uint32_t pc_, uint32_t& nt_o, uint32_t& pp_o) -> bool {
+                    uint32_t pp = pc_ + 2 + 2 * (N[pc_ + 1] & 0xf);
+                    for (uint32_t ee = ec + 1; ee < ne; ++ee, pp += 2 + 2 * (N[pp + 1] & 0xf))
+                        if ((N[pp + 1] >> 4) & SM) { nt_o = tc; pp_o = pp; return true; }
+                    if (tc + 1 < tn) { nt_o = tc + 1; pp_o = p_first; return true; }
+                    return false;
+                };
+                // overlap tile 0's first patched table read with the halo waits below (as in N_GATHER)
+                if (p_first && run) pf_load(p_first, 0, 0);
+#endif
                 for (uint32_t e = 0, pp = e0; e < ne && run; ++e, pp += 2 + 2 * (N[pp + 1] & 0xf)) {
                     if (!((N[pp + 1] >> 4) & SM)) continue;
                     np_ = N[pp + 1] & 0xf;
@@ -956,13 +979,14 @@ void kernel_main() {
                             if (!WAIT_UNTIL(S[4 * s] >= hcnt[s] * nsend[s], 16)) { run = false; break; }
                         }
                 }
-                (void)pe, (void)qz, (void)nz, (void)ql, (void)nl, (void)qh, (void)nh, (void)cl, (void)ch, (void)cz;
+                (void)pe, (void)p_first, (void)qi, (void)tm, (void)qz, (void)nz, (void)ql, (void)nl, (void)qh, (void)nh, (void)cl, (void)ch, (void)cz;
 #ifdef CFD_TRID
                 // tile 0's tables go out now, tile t + 1's once tile t is patched (two staging buffers, as in GATHER),
                 // so the patched page rarely waits for its tables
                 if (pe && run) load_tile(qi, 2 * np_ + 1, 0, 0, tm);
 #endif
 #else
+                (void)p_first;
                 if (pe) {
                     np_ = N[pe + 1] & 0xf;
                     uint32_t q = T[(N[pe + 1] >> 4) & SM];   // T[1 + map]
@@ -982,7 +1006,12 @@ void kernel_main() {
                     qz = q + 1;
                 }
 #endif
-                if (!run) break;
+                if (!run) {
+#if defined(CFD_SPREFETCH) && defined(CFD_TABSTREAM) && !defined(CFD_TRID) && !defined(CFD_DEFER)
+                    if (pflight) noc_async_read_barrier();
+#endif
+                    break;
+                }
                 uint32_t pend = 0;
 #ifdef CFD_TRID
                 // up to RING pages in flight, slot k's reads under id 1 + k: after every issue the slots whose reads
@@ -1047,6 +1076,14 @@ void kernel_main() {
                     const uint32_t lo = t * 1024, hi = lo + 1024;
                     p = e0;
                     for (uint32_t e = 0; e < ne && run; ++e) {
+#if defined(CFD_SPREFETCH) && defined(CFD_TABSTREAM) && !defined(CFD_TRID) && !defined(CFD_DEFER)
+                        if (pre_win) {
+                            pre_win = false;
+                            if (get_write_ptr(cb_in) + PS == in1) drain();
+                            p += 2 + 2 * (N[p + 1] & 0xf);
+                            continue;
+                        }
+#endif
                         const uint32_t d = N[p];
                         const int32_t sh = static_cast<int32_t>(N[p + 1]) >> SS;
 #ifdef CFD_TRID
@@ -1093,6 +1130,32 @@ void kernel_main() {
 #else
                             PSUB(16, tbar(id));
 #endif
+#elif defined(CFD_SPREFETCH) && defined(CFD_TABSTREAM) && !defined(CFD_DEFER)
+                            // earlier unpatched slots + this page's window (if !dn) + prefetched table in sp_[pbuf]
+                            PSUB(16, noc_async_read_barrier());
+                            pflight = false;
+                            const uint32_t cur_b = pbuf;
+                            np_ = N[p + 1] & 0xf;
+                            sp = sp_[cur_b], sn = sn_[cur_b];
+                            if (pend > 1) {
+                                cb_push_back(cb_in, pend - 1);
+                                npages += pend - 1;
+                                pend = 1;
+                            }
+                            {
+                                const uint32_t p_nxt = p + 2 + 2 * np_;
+                                if (e + 1 < ne && !((N[p_nxt + 1] >> 4) & SM) && pg + PS < in1 &&
+                                    cb_pages_reservable_at_back(cb_in, 2)) {
+                                    cb_reserve_back(cb_in, 2);
+                                    window(N[p_nxt], t, static_cast<int32_t>(N[p_nxt + 1]) >> SS, pg + PS);
+                                    pre_win = true;
+                                }
+                                uint32_t nt_pf = 0, pp_pf = 0;
+                                if (next_pat_after(t, e, p, nt_pf, pp_pf)) {
+                                    pbuf = cur_b ^ 1;
+                                    pf_load(pp_pf, nt_pf, pbuf);
+                                }
+                            }
 #else
 #ifdef CFD_TABSTREAM
                             np_ = N[p + 1] & 0xf;
@@ -1277,6 +1340,14 @@ void kernel_main() {
                         }
 #ifdef CFD_TRID
                         retire(false);
+#elif defined(CFD_SPREFETCH) && defined(CFD_TABSTREAM) && !defined(CFD_DEFER)
+                        if (pat) {
+                            cb_push_back(cb_in, 1);
+                            ++npages;
+                            pend = pre_win ? 1 : 0;
+                        } else if (pg + PS == in1) {
+                            drain();
+                        }
 #else
                         if (pat || pg + PS == in1) drain();
 #endif
@@ -1287,6 +1358,9 @@ void kernel_main() {
                 if (run) retire(true);
 #else
                 if (run) drain();
+#if defined(CFD_SPREFETCH) && defined(CFD_TABSTREAM) && !defined(CFD_DEFER)
+                if (!run && (pflight || pend)) noc_async_read_barrier();
+#endif
 #endif
                 break;
             }

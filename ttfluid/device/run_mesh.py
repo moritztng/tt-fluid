@@ -110,10 +110,13 @@ ap.add_argument("--tgts", type=int, default=None, help="J in 1..7: compute's UNP
 ap.add_argument("--tpat", type=int, default=0, help="J in 1..7: compute's UNPACK also takes J / 8 of the local L1-source lanes of every page "
                 "NCRISC patches or gathers in a STREAM op (dense or sparse), out of what --bpatch leaves NCRISC (CFD_TPAT, the --tgts "
                 "mailbox: UNPACK waits for that very page and copies from inside the wait); 0 off. A run flag. Data movement only: bit-exact")
-ap.add_argument("--dshare", default="", help="N,B,U,M,P (five non-negative ints summing to 64, 16-lane chunks): per-RISC shares of dense "
-                "GATHER tiles across NCRISC, BRISC, UNPACK, MATH, PACK (CFD_DSHARE). Empty: use --bgts/--tgts. Bit-exact")
+ap.add_argument("--dshare", default="auto", help="N,B,U,M,P (five non-negative ints summing to 64, 16-lane chunks): per-RISC shares of dense "
+                "GATHER tiles across NCRISC, BRISC, UNPACK, MATH, PACK (CFD_DSHARE). auto: 16,16,16,0,16 on BH with --tabstream --tabdense "
+                "when --bgts/--tgts/--tpat are unset; off: legacy --bgts/--tgts. Bit-exact")
 ap.add_argument("--pshare", default="", help="N,B,U,M,P (five non-negative ints summing to 64, 16-lane chunks): per-RISC shares of dense "
                 "STREAM tiles (CFD_PSHARE). Empty: same as --dshare when --dshare is set, else --bpatch/--tpat. Bit-exact")
+ap.add_argument("--sprefetch", type=int, default=1, help="1 (with --tabstream): double-buffer N_STREAM table reads into CB_TS's second staging slot, "
+                "push landed unpatched slots early, and pre-issue the next unpatched window read behind dense_tile/patch (CFD_SPREFETCH). 0 off. Bit-exact")
 ap.add_argument("--amg", action="store_true", help="p PCG preconditioned by smoothed aggregation (ttfluid.resident.sa), aggregates on the K x 72 global cores; "
                 "the coarse levels are chip-local (sa.setup chip_cores): only the fine level exchanges between chips")
 ap.add_argument("--amg-kind", default="sa", choices=["sa"])
@@ -615,7 +618,8 @@ if a.bpatch is None or a.bpatch < 0:
     a.bpatch, lm = bpatch_auto(loc, a.bpatch_min)
     print("--bpatch auto: %.1f local residue entries per patched map tile (min %.0f) -> %d" % (lm, a.bpatch_min, a.bpatch)
           + (" (these images do not record the entries: lower again, or pass --bpatch 4)" if E.tab_stream and not loc else ""), flush=True)
-if a.bgts is None and a.tgts is None:
+_auto_gshare = a.bgts is None and a.tgts is None
+if _auto_gshare:
     print("--bgts / --tgts auto: %d / %d" % gshare(), flush=True)
 a.bgts, a.tgts = gshare()
 assert 0 <= a.bpatch < 8 and not (a.bpatch and not a.tabstream), "--bpatch K: 1..7 with --tabstream"
@@ -624,12 +628,19 @@ assert not a.tsort or a.tabstream, "--tsort 1 needs --tabstream"
 assert 0 <= a.tgts < 8 and not (a.tgts and not a.tabstream) and a.tgts < (a.bgts or 8), "--tgts J: 1..7 with --tabstream, below --bgts"
 assert 0 <= a.tpat < (a.bpatch or 1) and not (a.tpat and not a.tgts), "--tpat J: 1..7 with --tgts (its mailbox), below --bpatch"
 def _parse_share(s, name):
-    if not s:
+    if not s or s == "off":
         return None
     v = tuple(int(x) for x in s.split(","))
     assert len(v) == 5 and all(x >= 0 for x in v) and sum(v) == 64, "%s: five non-negative ints summing to 64" % name
     return v
-dshare = _parse_share(a.dshare, "--dshare")
+if a.dshare == "auto":
+    if a.arch == "bh" and a.tabstream and a.tabdense and not ttfluid.resident.encode.WIDE and _auto_gshare and not a.tpat:
+        dshare = (16, 16, 16, 0, 16)
+        print("--dshare auto: %s" % ",".join(map(str, dshare)), flush=True)
+    else:
+        dshare = None
+else:
+    dshare = _parse_share(a.dshare, "--dshare")
 pshare = _parse_share(a.pshare, "--pshare") if a.pshare else dshare
 assert not (dshare or pshare) or (a.tabstream and a.tabdense), "--dshare/--pshare need --tabstream and --tabdense"
 has_dm = bool((dshare and dshare[3]) or (pshare and pshare[3]))
@@ -728,6 +739,7 @@ def kd(src, ct, cfg, rt=None, crt=None):
     k.defines = defs + ([("CFD_ICACHE", "1")] if a.icache and src == "vm_compute.cpp" else []) + \
         ([("CFD_PHASE", "1")] if a.phase and src in ("vm_compute.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_TSORT", "1")] if a.tsort and src == "vm_ncrisc.cpp" else []) + \
+        ([("CFD_SPREFETCH", "1")] if a.sprefetch and a.tabstream and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_BPATCH", str(a.bpatch))] if a.bpatch and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_BGTS", str(a.bgts))] if a.bgts and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_DENSE", "1")] if a.tabdense and src in ("vm_ncrisc.cpp", "vm_brisc.cpp", "vm_compute.cpp") else []) + \
@@ -1047,7 +1059,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         h[:, w] += h[:, w + 400] << 32
     root = [k * P for k in range(K)]
     gws = sorted(gtab)
-    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, tpat=a.tpat, dshare=a.dshare, pshare=a.pshare, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
+    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, tpat=a.tpat, dshare=a.dshare, pshare=a.pshare, sprefetch=a.sprefetch, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
                plan=info, sizes=E.sizes(), l1=l1, rows=nrow, walls=walls, ticks=ticks,
                ms_device=[max(t) / amax / 1e3 for t in ticks], aiclk=clks,
                same_history_all_chips=bool(all(np.array_equal(hist_all[0, :nrow], hist_all[k, :nrow]) for k in range(K))),
