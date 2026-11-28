@@ -1027,6 +1027,7 @@ void kernel_main() {
 #ifdef CFD_DENSE
                             if (dn) {   // BRISC gathers the upper (8 - CFD_BPATCH) / 8 of the tile's lanes (bit 31: dense)
                                 dkeep = 1024 * CFD_BPATCH / 8;
+                                nkeep[0] = 0;   // (unused on a dense tile)
                                 S[M_JOB] = reinterpret_cast<uint32_t>(A + N[p + 2] * 1024);
                                 S[M_JOB + 1] = reinterpret_cast<uint32_t>(reinterpret_cast<const uint16_t*>(sp[0]) + dkeep);
                                 S[M_JOB + 2] = (1024 - dkeep) | 1u << 31;
