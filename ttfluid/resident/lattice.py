@@ -131,3 +131,65 @@ def grid_lanes(X, P, owner=None, neighbour=None):
     H, D = int(b[order[1]]), int(b[order[2]])
     lane = 4 * (ii + w * (r[:, order[1]] + H * r[:, order[2]])) + m
     return own, lane, (w, H, D), (tuple(int(x) for x in g), tuple(order))
+
+
+BIG = 1 << 20
+AX = {"x": (0, 1, 2), "y": (1, 2, 0), "z": (2, 0, 1)}     # fastest, middle, slowest
+
+
+def pieces(n, row, oth, loc, dc, fc):
+    """The octree lattice inside one core, from its n cells' faces: entry e is a face of cell row[e] in direction dc[e]
+    (2 * axis + sign of the outward normal), loc[e] says the cell behind it, oth[e], is on the core too; fc counts a
+    cell's faces. A cell with six faces, one per direction, is regular; regular cells joined by a face form a piece
+    of one refinement level, and walking the faces gives every cell of a piece integer coordinates.
+    Returns (regular, piece of each cell, xyz, piece sizes, piece dims, entries the coordinates agree with)."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+    nd = np.zeros((n, 6), np.int64)
+    np.add.at(nd, (row, dc), 1)
+    reg = (fc == 6) & (nd == 1).all(1)
+    e = loc & reg[row] & reg[np.where(loc, oth, 0)]
+    a, b, d = row[e], oth[e], dc[e].astype(np.int64)
+    nco, comp = connected_components(csr_matrix((np.ones(len(a), np.int8), (a, b)), shape=(n, n)), directed=False)
+    step = np.zeros((6, 3), np.int64)
+    step[np.arange(6), np.arange(6) // 2] = np.where(np.arange(6) % 2, 1, -1)
+    xyz, known = np.zeros((n, 3), np.int64), np.zeros(n, bool)
+    known[np.unique(comp, return_index=True)[1]] = True
+    A, B, D = a, b, d
+    while len(A):
+        m = known[A] & ~known[B]
+        if not m.any():
+            break
+        xyz[B[m]] = xyz[A[m]] + step[D[m]]
+        known[B[m]] = True
+        keep = ~known[B]
+        A, B, D = A[keep], B[keep], D[keep]
+    lo = np.full((nco, 3), BIG)
+    hi = np.full((nco, 3), -BIG)
+    for i in range(3):
+        np.minimum.at(lo[:, i], comp, xyz[:, i])
+        np.maximum.at(hi[:, i], comp, xyz[:, i])
+    xyz -= lo[comp]
+    good = np.zeros(len(row), bool)
+    good[np.flatnonzero(e)] = (xyz[b] - xyz[a] == step[d]).all(1)
+    return reg, comp, xyz, np.bincount(comp, minlength=nco), hi - lo + 1, good
+
+
+def rows8(comp, xyz, npieces):
+    """Per piece and axis: the cells in rows of 8 or more along that axis."""
+    rows = np.zeros((npieces, 3), np.int64)
+    for a0, a1, a2 in AX.values():
+        _, inv, cnt = np.unique((comp * 4096 + xyz[:, a1]) * 4096 + xyz[:, a2], return_inverse=True, return_counts=True)
+        np.add.at(rows[:, a0], comp, cnt[inv] >= 8)
+    return rows
+
+
+def box_order(comp, xyz, size, tie, fast=None):
+    """Position of every cell of a core in lattice order (pieces as returned by `pieces`): pieces by size, a piece's
+    cells lexicographic in its coordinates, the cells in no piece behind them in the order of `tie`. fast: the axis
+    that runs fastest (x, y, z); None picks per piece the axis with the most cells in rows of 8 or more."""
+    crank = np.empty(len(size), np.int64)
+    crank[np.argsort(-size, kind="stable")] = np.arange(len(size))
+    crank = np.where(size[comp] > 1, crank[comp], len(size))
+    pc = xyz[:, AX[fast]] if fast else np.take_along_axis(xyz, np.array(list(AX.values()))[rows8(comp, xyz, len(size)).argmax(1)][comp], 1)
+    return np.lexsort((tie, pc[:, 0], pc[:, 1], pc[:, 2], crank)).argsort()

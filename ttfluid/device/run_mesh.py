@@ -98,8 +98,10 @@ ap.add_argument("--amg", action="store_true", help="p PCG preconditioned by smoo
 ap.add_argument("--amg-kind", default="sa", choices=["sa"])
 ap.add_argument("--amg-stack", action="store_true", help="as run_vm.py: stacked coarse SpMV")
 ap.add_argument("--amg-vec", action="store_true", help="as run_vm.py: coarse values are vector registers (--l1 auto may home them in DRAM)")
-ap.add_argument("--order", default="index", choices=("index", "rcm"), help="with --sliced: the cells of a core inside each slot class. index: by cell id. "
+ap.add_argument("--order", default="index", choices=("index", "rcm", "box"), help="with --sliced: the cells of a core inside each slot class. index: by cell id. "
                 "rcm: reverse Cuthill-McKee on the core's cell graph, so face neighbours are a few tiles apart and a small --gcache holds them. "
+                "box: the hexes of a refinement level in the order of their lattice, with ELL slots by face direction, so a slot's neighbour "
+                "is a constant lane shift for a row of cells and is loaded, not gathered. "
                 "Sums run in another order, so the state is not bitwise the index order's")
 ap.add_argument("--sliced", action="store_true", help="sorted rcb lanes; report what sliced ELL slots would save (machine.slot_extents)")
 ap.add_argument("--lsched", action="store_true", help="reorder straight-line IR runs for fewer live vectors (machine._lsched)")
@@ -260,7 +262,7 @@ else:
         print("machine from %s in %.1f s" % (a.mcache, time.time() - t0), flush=True)
     else:
         s = SimpleFoam(a.case, backend="ell", dtype=np.float32, log=lambda *x: None,
-                       ell_order="dir" if a.layout == "lattice" else "face")
+                       ell_order="dir" if a.layout == "lattice" or a.order == "box" else "face")
         core = None
         if a.layout == "rcb" and K > 1:   # chip placement first (seconds): an unplaceable partition used to surface at plan(), an hour in
             import ttfluid.resident.machine

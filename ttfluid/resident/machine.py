@@ -934,18 +934,58 @@ def rcm_rank(owner, faces, P):
     return rank
 
 
+def box_rank(owner, mesh, P):
+    """Rank of every cell in the lattice order of its core (lattice.box_order): the hexes of one refinement level in
+    index order of the octree lattice. A row neighbour is then the next cell, where rcm_rank only keeps it within a
+    few tiles, and under ELL slots by direction (Ell order="dir") a slot's gather is the same lane shift for most
+    cells of a row: an offset load (_split_gathers), not a table entry. One axis runs fastest on every core, the one
+    with the most cells of the mesh in rows of 8 or more, so the two slots along it share one shift for the whole
+    machine (Small k2: 26.7 % of the local entries at their map's shift with y, 24.0 % with an axis per piece).
+    The cells on no lattice (refinement interfaces, the snapped layer) follow in rcm_rank's order."""
+    from .lattice import box_order, pieces, rows8
+    nI = mesh.nInternalFaces
+    fo, fn = mesh_faces(mesh)
+    bc = [p.faceCells for p in mesh.patches]
+    row = np.concatenate([fo, fn] + bc).astype(np.int64)
+    oth = np.concatenate([fn, fo] + [np.full(len(b), -1) for b in bc]).astype(np.int64)
+    out = np.concatenate([mesh.Sf[:nI], -mesh.Sf[:nI]] + [p.Sf for p in mesh.patches])
+    ax = np.argmax(np.abs(out), axis=1)
+    dc = 2 * ax + (out[np.arange(len(ax)), ax] > 0)
+    del out
+    fc, tie = np.bincount(row, minlength=len(owner)), rcm_rank(owner, (fo, fn), P)
+    by = np.argsort(owner[row], kind="stable")
+    row, oth, dc = row[by], oth[by], dc[by]
+    estart = np.searchsorted(owner[row], np.arange(P + 1))
+    cells = np.argsort(owner, kind="stable")
+    cnt = np.bincount(owner, minlength=P)
+    start = np.cumsum(cnt) - cnt
+    loc = np.empty(len(owner), np.int64)
+    loc[cells] = np.arange(len(owner)) - np.repeat(start, cnt)
+    rank, lat, rows = np.empty(len(owner), np.int64), [], np.zeros(3, np.int64)
+    for i in range(P):
+        e, c = slice(estart[i], estart[i + 1]), cells[start[i]:start[i] + cnt[i]]
+        inside = (oth[e] >= 0) & (owner[oth[e]] == i)
+        _, comp, xyz, size, _, _ = pieces(cnt[i], loc[row[e]], np.where(inside, loc[oth[e]], 0), inside, dc[e], fc[c])
+        lat.append((c, comp, xyz, size))
+        rows += rows8(comp, xyz, len(size)).sum(0)
+    for c, comp, xyz, size in lat:
+        rank[c] = box_order(comp, xyz, size, tie[c], "xyz"[int(rows.argmax())])
+    return rank
+
+
 def sliced_lanes(owner, counts, P, Q=0, banded=None):
     """Lanes of a partition with every core's cells sorted by face count, widest first (then by index): ELL slot k's
     real entries are then lanes [0, n_k) of each core, n_k = the core's cells with more than k faces. Q > 0 (layout
     rcbq<Q>): each run of equal face count is quarter-interleaved within itself (_quarter), so index neighbours are a
     4-lane shift and the [0, n_k) sets do not change.
-    banded = (L, rank), --order rcm: cells by slot class instead (L[count - 1], the tiles the cell's last slot spans,
-    fewest first), then by rank (rcm_rank). Slot k is still inside its first L[k] tiles, which is all a narrow register
-    needs, and the cells that span every tile keep the band of the rank."""
+    banded = (L, rank), --order rcm and box: cells by slot class instead (L[count - 1], the tiles the cell's last slot
+    spans, fewest first), then by rank (rcm_rank, box_rank). Slot k is still inside its first L[k] tiles, which is all
+    a narrow register needs, and the cells that span every tile keep the order of the rank. With Q the runs that are
+    quartered are the slot classes."""
     lane = np.zeros(len(owner), np.int64)
     if banded is not None:
-        assert not Q, "--order rcm and rcbq<Q> both order the lanes"
-        order = np.lexsort((banded[1], np.asarray(banded[0])[counts - 1], owner))
+        counts = np.asarray(banded[0])[counts - 1]
+        order = np.lexsort((banded[1], counts, owner))
     else:
         order = np.lexsort((np.arange(len(owner)), -counts, owner))
     cnt = np.bincount(owner, minlength=P)
@@ -1073,14 +1113,17 @@ class Machine:
             self.lay = Layout(prog, own, P, quarter_lanes(own, P, int(layout[4:])), amg_vec=amg_vec, ptiles=ptiles)
         else:
             own = self._own if sliced else rcb(mesh.C, P, chips=P // chip_cores if chip_cores and chip_line else None, faces=mesh_faces(mesh))
-            Q = int(layout[4:]) if layout.startswith("rcbq") else 0
-            banded = (self.slotL, rcm_rank(own, mesh_faces(mesh), P)) if order == "rcm" else None
+            # --order box: every tile of a class quartered, so the row neighbour sits 4 lanes on, a shift of 16 B, the
+            # unit of the unpacker's and the NoC's addresses (Small k2, 220 cores, ttfluid.tools.residcensus: 24.0 % of
+            # the local neighbour entries at their map's shift against 1.1 % unquartered and 3.3 % by cell id)
+            Q = int(layout[4:]) if layout.startswith("rcbq") else LANES // 4 if order == "box" else 0
+            banded = None if order == "index" else (self.slotL, rcm_rank(own, mesh_faces(mesh), P) if order == "rcm" else box_rank(own, mesh, P))
             self.lay = Layout(prog, own, P, sliced_lanes(own, face_counts(mesh), P, Q, banded) if sliced else None, amg_vec=amg_vec, ptiles=ptiles,
-                              follow=order == "rcm")
+                              follow=order != "index")
         self.T = max(self.lay.T, tiles or 1)   # tiles: force more tiles per vector than needed (testing)
         self.Ts = {n: (self.T if t == self.lay.T else t) for n, t in self.lay.Ts.items()}   # T: the slot stride
         assert not sliced or layout == "rcb" or layout.startswith("rcbq"), "--sliced sorts rcb lanes"
-        assert order == "index" or sliced and layout == "rcb", "--order rcm orders the lanes of --layout rcb --sliced"
+        assert order == "index" or sliced and layout == "rcb", "--order orders the lanes of --layout rcb --sliced"
         if sliced:      # the prefix property every narrow register relies on (spmd: lanes come from prep --sliced)
             fc, ln = face_counts(mesh), self.lay.lane[prog.cells.name]
             for k, Lk in enumerate(self.slotL):
