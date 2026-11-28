@@ -31,6 +31,18 @@ enum : uint32_t {
     C_FOLD, C_TOK, C_SIGB, C_SIGN, C_WAITB, C_WAITN, C_JMP, C_BRT, C_LDS, C_TBEG, C_TEND, C_LDR, C_STW, C_MAD, C_MSB, C_LDRH, C_STWH, C_PH
 };
 constexpr uint32_t TILE = 0x80;   // op bit: the tile operand is offset by the tile loop counter
+// run_mesh --knockin l / s: every load unpacks its tile into the dst register twice / every store packs its tile twice
+// into the same page. Same source, same destination: the state stays bitwise and the run pays the class twice.
+#ifdef CFD_KIN_L
+#define KIN_L(...) __VA_ARGS__
+#else
+#define KIN_L(...)
+#endif
+#ifdef CFD_KIN_S
+#define KIN_S(...) __VA_ARGS__
+#else
+#define KIN_S(...)
+#endif
 
 void kernel_main() {
     if (get_common_arg_val<uint32_t>(0) == 0) return;   // limit 0: run_mesh --l1-check, nothing runs
@@ -214,23 +226,25 @@ void kernel_main() {
             case C_ACQ: tile_regs_acquire(); break;
             case C_COMMIT: tile_regs_commit(); tile_regs_wait(); break;
             case C_REL: tile_regs_release(); break;
-            case C_LD: LDI(cb_v); copy_tile(cb_v, (w >> 16) + to, a); break;
+            case C_LD: LDI(cb_v); copy_tile(cb_v, (w >> 16) + to, a); KIN_L(copy_tile(cb_v, (w >> 16) + to, a);) break;
             case C_LDS: {   // offset load: the unpacker reads the tile from a 16-byte-unit shifted L1 address
                 const int32_t units = static_cast<int32_t>(CW(pc));
                 ++pc;
                 LDI(cb_v);
                 UNPACK((get_local_cb_interface(cb_v).fifo_rd_ptr += units));
                 copy_tile(cb_v, (w >> 16) + to, a);
+                KIN_L(copy_tile(cb_v, (w >> 16) + to, a);)
                 UNPACK((get_local_cb_interface(cb_v).fifo_rd_ptr -= units));
                 break;
             }
-            case C_ST: pack_tile<true>(a, cb_v, (w >> 16) + to); break;
+            case C_ST: pack_tile<true>(a, cb_v, (w >> 16) + to); KIN_S(pack_tile<true>(a, cb_v, (w >> 16) + to);) break;
             case C_LDR:   // next reader page; the tile starts b 16-B units in (the DRAM source's 32-B phase)
                 TWAIT(cb_in);
                 cb_wait_front(cb_in, 1);
                 LDI(cb_in);
                 UNPACK((get_local_cb_interface(cb_in).fifo_rd_ptr += b));
                 copy_tile(cb_in, 0, a);
+                KIN_L(copy_tile(cb_in, 0, a);)
                 UNPACK((get_local_cb_interface(cb_in).fifo_rd_ptr -= b));
                 cb_pop_front(cb_in, 1);
                 break;
@@ -241,6 +255,7 @@ void kernel_main() {
                 copy_tile_to_dst_init_short_with_dt(cb_in, CFD_NARROW);
                 UNPACK((get_local_cb_interface(CFD_NARROW).fifo_rd_ptr = get_local_cb_interface(cb_in).fifo_rd_ptr + b));
                 copy_tile(CFD_NARROW, 0, a);
+                KIN_L(copy_tile(CFD_NARROW, 0, a);)
                 copy_tile_to_dst_init_short_with_dt(CFD_NARROW, cb_in);
                 LDX();
                 cb_pop_front(cb_in, 1);
@@ -252,6 +267,7 @@ void kernel_main() {
                 PACK((get_local_cb_interface(CFD_NARROW_OUT).fifo_wr_ptr = get_local_cb_interface(cb_out).fifo_wr_ptr));
                 pack_reconfig_data_format(cb_out, CFD_NARROW_OUT);
                 pack_tile<true>(a, CFD_NARROW_OUT, 0);
+                KIN_S(pack_tile<true>(a, CFD_NARROW_OUT, 0);)
                 pack_reconfig_data_format(CFD_NARROW_OUT, cb_out);
                 cb_push_back(cb_out, 1);
                 break;
@@ -259,6 +275,7 @@ void kernel_main() {
             case C_STW:
                 cb_reserve_back(cb_out, 1);
                 pack_tile(a, cb_out);
+                KIN_S(pack_tile<true>(a, cb_out, 0);)   // the in-order pack went to tile 0 of the reserved page
                 cb_push_back(cb_out, 1);
                 break;
             case C_PH:
