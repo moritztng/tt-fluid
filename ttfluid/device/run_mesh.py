@@ -146,6 +146,9 @@ ap.add_argument("--save", help="CPU only: lower and encode, pickle the result to
                 "off-chip and the device run (--load) holds its chips only for the run")
 ap.add_argument("--gdump", help="CPU: dump every gather op and the local gather entries of --gdump-cores (tools/gcensus.py), exit before encoding")
 ap.add_argument("--gdump-cores", default=None, help="comma list of global cores (default: every 11th core of chip 0)")
+ap.add_argument("--cx", help="CPU: write the census extract of --cx-cores (tools/const_census.py, fold_census.py) straight from the lowered Machine "
+                "and exit before encoding: no Machine pickle on disk (a Small k2 --mcache is 56 GB)")
+ap.add_argument("--cx-cores", default="0", help="--cx: comma list of global cores")
 ap.add_argument("--mcache", help="CPU: pickle the lowered Machine here, or read it if the file exists (encode-only rerun); *.zst: zstd-compressed")
 ap.add_argument("--load", help="read a --save file instead of lowering; the lowering flags must be the ones it was saved with")
 ap.add_argument("--from-images", help="device run from the per-chip images in this directory (lower/image_dev.py), uploaded chip by "
@@ -168,7 +171,7 @@ assert min(R, C) == 1 or a.block2d or a.plan or a.emuonly, "2D mesh %dx%d needs 
 GRID, l1_default, NCB, DA = ARCH[a.arch]
 a.l1_bytes = a.l1_bytes or l1_default
 K, P = R * C, GRID[0] * GRID[1]
-assert not a.cores or a.plan or a.emuonly or a.solve_census, "--cores: a CPU lowering only (the device grid is --arch's)"
+assert not a.cores or a.plan or a.emuonly or a.solve_census or a.cx, "--cores: a CPU lowering only (the device grid is --arch's)"
 P = a.cores or P
 PP = -(-P // 4) * 4   # one chip's partials padded to 16 B (vm_brisc.cpp PP): P = 110 on BH, 72 on WH (unchanged)
 import ttfluid.resident.encode  # noqa: E402
@@ -295,6 +298,10 @@ else:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))
             sys.exit(0)
+        if a.cx:
+            from ttfluid.tools import const_census
+            const_census.save_x(const_census.extract(LOWER, prog, m, [int(c) for c in a.cx_cores.split(",")]), a.cx)
+            sys.exit(print("census extract -> %s at %.1f s" % (a.cx, time.time() - t0), flush=True))
         if a.mcache:   # the Machine before encoding: an encode-only rerun skips the lowering (Small k1: 17 min, 98 GB)
             import cloudpickle
             with mcache_open("wb") as f:
