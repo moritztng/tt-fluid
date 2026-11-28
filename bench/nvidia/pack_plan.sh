@@ -73,8 +73,10 @@ EOF
 }
 
 for c in $CELLS; do
-  # a batch in which no case finished is a broken box or build, not a packing number: stop before paying for more
-  grep -q "^CELL .* ok=0/" $W/cells.tsv && { stamp "PLAN-FAILED: $(grep '^CELL .* ok=0/' $W/cells.tsv | cut -d' ' -f2) finished no case"; exit 1; }
+  # a baseline-dictionary batch in which no case finished is a broken box or build, not a packing number: stop before
+  # paying for more. A variant that finishes no case is that variant's result and the plan goes on.
+  bad=$(grep -E "^CELL P_[a-z]+_k[0-9]+ .* ok=0/" $W/cells.tsv | cut -d' ' -f2)
+  [ -n "$bad" ] && { stamp "PLAN-FAILED: $bad finished no case"; exit 1; }
   if [ $c = auto ]; then
     m2=$(ms P_mps_k2); m4=$(ms P_mps_k4); k=3
     if [ -n "$m2" ] && [ -n "$m4" ]; then
