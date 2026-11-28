@@ -143,7 +143,8 @@ ap.add_argument("--forces", default=None, metavar="FUNC", help="Cd/Cl of each ou
 ap.add_argument("--phase", action="store_true", help="per-SIMPLE-phase device cycles (program.PHASES markers, CFD_PHASE): result key phase")
 ap.add_argument("--cap", type=int, default=32, help="as run_vm.py: scratch cap, live one-tile values per fused run")
 ap.add_argument("--lsplit", type=int, default=0, help="1: a vector that holds an L1 colour across a Krylov loop it is not used in is parked in DRAM "
-                "for the loop, so the loop's own vectors take the colour (Machine(lsplit)). Data movement only: same values. Needs a lowering")
+                "for the loop, so the loop's own vectors take the colour (Machine(lsplit)); 2: also a colour holder the loop touches less often than "
+                "a vector it left in DRAM (the solve's own solution register). Data movement only: same values. Needs a lowering")
 ap.add_argument("--kfold", type=int, default=0, help="1: a DRAM constant page that holds one bit pattern (zeros, ones, ...) is not streamed: a per-core "
                 "table in one more arena tile tells the reader to skip it and compute to fill the slot (Machine(kfold)). Same values. Needs a lowering")
 ap.add_argument("--kfold-broken", type=int, default=0, help="test arms of --kfold on core 0, the result has to differ: 1 a page that is not uniform "
@@ -312,7 +313,7 @@ else:
                     l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
                     joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
                     bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span, lsplit=bool(a.lsplit), kfold=bool(a.kfold))
+                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=a.cse, hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span, lsplit=a.lsplit, kfold=bool(a.kfold))
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))
