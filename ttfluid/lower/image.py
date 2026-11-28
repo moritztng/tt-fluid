@@ -32,8 +32,8 @@ SCALARS = ("K", "P", "T", "ndram", "hpages", "cpages", "ntiles", "nhalo", "hmax"
 
 class Pages:
     """A (cores, pages, LANES) array held as the pages that are not zero: rows[row[core, page]] is a page, and the
-    pages left out share one row (zero on the way back from a chip; never written on the way in, their values are
-    zero). Indexed as Image.state and put_state index the homes: [core, page, lane] with index arrays."""
+    pages left out share one row on the way back from a chip (zero) and have row -1 on the way in, where a write to
+    them is dropped (they are zero, or another part of the upload holds them). Indexed as Image.state and put_state index the homes: [core, page, lane] with index arrays."""
 
     def __init__(self, rows, row):
         self.rows, self.row = rows, row
@@ -45,7 +45,12 @@ class Pages:
         return self.rows[self.row[i[0], i[1]], i[2]]
 
     def __setitem__(self, i, v):
-        self.rows[self.row[i[0], i[1]], i[2]] = v
+        r = self.row[i[0], i[1]]
+        m = r >= 0           # row -1: the page is held elsewhere (another part of a staged upload), not written here
+        if m.all():
+            self.rows[r, i[2]] = v
+        else:
+            self.rows[r[m], i[2][m]] = v[m]
 
 
 class Image:
@@ -284,8 +289,8 @@ class _ChipFiles(dict):
     def read_into(self, name, out, row=None):
         """Array `name` read into out, a zeroed C-contiguous buffer, from the byte ranges the file stores. A hole is
         not read, so its pages of out stay untouched: they take no time and no RAM (Small k2: 5.3 of 27.3 GB is
-        stored). row: out holds only the pages pages() marks, page p in row row[p] (a staged upload); without it out
-        is the whole array. The zero rows of the constants sit between data every ~60 KB and one read per stored range
+        stored). row: out holds a run of the pages pages() marks, page p in row row[p] and -1 for a page outside it
+        (a staged upload, whole or in parts); without it out is the whole array. The zero rows of the constants sit between data every ~60 KB and one read per stored range
         is slow, so ranges closer than GAP share one vectored read whose zeros between them land in a scratch buffer,
         not in out."""
         buf = memoryview(out).cast("B")
@@ -295,8 +300,11 @@ class _ChipFiles(dict):
             assert end - off == (len(buf) if row is None else len(row) * PAGE), (name, end - off, len(buf))
             # where the byte at file offset x goes: a stored range is whole pages in a row, so it stays one piece
             at = (lambda x: x - off) if row is None else (lambda x: int(row[(x - off) // PAGE]) * PAGE + (x - off) % PAGE)
+            held = None if row is None else np.flatnonzero(row >= 0)
+            lo_b, hi_b = (off, end) if held is None else (off + int(held[0]) * PAGE, off + (int(held[-1]) + 1) * PAGE) if len(held) else (off, off)
             reads, last = [], None      # a read: [file offset, bytes, [memoryview, ...]], contiguous in the file
             for a, p in ranges:
+                a, p = max(a, lo_b), min(p, hi_b)      # the part of the range inside the run of pages out holds
                 for lo in range(a, p, CHUNK):
                     hi = min(lo + CHUNK, p)
                     r = reads[-1] if reads else None

@@ -161,36 +161,57 @@ def chip_pages(img, k, P, name, state=None):
 
 
 class Staged:
-    """An array of 4 KB pages as upload_placed sends it: only the pages that hold a value, in page order.
-    mark() reads the page marks of every chip (on[k], pages(k) on a thread per chip) and decides: sparse when the
-    host would write less than half of the array. src(): (shape, fill) as upload takes them, the staging buffer
-    (every chip's padded to the longest) when sparse, else the array itself."""
+    """An array of 4 KB pages as upload_placed sends it: only the pages that hold a value, in page order, in one part
+    or several. mark() reads the page marks of every chip (on[k], pages(k) on a thread per chip) and decides: sparse
+    when the host would write less than half of the array, and as many equal runs of pages (parts) as it takes for
+    the staged pages of one run, over all chips, to fit in cap bytes: the host holds a part while it is written and
+    the next one while it is built, never the array. part(j): its first page, the pages of a full part, its staging
+    shape and fill, and on(k), chip k's marks inside it. src(): (shape, fill) of the first thing upload_placed
+    writes, part 0 when sparse, else the array itself."""
 
-    def __init__(self, DEVBLK, shape, fill, pages):
-        self.DEVBLK, self.full, self.fill_full, self.pages, self.on = DEVBLK, shape, fill, pages, None
+    def __init__(self, DEVBLK, shape, fill, pages, cap=None):
+        self.DEVBLK, self.full, self.fill_full, self.pages, self.cap, self.on = DEVBLK, shape, fill, pages, cap, None
 
     def mark(self):
         if self.on is None:
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(len(self.DEVBLK)) as ex:
                 self.on = dict(zip(self.DEVBLK, ex.map(self.pages, self.DEVBLK)))
-            self.shape = (max(1, max(int(o.sum()) for o in self.on.values())), self.full[1])
+            c = [np.concatenate([[0], np.cumsum(o)]) for o in self.on.values()]
+            self.shape = (max(1, max(int(x[-1]) for x in c)), self.full[1])
             self.sparse = 2 * self.shape[0] < self.full[0]
+            n = 1
+            while True:
+                self.size = -(-self.full[0] // n)
+                e = np.minimum(np.arange(n + 1) * self.size, self.full[0])
+                self.rows = np.maximum(1, np.max([x[e[1:]] - x[e[:-1]] for x in c], axis=0))
+                if self.cap is None or not self.sparse or n == 64 or int(self.rows.max()) * len(c) * 4 * self.full[1] <= self.cap:
+                    break
+                n += 1
+            self.parts = n
         return self
 
-    def fill(self, k, out):
-        self.fill_full(k, out, np.cumsum(self.on[k]) - 1)
+    def part(self, j):
+        a, b = j * self.size, min((j + 1) * self.size, self.full[0])
+
+        def fill(k, out):
+            row = np.full(self.full[0], -1, np.int64)
+            row[a:b] = np.where(self.on[k][a:b], np.cumsum(self.on[k][a:b]) - 1, -1)
+            self.fill_full(k, out, row)
+        return SimpleNamespace(first=a, size=self.size, shape=(int(self.rows[j]), self.full[1]), fill=fill, on=lambda k: self.on[k][a:b])
 
     def src(self):
         self.mark()
-        return (self.shape, self.fill) if self.sparse else (self.full, self.fill_full)
+        return (self.part(0).shape, self.part(0).fill) if self.sparse else (self.full, self.fill_full)
 
 
-def page_map(on, W):
-    """An array's pages split over W workers: (map, args) from one bool per page. Worker w moves pages first ..
-    first + count - 1; bit j of its map row (uint32 words) says page first + j is staged, and its staged pages start
-    at row start of the staging tensor. args[w] = (w, first, count, start), what kernels/place.cpp takes."""
-    n = -(-len(on) // W)
+def page_map(on, W, size=None):
+    """A run of an array's pages split over W workers: (map, args) from one bool per page. Worker w moves pages
+    first .. first + count - 1 of the run; bit j of its map row (uint32 words) says page first + j is staged, and
+    its staged pages start at row start of the staging tensor. args[w] = (w, first, count, start), what
+    kernels/place.cpp takes. size: lay the map out for a run of this many pages (the last part of a staged upload is
+    shorter than the others and shares their kernel build)."""
+    n = -(-(size or len(on)) // W)
     bits = np.zeros((W, -(-n // 512) * 512), bool)      # a map row is whole 64-byte DRAM reads
     pad = np.zeros(W * n, bool)
     pad[:len(on)] = on
@@ -298,12 +319,14 @@ NB = 16   # pages a worker keeps in flight
 
 
 def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, host=None):
-    """upload for a Staged array. Sparse: the host writes the staged pages and a page map, and every core of a chip
-    lays a share of the array with both its data movement processors (kernels/place.cpp), copying the staged pages
-    to their places and writing the rest as zeros. The array ends up as upload leaves it; the PCIe write carries a
-    fifth of the bytes (zeros cost it what data costs) and the host never holds the zero pages. Not sparse: a plain
-    upload. cells[d]: device d's mesh coordinate; host: a future of host_shards(md, K, DEVBLK, *sg.src())."""
+    """upload for a Staged array. Sparse: part by part the host writes the staged pages and a page map, and every
+    core of a chip lays its share of the part with both its data movement processors (kernels/place.cpp), copying the
+    staged pages to their places and writing the rest as zeros. The array ends up as upload leaves it; the PCIe write
+    carries a fifth of the bytes (zeros cost it what data costs) and the host never holds the zero pages, nor more
+    than two parts. Not sparse: a plain upload. cells[d]: device d's mesh coordinate; host: a future of
+    host_shards(md, K, DEVBLK, *sg.src()), part 0 built ahead."""
     import ttnn
+    from concurrent.futures import ThreadPoolExecutor
     K, W = len(DEVBLK), 2 * len(cores)
     prof = name and os.environ.get("CFD_UPLOAD_PROFILE")
     if host is not None:
@@ -311,20 +334,26 @@ def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, host=None):
     if not sg.mark().sparse:
         return upload(md, K, DEVBLK, *sg.src(), name, host)
     t = ttnn.allocate_tensor_on_device(ttnn.Shape(list(sg.full)), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
-    t_stage = upload(md, K, DEVBLK, *sg.src(), name and name + " staged", host)
-    t0 = time.time()
-    work = {k: page_map(sg.on[k], W) for k in DEVBLK}
-    mw = work[DEVBLK[0]][0].shape[1]
-    t_map = upload(md, K, DEVBLK, (W, mw), lambda k, out: np.copyto(out, work[k][0]))
-    t1 = time.time()
-    workers(md, cells, grid, cores, DEVBLK, "place.cpp", [4 * mw, NB, 0], [t, t_stage, t_map], t, [0],
-            lambda k: work[k][1], 4 * mw + 4096 * (NB + 1))
-    t2 = time.time()
-    ttnn.deallocate(t_stage)
-    ttnn.deallocate(t_map)
+    parts = [sg.part(j) for j in range(sg.parts)]
+    maps = laid = 0.0
+    with ThreadPoolExecutor(1) as ahead:      # the next part is built while this one is written and laid
+        for j, p in enumerate(parts):
+            nxt = ahead.submit(host_shards, md, K, DEVBLK, parts[j + 1].shape, parts[j + 1].fill) if j + 1 < len(parts) else None
+            t_stage = upload(md, K, DEVBLK, p.shape, p.fill, name and "%s staged %d/%d" % (name, j + 1, len(parts)), host)
+            host = nxt
+            t0 = time.time()
+            work = {k: page_map(p.on(k), W, p.size) for k in DEVBLK}
+            mw = work[DEVBLK[0]][0].shape[1]
+            t_map = upload(md, K, DEVBLK, (W, mw), lambda k, out: np.copyto(out, work[k][0]))
+            t1 = time.time()
+            workers(md, cells, grid, cores, DEVBLK, "place.cpp", [4 * mw, NB, 0], [t, t_stage, t_map], t, [0],
+                    lambda k: [(w, p.first + first, count, start) for w, first, count, start in work[k][1]], 4 * mw + 4096 * (NB + 1))
+            ttnn.deallocate(t_stage)
+            ttnn.deallocate(t_map)
+            maps, laid = maps + t1 - t0, laid + time.time() - t1
     if prof:
-        print("place %s: %d of %d pages per chip staged, map %.2f s, laid on the chips in %.2f s (compile included)"
-              % (name, sg.shape[0], sg.full[0], t1 - t0, t2 - t1), flush=True)
+        print("place %s: %d of %d pages per chip staged in %d part(s), maps %.2f s, laid on the chips in %.2f s (compile included)"
+              % (name, sg.shape[0], sg.full[0], len(parts), maps, laid), flush=True)
     verify(t, K, DEVBLK, sg.full, sg.fill_full, name)
     return t
 
