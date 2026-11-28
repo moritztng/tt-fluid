@@ -211,7 +211,7 @@ def mwait(hdr):
     load = {"%s | %s" % (MW_U[u], MW_N[n]): w64(700 + 2 * (16 * u + n)) for u in range(8) for n in range(16)}
     acq = {MW_P[q]: w64(960 + 2 * q) for q in range(8)}
     return dict(load={k: round(v) for k, v in load.items() if v}, acq={k: round(v) for k, v in acq.items() if v},
-                own=round(w64(976)), load_after=round(w64(978)), acq_after=round(w64(992)),
+                own=round(w64(976)), load_after=round(w64(978)), acq_after=round(w64(952)),
                 tail=dict(load_after=round(w64(980)), acq_after=round(w64(982)), own=round(w64(984)), load=round(w64(986)),
-                          acq=round(w64(994))),
+                          acq=round(w64(954))),
                 n=dict(load=float(hdr[:, 988].mean()), acq=float(hdr[:, 989].mean()), own=float(hdr[:, 990].mean())))

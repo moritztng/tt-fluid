@@ -69,10 +69,15 @@ run1() { # leg's arguments; LEGMAX is also winwait's lead
   [ $r != 0 ] && { st "$1: winwait rc=$r: chain ends"; exit 4; }
   leg "$@"
 }
-run1 w_B0c hB "$HD" 1 420 0 "" || { st "the cold body leg failed: chain ends, logs/w_B0c.log"; exit 7; }
-run1 w_Bw1 hB "$HD" 1 900 0 "--prof 2" || { st "the first --prof 2 leg failed: chain ends, logs/w_Bw1.log"; exit 8; }
-run1 w_Bw2 hB "$HD" 1 900 0 "--prof 2"
-run1 w_Bp hB "$HD" 1 600 0 "--prof"
-run1 w_B1 hB "$HD" 1 420 0 ""
-for n in w_Bw1 w_Bw2; do grep -a "^census mwait" $L/$n.log | tail -n 1 > $L/$n.mwait; done
+# LEGS (default all five), PFX (default w): a re-run of some legs keeps the first chain's files
+PFX=${PFX:-w}
+for l in ${LEGS:-B0c Bw1 Bw2 Bp B1}; do
+  case $l in
+    B0c) run1 ${PFX}_B0c hB "$HD" 1 420 0 "" || { st "the cold body leg failed: chain ends, logs/${PFX}_B0c.log"; exit 7; };;
+    Bw*) run1 ${PFX}_$l hB "$HD" 1 900 0 "--prof 2" || { st "the --prof 2 leg $l failed: chain ends, logs/${PFX}_$l.log"; exit 8; };;
+    Bp) run1 ${PFX}_Bp hB "$HD" 1 600 0 "--prof";;
+    B1) run1 ${PFX}_B1 hB "$HD" 1 420 0 "";;
+  esac
+done
+for n in ${PFX}_Bw1 ${PFX}_Bw2; do [ -e $L/$n.log ] && grep -a "^census mwait" $L/$n.log | tail -n 1 > $L/$n.mwait; done
 st "chainW done"
