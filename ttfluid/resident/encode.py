@@ -37,7 +37,7 @@ C_BLK = 46              # a generated SFPU body (BLOCKS): n << 16, then its n-wo
 # by blklower.lower_block(**plan) and its bodies by blockgen.program(**gen); the kernel needs CFD_BLK. The arithmetic
 # and its order are the uop list's, so memu stays the reference and the state digest must not move.
 BLOCKS = None
-BLK_STAT = {"blocks": 0, "bodies": 0, "words": 0, "fallback": 0}
+BLK_STAT = {"bodies": 0, "words": 0}    # and blklower.lower_block's counts
 NARROW = 1 << 27        # desc bit: a bf16 constant page (vm_ncrisc window)
 TILE = 0x80     # op bit: tile operand += loop counter
 # BRISC
@@ -270,13 +270,8 @@ class Encoded:
             if BLOCKS:
                 from . import blklower, blockgen
                 gen = BLOCKS.get("gen", {})
-                low = blklower.lower_block(uops, stores, m.nslot, accept=lambda sp: blockgen.program(sp, **gen) is not None,
-                                           **BLOCKS.get("plan", {}))
-                BLK_STAT["blocks"] += 1
-                if low is None or not any(u[0] == "body" for u in low[0]):
-                    BLK_STAT["fallback"] += low is None
-                else:
-                    uops, stores = low
+                uops, stores = blklower.lower_block(uops, stores, m.nslot, accept=lambda sp: blockgen.accept(sp, **gen),
+                                                    info=BLK_STAT, **BLOCKS.get("plan", {}))
             c(W(C_ACQ))
             for u in uops:
                 k = u[0]

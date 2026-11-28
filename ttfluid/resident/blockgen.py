@@ -243,9 +243,14 @@ def stock_cost(uops):
 # evaluated one by one, so a schedule is replayed against the plain evaluation before it may run on a chip.
 import numpy as np
 
-FP32, AM_STAY, AM_STEP = 3, 3, 2    # SFPLOAD / SFPSTORE mode; ADDR_MOD_7 (no step) and ADDR_MOD_6 (dest += 2) under base 4
+FP32, AM_STAY, AM_STEP = 3, 7, 6    # SFPLOAD / SFPSTORE mode; ADDR_MOD_7 (no step) and ADDR_MOD_6 (dest += 2), blk_init
 C0, C1 = 9, 10                      # LCONST_0, LCONST_1
-EQ0 = 6                             # SFPSETCC_MOD1_LREG_EQ0
+NE0, GTE0, EQ0 = 2, 4, 6            # SFPSETCC_MOD1_LREG_*
+# the six comparisons as the stock tile ops compile (vm_compute.cpp, objdump of the TRISC1 kernel): the SFPSETCC modes
+# and the value of the lanes they select (the other lanes get the other one of 0.0 / 1.0)
+CMP = {"eqz": ((EQ0,), 1), "nez": ((EQ0,), 0), "gez": ((GTE0,), 1), "ltz": ((GTE0,), 0), "gtz": ((GTE0, NE0), 1), "lez": ((GTE0, NE0), 0)}
+NEG1 = "-1.0"                       # the msb's multiplier, a constant LREG of its own (stock: addcmul's value)
+ENCC = ("sfpencc", 3, 0, 0, 10)     # every lane on again, as compiled SFPI code ends a v_if
 MADS = ("sfpmad", "sfpadd", "sfpmul")
 NLANE = 32
 
@@ -269,6 +274,9 @@ def _plain(spec, lregs=8):
             first.setdefault(v, i)
     cfg, row = [], []
     free, reg, ready = list(range(lregs)), {}, {}
+    const = dict(const)
+    if any(o[0] == "msb" for o in ops):
+        const[NEG1] = -1.0
     for v, x in const.items():
         b = _f32bits(x)
         if b == 0:
@@ -342,6 +350,30 @@ def _plain(spec, lregs=8):
             wait([ra, rb])
             r = reg.pop(a[0]) if dies(a[0], i) else reg.pop(a[1]) if dies(a[1], i) and a[1] != a[0] else alloc()
             ready[r] = (emit("sfpadd", C1, ra, rb, r, 0) if name == "add" else emit("sfpmul", ra, rb, C0, r, 0)) + 1
+        elif name == "sub":     # 1 a - b: the add with its addend negated
+            ra, rb = need(a[0]), need(a[1])
+            wait([ra, rb])
+            r = reg.pop(a[0]) if dies(a[0], i) else reg.pop(a[1]) if dies(a[1], i) and a[1] != a[0] else alloc()
+            ready[r] = emit("sfpadd", C1, ra, rb, r, 2) + 1
+        elif name in ("mad", "msb"):    # d +- b c as addcmul runs it: t = b * (+-1), then c t + d in one multiply-add
+            rb, rc, rd = need(a[0]), need(a[1]), need(a[2])
+            wait([rb])
+            t = alloc()
+            ready[t] = emit("sfpmul", rb, C1 if name == "mad" else reg[NEG1], C0, t, 0) + 1
+            wait([rc, t, rd])
+            r = t
+            ready[r] = emit("sfpmad", rc, t, rd, r, 0) + 1
+        elif name in CMP:
+            ra = need(a[0])
+            wait([ra])
+            r = reg.pop(a[0]) if dies(a[0], i) else alloc()
+            modes, hit = CMP[name]
+            for md in modes:
+                emit("sfpsetcc", 0, ra, 0, md)
+            emit("sfpmov", 0, C1 if hit else C0, r, 0)
+            emit("sfpcompc", 0, 0, 0, 0)
+            emit("sfpmov", 0, C0 if hit else C1, r, 0)
+            ready[r] = emit(*ENCC)
         elif name in ("neg", "abs"):
             ra = need(a[0])
             wait([ra])
@@ -362,7 +394,7 @@ def _plain(spec, lregs=8):
                 unloaded.remove(y)
             else:
                 emit("sfpmov", 0, reg[y], r, 0)
-            ready[r] = emit("sfpencc", 0, 0, 0, 0)
+            ready[r] = emit(*ENCC)
         elif name in ("max", "min"):
             need(a[0])
             need(a[1])
@@ -423,6 +455,9 @@ PRIM = {
     "neg": lambda a: (a.view(np.uint32) ^ np.uint32(0x80000000)).view(np.float32),
     "abs": lambda a: np.where(np.isnan(a), a, (a.view(np.uint32) & np.uint32(0x7fffffff)).view(np.float32)),
     "eq0": lambda a: (a.view(np.uint32) & np.uint32(0x7fffffff)) == 0,
+    "gte0": lambda a: (a.view(np.uint32) >> 31) == 0,
+    "sub": lambda a, b: (a.astype(np.float64) - b).astype(np.float32),
+    "mad1": lambda a, b, c: (a.astype(np.float64) * b + c).astype(np.float32),
     "max": lambda a, b: np.where(_ord(a) >= _ord(b), a, b),
     "min": lambda a, b: np.where(_ord(a) >= _ord(b), b, a),
 }
@@ -466,16 +501,25 @@ def sim(cfg, row, slots, nrow=2, strict=True):
             elif op == "sfpstore":
                 assert on.all(), "store under a lane mask"
                 slots[x[4] // 64][k] = rd(x[1], t)
-            elif op in ("sfpadd", "sfpmul"):
-                wr(x[4], PRIM[op[3:]](rd(x[2], t), rd(x[3], t)) if op == "sfpadd" else PRIM["mul"](rd(x[1], t), rd(x[2], t)), t, 2)
+            elif op == "sfpadd":
+                assert x[1] == C1 and x[5] in (0, 2)
+                wr(x[4], PRIM["sub" if x[5] else "add"](rd(x[2], t), rd(x[3], t)), t, 2)
+            elif op == "sfpmul":
+                assert x[3] == C0 and x[5] == 0
+                wr(x[4], PRIM["mul"](rd(x[1], t), rd(x[2], t)), t, 2)
+            elif op == "sfpmad":
+                assert x[5] == 0
+                wr(x[4], PRIM["mad1"](rd(x[1], t), rd(x[2], t), rd(x[3], t)), t, 2)
             elif op == "sfpmov":
                 wr(x[3], PRIM["neg"](rd(x[2], t)) if x[4] == 1 else rd(x[2], t), t)
             elif op == "sfpabs":
                 wr(x[3], PRIM["abs"](rd(x[2], t)), t)
             elif op == "sfpsetcc":
-                assert x[4] == EQ0
-                on = on & PRIM["eq0"](rd(x[2], t))
+                on = on & {EQ0: PRIM["eq0"], NE0: lambda a: ~PRIM["eq0"](a), GTE0: PRIM["gte0"]}[x[4]](rd(x[2], t))
+            elif op == "sfpcompc":
+                on = ~on
             elif op == "sfpencc":
+                assert x == ENCC
                 on = np.ones(n, bool)
             elif op == "sfpswap":
                 c, d = rd(x[2], t), rd(x[3], t)
@@ -493,9 +537,19 @@ def ref(spec, slots, nrow=2):
     env = {v: slots[s] for v, s in spec["ins"]}
     n = next(iter(slots.values())).shape
     env.update({v: np.full(n, x, np.float32) for v, x in spec["const"].items()})
+    one, zero = np.float32(1), np.float32(0)
     for name, out, *a in spec["ops"]:
         x = [env[v] for v in a]
-        env[out] = np.where(PRIM["eq0"](x[0]), x[2], x[1]) if name == "where" else PRIM[name](*x)
+        if name == "where":
+            env[out] = np.where(PRIM["eq0"](x[0]), x[2], x[1])
+        elif name in CMP:
+            modes, hit = CMP[name]
+            sel = PRIM["gte0"](x[0]) & ~PRIM["eq0"](x[0]) if len(modes) == 2 else PRIM["eq0" if modes[0] == EQ0 else "gte0"](x[0])
+            env[out] = np.where(sel, one if hit else zero, zero if hit else one).astype(np.float32)
+        elif name in ("mad", "msb"):
+            env[out] = PRIM["mad1"](x[1], PRIM["mul"](x[0], np.float32(1 if name == "mad" else -1) + np.zeros_like(x[0])), x[2])
+        else:
+            env[out] = PRIM[name](*x)
     return {s: env[v] for v, s in spec["outs"]}
 
 
@@ -515,3 +569,19 @@ def check(spec, seed=0, **kw):
         slots[s] = a
     got, want = sim(*p, slots), ref(spec, slots)
     return all(np.array_equal(got[s].view(np.uint32), want[s].view(np.uint32)) for s in want)
+
+
+_ACC = {}
+
+
+def accept(spec, **kw):
+    """The encoder's test of a planned body: a program exists and its replay computes what the ops do. Cached per
+    body (slots, ops and constants)."""
+    names = {}
+    k = (tuple(sorted(kw.items())), tuple((names.setdefault(v, len(names)), s) for v, s in spec["ins"]),
+         tuple((name, names.setdefault(out, len(names))) + tuple(names.setdefault(v, len(names)) for v in a) for name, out, *a in spec["ops"]),
+         tuple((names.get(v), s) for v, s in spec["outs"]), tuple(sorted((names.get(v, -1), _f32bits(x)) for v, x in spec["const"].items())))
+    if k not in _ACC:
+        with np.errstate(all="ignore"):
+            _ACC[k] = check(spec, **kw) is True
+    return _ACC[k]
