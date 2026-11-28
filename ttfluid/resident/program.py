@@ -225,10 +225,11 @@ def build(solver, max_outer=2000, amg_owner=None, amg_kind="pairwise", amg_smoot
         from . import amg
         tops.amg_levels = amg.attach(tr, amg_setup(ops, np.asarray(amg_owner), kind=amg_kind,
                                                    shape=amg_vshape if amg_kind == "matched" else None,
-                                                   chip_cores=amg_chip_cores), cells)
+                                                   chip_cores=amg_chip_cores), cells,
+                                     stack=amg_stack and amg_kind == "matched", owner=np.asarray(amg_owner))
         for L in tops.amg_levels:          # Layout places every space the Program lists
             pspace[L.space.name] = L.space
-            for sp_ in L.fspaces:
+            for sp_ in L.fspaces + [c[0] for c in (L.gchunks or []) + (L.mchunks or [])]:
                 pspace[sp_.name] = sp_
 
     # ---- the state: every field's cells and patch values, and the flux

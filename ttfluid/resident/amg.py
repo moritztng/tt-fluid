@@ -355,9 +355,13 @@ def _traced(x):
     return hasattr(x, "tr") and hasattr(x, "space")
 
 
-def attach(tr, levels, cells):
+def attach(tr, levels, cells, stack=False, owner=None):
     """Make `levels` traceable on tracer `tr`: one Space per coarse level (an aggregate lives on its leader's core,
-    the leader being its first member's fine cell), every constant index array registered with its result space."""
+    the leader being its first member's fine cell), every constant index array registered with its result space.
+    stack (owner: the core of every fine cell): the coarse SpMV and the member sum of every level run on stacked
+    spaces (sa._chunks: slot k of row I at lane k * w + lane(I)), so each is one gather and one block sum
+    (trace.Tracer.bsum) instead of one gather and one block per slot, and the coarse coefficients are stacked
+    vectors, not one register per slot."""
     leader = np.arange(cells.n)
     fine = cells
     from .trace import Space
@@ -368,6 +372,13 @@ def attach(tr, levels, cells):
         L.fine_space = fine
         L.fspaces = [Space(f"amg{l + 1}f" + (str(c) if len(L.nF) > 1 else ""), n, cells=leader[fc])
                      for c, (n, fc) in enumerate(zip(L.nF, L.fcells))]
+        L.gchunks = L.mchunks = None
+        if stack:
+            from .sa import _chunks
+            sI, sk = np.nonzero(L.mask)
+            L.gchunks, L.C = _chunks(f"amg{l + 1}g", L.space, leader, np.asarray(owner), sI, sk, L.nbr[sI, sk])
+            mI, mk = np.nonzero(L.Mw > 0)
+            L.mchunks, _ = _chunks(f"amg{l + 1}m", L.space, leader, np.asarray(owner), mI, mk, L.M[mI, mk])
         L.Mcols = [np.ascontiguousarray(L.M[:, j]) for j in range(L.M.shape[1])]
         for a in [L.M, L.nbr] + L.Mcols:
             tr.index_space[id(a)] = L.space
@@ -381,7 +392,7 @@ def galerkin(L, d, off, dtype):
     gathers and adds only (Level.__init__ lists them)."""
     tr = d.tr if _traced(d) else None
     if tr is not None:
-        from .trace import T
+        from .trace import T, _zero_vec
 
     def gather(space, n, parts):
         """parts: [(source, dst lanes, src lanes)], at most 8 sources per gather: the DRAM reader patches a DRAM-homed
@@ -404,16 +415,58 @@ def galerkin(L, d, off, dtype):
             out = out + x
         return out
 
+    def col(s, r):
+        """slot s of the finer level's coefficients at its rows r, as a gather source: (vector, lanes)"""
+        if isinstance(off, Stacked):
+            return off[s // off.C], (s % off.C) * off.n + r
+        return off[:, s], r
+
     fine = getattr(L, "fine_space", None)
-    q = total([d] + [gather(fine, L.n, [(off[:, s], r, r)]) for s, r in L.inner])
+    q = total([d] + [gather(fine, L.n, [col(s, r)[:1] + (r, col(s, r)[1])]) for s, r in L.inner])
     dc = total([gather(getattr(L, "space", None), L.nc, [(q, live, rows)]) for live, rows in L.members])
-    F = [total([gather(sp_, n, [(off[:, s], f, r) for s, f, r in layer]) for layer in lay]) if lay else None
-         for sp_, n, lay in zip(getattr(L, "fspaces", [None] * len(L.nF)), L.nF, L.layers)]
+    F = [total([gather(sp_, n, [col(s, r)[:1] + (f, col(s, r)[1]) for s, f, r in layer]) for layer in lay]) if lay
+         else None for sp_, n, lay in zip(getattr(L, "fspaces", [None] * len(L.nF)), L.nF, L.layers)]
+    if tr is not None and getattr(L, "gchunks", None) is not None:
+        # stacked: per chunk of C slots one gather, a part per flat space its slots read (slot k of row I at
+        # (k - k0) * nc + I, sa._chunks)
+        out = Stacked()
+        out.C, out.n = L.C, L.nc
+        for j, (g, _, _, _) in enumerate(L.gchunks):
+            byf = {}
+            for k in range(j * L.C, min((j + 1) * L.C, L.S)):
+                rows, lanes = L.flat[k]
+                if F[L.fslot[k]] is not None and len(rows):
+                    byf.setdefault(int(L.fslot[k]), []).append(((k - j * L.C) * L.nc + rows, lanes))
+            parts = [(F[c], np.concatenate([a for a, _ in v]), np.concatenate([b for _, b in v])) for c, v in
+                     sorted(byf.items())]
+            out.append(gather(g, g.n, parts) if parts else T(tr, g, np.array(_zero_vec(tr, g), object)))
+        return dc, out
     cols = [gather(getattr(L, "space", None), L.nc, [(F[L.fslot[k]], *L.flat[k])]) if F[L.fslot[k]] is not None
             else (dc * 0) for k in range(L.S)]
     if tr is not None:
         return dc, T(tr, L.space, np.array([c.c[()] for c in cols], object))
     return dc, np.stack(cols, axis=1)
+
+
+class Stacked(list):
+    """A level's coefficients as stacked vectors: chunk j holds slots [j C, (j + 1) C), slot k of row I at entry
+    (k - j C) * n + I of its space (attach(stack=True))."""
+    C = n = None
+
+
+def _ssum(x, chunks, base, weights=None):
+    """Sum over the slots of a stacked map (traced only): per chunk one gather of x and one block sum, of weight *
+    gathered if the chunk has a weight vector. A gather's unlisted lanes read 0, so a slot a row does not have adds
+    nothing."""
+    from .trace import T
+    y = None
+    for j, (g, dst, pos, _) in enumerate(chunks):
+        xg = T(x.tr, g, np.array(x.tr.gather(g, [(x.c[()], dst, pos)]), object))
+        if weights is not None:
+            xg = xg * weights[j]
+        t = T(x.tr, base, np.array(x.tr.bsum(xg.c[()]), object))
+        y = t if y is None else y + t
+    return y
 
 
 def gershgorin(d, off):
@@ -447,7 +500,17 @@ class Ops:
 
     def spmv(self, l, x):
         d, off, nbr = self.A[l]
+        if isinstance(off, Stacked):                # one gather and one block sum per chunk of slots
+            L = self.levels[l - 1]
+            return d * x + _ssum(x, L.gchunks, L.space, off)
         return d * x + (off * x[nbr]).sum(axis=1)   # a coarse level reads other cores through its own halo plan
+
+    def restrict(self, l, res):
+        """Residual of level l summed over the members of level l + 1's aggregates."""
+        L = self.levels[l]
+        if _traced(res) and getattr(L, "mchunks", None) is not None:
+            return _ssum(res, L.mchunks, L.space)
+        return (L.Mw.astype(self.dtype) * res[L.M]).sum(axis=1)
 
     def smooth(self, l, b, x, deg, ratio=None):
         th, de, dinv = self.cheb[l]
@@ -475,7 +538,7 @@ class Ops:
         mode, k, a = (c["fine"], c["k"], c["a"]) if l == 0 else (c["coarse"], c["ck"], c["ca"])
 
         def corr(res):
-            return self.cycle((L.Mw.astype(self.dtype) * res[L.M]).sum(axis=1), l + 1)[L.agg]
+            return self.cycle(self.restrict(l, res), l + 1)[L.agg]
         if mode == "add":
             return self.smooth(l, r, None, k, a) + corr(r)
         if mode == "post":
@@ -492,7 +555,7 @@ class Ops:
         L = self.levels[l]
         x = self.smooth(l, r, None, 3)
         res = r - self.spmv(l, x)
-        rc = (L.Mw.astype(self.dtype) * res[L.M]).sum(axis=1)
+        rc = self.restrict(l, res)
         ec = self.vcycle(rc, l + 1)
         x2 = x + ec[L.agg]
         out = self.smooth(l, r, x2, 3)
