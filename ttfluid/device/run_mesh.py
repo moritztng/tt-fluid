@@ -342,7 +342,9 @@ else:
         code = (a.page * 1024 if a.page else pad(len(E.c))) + pad(len(E.b)) + (a.nwin * 4 if a.nwin else pad(len(E.n)))
         ts = 2 * (4096 + 64 * 32) if E.tab_stream else 0
         ts += 4096 if E.tab_stream and a.bpatch != 0 else 0      # cb_sync may grow a page for the B-patch mailbox
-        return mm.ntiles * 4096 + code + pad(E.tab.shape[1] + 64) + fixed + rings + mesh + max(a.gcache, 6 if a.gcache < 0 else 0) * 4096 + ts + (0 if mm.ndram else 2048 * min(a.narrow, 2))
+        blk = (ttfluid.resident.encode.BLOCKS or {}).get("tab")   # --blktab: the body table is kernel text, the kernel config buffer grows by it
+        blk = -(-4 * sum(len(q) for q in blk) // 4096) * 4096 if blk else 0
+        return mm.ntiles * 4096 + code + pad(E.tab.shape[1] + 64) + fixed + rings + mesh + max(a.gcache, 6 if a.gcache < 0 else 0) * 4096 + ts + (0 if mm.ndram else 2048 * min(a.narrow, 2)) + blk
 
 
     ttfluid.resident.encode.WIDE = a.wide or m.T > 64   # over 65,536 lanes a core: 22-bit gather entries (ttfluid/resident/encode.py)
