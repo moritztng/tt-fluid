@@ -1018,6 +1018,7 @@ class Machine:
             log(f"cse: {n0} -> {len(code)} instructions")
         code = dce(code)
         self.sliced, self.ext = sliced, {}
+        self.stiles = {}     # scratch register -> tile count of the vector it stands for (_scratch, tiles)
         if sliced:
             code, D = self._sliced(code, prog, mesh, P, tiles, chip_cores if chip_line else None, log)
         n0 = sum(1 for i in code if i[0] == "copy")
@@ -1175,6 +1176,11 @@ class Machine:
         regs += [r for x in blks for _, r in x[2]]
         regs += [u[2] for x in blks for u in x[1] if u[0] == "ldr" and u[2] is not None and not stk(x, u)]  # patch sources
         ts = {self.size(r) for r in regs if r != "__anchor__" and self.is_vec(r)}
+        # a vector the run keeps in a one-tile scratch register still counts with its own extent: a short ELL slot
+        # whose gather destination went to scratch (a reader-built page under pseg) would otherwise loop over the
+        # tiles of its source and coefficient, T instead of L_k, building and multiplying pages of zeros
+        st = getattr(self, "stiles", {})
+        ts |= {st[r] for r in regs if r in st}
         ts |= {self.Ts[b.name] if b.name in self.lay.wide else 1
                for b in (self.space[u[2]].stack[0] for x in blks for u in x[1] if stk(x, u))}
         if self.sliced and ts:      # a block runs over its narrowest vector; wider ones are read at their first tiles
@@ -1868,9 +1874,11 @@ class Machine:
                         sts.append((slot, r))
                     elif r not in after:
                         ren[r] = self._tmp(SCRATCH)
+                        self.stiles[ren[r]] = self.size(r)
                         sts.append((slot, ren[r]))
                     elif r in later:
                         ren[r] = self._tmp(SCRATCH)
+                        self.stiles[ren[r]] = self.size(r)
                         sts += [(slot, r), (slot, ren[r])]
                     else:
                         sts.append((slot, r))
