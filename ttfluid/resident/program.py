@@ -149,6 +149,7 @@ class Program:
         self.outs = outs              # names of the per-iteration scalars, in 'out' order
         self.perf_names = perf_names
         self.trips = tr.trips
+        self.rounds = tr.rounds
         self.phase_at = getattr(tr, "phase_at", {})   # build(phase=True): label -> PHASES index (encode.py C_PH / B_PH)
 
 

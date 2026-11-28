@@ -472,6 +472,14 @@ def _pbicgstab_joint(A, x, b, c):
     return Perf(r0n, RES.t, IT.t)
 
 
+def _round(tr, sums):
+    """Mark the sums of all components at one point of a lockstep loop as one reduction round: the lowering keeps
+    them adjacent (machine._lsched), so they can leave in one message."""
+    for v in sums:
+        for t in (v if isinstance(v, (tuple, list)) else (v,)):
+            tr.rounds.add(t.c[()])
+
+
 def pbicgstab_fused(As, xs, bs, c):
     """The BiCGStab solves of the components of one vector equation in lockstep: one loop, one pass over the matrix
     for all of them. The components share the off-diagonal coefficients and the gather tables (As[k] differ in the
@@ -495,6 +503,7 @@ def pbicgstab_fused(As, xs, bs, c):
     r = [bs[k] - Ax[k] for k in K]
     e = [(np.abs(Ax[k] - tv[k]), np.abs(bs[k] - tv[k]), np.abs(r[k])) for k in K]
     e = [tuple(v.sum() for v in e[k]) for k in K]
+    _round(tr, e)
     nf = [e[k][0] + e[k][1] + SMALL for k in K]
     r0n = [e[k][2] / nf[k] for k in K]
     END, LOOP = tr.new_label(), tr.new_label()
@@ -507,7 +516,9 @@ def pbicgstab_fused(As, xs, bs, c):
     rD = [1.0 / As[k].d for k in K]
     r0 = [r[k].copy() for k in K]
     g = [r0[k] * r[k] for k in K]
-    RHO = [Var(v.sum()) for v in g]
+    rho0 = [v.sum() for v in g]
+    _round(tr, rho0)
+    RHO = [Var(v) for v in rho0]
     act = []
     for k in K:   # pbicgstab leaves before its loop when converged at entry, at maxIter 0 and at rho == 0
         a = 1.0 - (np.abs(RHO[k].t) < 1e-300)
@@ -538,6 +549,7 @@ def pbicgstab_fused(As, xs, bs, c):
         V[k].set(v[k])
     g = [r0[k] * v[k] for k in K]
     rv = [w.sum() for w in g]
+    _round(tr, rv)
     alpha, s, it, z = [], [], [], []
     for k in K:
         alpha.append(RHO[k].t / rv[k])
@@ -548,6 +560,7 @@ def pbicgstab_fused(As, xs, bs, c):
     t = [As[k](z[k]) for k in K]
     e = [(np.abs(s[k]), t[k] * t[k], t[k] * s[k]) for k in K]
     e = [tuple(w.sum() for w in e[k]) for k in K]
+    _round(tr, e)
     gate = [(it[k] >= float(c.minIter)) if c.minIter > 0 else None for k in K]
     res_s, sdone, omega = [], [], []
     for k in K:
@@ -564,6 +577,7 @@ def pbicgstab_fused(As, xs, bs, c):
         R[k].set(s[k] - omega[k] * t[k])
     e = [(np.abs(R[k].t), r0[k] * R[k].t) for k in K]
     e = [tuple(w.sum() for w in e[k]) for k in K]
+    _round(tr, e)
     for k in K:
         sa, rho_n = e[k]
         res_r = sa / nf[k]

@@ -823,8 +823,10 @@ def _dfs_order(blks, rev=False):
 _MOVABLE = ("ew", "gather", "reduce", "copy", "bsum")
 
 
-def _lsched(code, space, log=print):
+def _lsched(code, space, log=print, fixed=()):
     """Reorder each straight-line run of ew/gather/reduce/copy/bsum to cut the peak number of live vector registers.
+    A reduce whose result is in `fixed` (a reduction round of a lockstep solve, Program.rounds) ends a run and stays
+    where it is: the walk would finish one component's sums before the next component's SpMV and split the round.
     The trace emits numpy's whole-array order (all S gathers of an ELL product, then all S products, then the sums),
     so every slot's term is live at once; a post-order walk from the run's sinks finishes one term into the
     accumulator before making the next. Same instructions on the same registers, only reordered under RAW/WAR/WAW,
@@ -832,15 +834,16 @@ def _lsched(code, space, log=print):
     n = len(code)
     vec = lambda r: space[r] is not SCALAR
     live_end = {}
-    ends = [i for i in range(n) if code[i][0] in _MOVABLE and (i + 1 == n or code[i + 1][0] not in _MOVABLE)]
+    mov = [ins[0] in _MOVABLE and not (ins[0] == "reduce" and ins[1] in fixed) for ins in code]
+    ends = [i for i in range(n) if mov[i] and (i + 1 == n or not mov[i + 1])]
     lo = liveness(code, at=set(ends))
     out, i, nrun, p0, p1 = [], 0, 0, 0, 0
     while i < n:
-        if code[i][0] not in _MOVABLE:
+        if not mov[i]:
             out.append(code[i]); i += 1
             continue
         j = i
-        while j < n and code[j][0] in _MOVABLE:
+        while j < n and mov[j]:
             j += 1
         blk = code[i:j]
         live = {r for r in lo[j - 1] if vec(r)}
@@ -1001,7 +1004,7 @@ class Machine:
         code = dce(code)
         log(f"IR: {len(code)} instructions, copies {n0} -> {sum(1 for i in code if i[0] == 'copy')}")
         if lsched:
-            code = _lsched(code, prog.space, log)
+            code = _lsched(code, prog.space, log, {self.ren(r) for r in getattr(prog, "rounds", ())})
         if self.redm:
             code = _adjacent_reduces(code)
         self.code = code
