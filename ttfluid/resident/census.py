@@ -208,7 +208,7 @@ def mwait(hdr):
     tail = the last poll
     of each kind (nobody waited for), n = drains of each kind."""
     w64 = lambda i: float((hdr[:, i].astype("float64") + hdr[:, i + 1].astype("float64") * 2.0 ** 32).mean())
-    load = {"%s | %s" % (MW_U[u], MW_N[n]): w64(700 + 2 * (16 * u + n)) for u in range(8) for n in range(16)}
+    load = {"%s | %s" % (MW_U[u], MW_N[n]): w64(700 + 2 * (16 * u + n)) for u in range(6) for n in range(13)}   # the states and classes the kernels publish; 952 and 954 above them are the acquire's cross-checks
     acq = {MW_P[q]: w64(960 + 2 * q) for q in range(8)}
     return dict(load={k: round(v) for k, v in load.items() if v}, acq={k: round(v) for k, v in acq.items() if v},
                 own=round(w64(976)), load_after=round(w64(978)), acq_after=round(w64(952)),
