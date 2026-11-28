@@ -21,6 +21,19 @@ All notable changes to this project are documented here. The format follows
 - Image upload and the state transfer read only the bytes an image stores. Host time around a Small run fell from
   65 s to 18 s and its peak host memory from 29 GB to 11 GB.
 - Lowering HPC_motorbike Small needs about 90 GB of host RAM (the docs said 220 GB).
+- A run whose residuals become NaN or infinite ends in that iteration: `run_mesh` prints `DIVERGED` with the
+  iteration and the fields, saves the state and exits with status 4. Before, every linear solve of the remaining
+  iterations ran to its cap.
+
+### Fixed
+- HPC_motorbike Small could go NaN in single precision: in iteration 337 of one of nine start states on four
+  Blackhole chips, and after about 2,200 iterations on two. omega was floored at OpenFOAM's double-precision `SMALL`
+  (1e-15). In fp32 it is now floored at 1e-6, the value OpenFOAM's own single-precision build uses; `omegaMin` and
+  `kMin` in the RAS dictionary override the defaults. The new floor moves the rounding of every fp32 run from its
+  first iterations, so earlier final states are not reproduced bit for bit
+  ([accuracy](docs/accuracy.md#a-known-behaviour-of-the-case)).
+- PBiCGStab's breakdown test compared against 1e-300, which is zero in fp32, so it could never stop a solve. It now
+  uses the smallest magnitude of the precision.
 
 ## [0.1.0] - 2026-10-19
 
