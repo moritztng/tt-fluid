@@ -144,14 +144,18 @@ class Program:
         self.phase_at = getattr(tr, "phase_at", {})   # build(phase=True): label -> PHASES index (encode.py C_PH / B_PH)
 
 
-def amg_setup(ops, owner, log=print):
+def amg_setup(ops, owner, log=print, kind="pairwise", shape=None):
     """Multigrid levels for the pressure PCG: pairwise aggregates on the face graph weighted by |Sf| deltaCoeffs
-    (the p Laplacian at uniform rAU), never across `owner` cores."""
+    (the p Laplacian at uniform rAU), never across `owner` cores. kind "matched": the handshake matching of the host
+    model (amg.matched, about 8 cells per aggregate and level, down to 18 rows a core), with the cycle `shape`."""
     from . import amg
     e = ops.e
     w = np.where(e.internal, np.asarray(e.magSf, np.float64) * np.asarray(e.dc, np.float64), 0.0)
-    aggs = amg.pairwise(ops.cnbr, e.internal, w, owner)
-    levels = amg.build(ops.cnbr, e.internal, aggs, w)
+    if kind == "matched":
+        aggs = amg.matched(ops.cnbr, e.internal, w, owner, max_coarse=18 * (int(np.max(owner)) + 1))
+    else:
+        aggs = amg.pairwise(ops.cnbr, e.internal, w, owner)
+    levels = amg.build(ops.cnbr, e.internal, aggs, w, shape=shape)
     log(f"amg: levels {[e.nCells] + [L.nc for L in levels]}, coarse slots {[L.S for L in levels]}")
     return levels
 

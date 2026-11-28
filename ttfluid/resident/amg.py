@@ -294,10 +294,16 @@ CAP = int(os.environ.get("CFD_AMG_CAP", 24)) or None    # coarse-row width cap (
 # cap none/24/16/12/8 -> PCG 11/11/13/16/21 it, coarse widths sum 445/144/96/72/48 (amg/cap_study.py)
 
 
-def build(nbr, mask, aggs, w=None, cap=CAP):
+class Levels(list):
+    """The levels of one hierarchy and the cycle Ops runs on them (shape None: the V(3,3) cycle)."""
+    shape = None
+
+
+def build(nbr, mask, aggs, w=None, cap=CAP, shape=None):
     """aggs: one fine->coarse map per level (level l's map indexes level l-1's rows); w: fine edge weights (n, S),
-    cap: coarse ELL width limit (Level)."""
-    levels = []
+    cap: coarse ELL width limit (Level), shape: the cycle Ops runs (Ops.cycle)."""
+    levels = Levels()
+    levels.shape = shape
     for agg in aggs:
         L = Level(nbr, mask, np.asarray(agg), w, cap)
         levels.append(L)
