@@ -25,9 +25,9 @@ solvers. With --base the same window of a baseline run is compared too: two corr
 of their floating-point sums sit sqrt(2) S100 / sqrt(n) apart (the floor); 1 such pair in 20 is over twice that apart.
 
 A change that only reorders the same arithmetic has a much sharper check, also printed with --base when both runs
-start from the same state: such runs still track each other through iteration 10 (TRACK), long before the window.
-After that one linear solve taking one iteration more or fewer separates them for good. A run too short for a window
-(11 iterations are enough) gets this check alone, and the exit status is its result.
+start from the same state or from states one rounding step apart: such runs still track each other through iteration
+5 (TRACK), long before the window. After that one linear solve taking one iteration more or fewer separates them for
+good. A run too short for a window (6 iterations are enough) gets this check alone, and the exit status is its result.
 
 Runs that track each other are draws of one arithmetic, so their windows can be pooled into one grade: each --pool
 adds such a run (the tool refuses one that does not track --run), and the pooled window counts every run's blocks
@@ -47,7 +47,7 @@ from pathlib import Path
 BAND = 12.5                       # counts, the accuracy bar once enough runs are pooled to resolve it
 ONE_RUN, RECORD_RUNS = 6, 4       # blocks one run counts for at most; runs a grade of record pools
 S100 = {"Cd": 20.0, "Cl": 18.0}   # counts, sd of a 100-iteration mean (OpenFOAM, SPUMA x18, two device builds)
-TRACK_ITS, TRACK = 10, 1.0        # reordered runs stay within TRACK counts of Cd through iteration TRACK_ITS
+TRACK_ITS, TRACK = 5, 1.0         # runs of one arithmetic stay within TRACK counts of Cd through iteration TRACK_ITS
 BLOCK, START, REF_FROM = 100, 201, 501
 REF = [str(Path(__file__).resolve().parent.parent / "results/openfoam" / f) for f in ("of1k.dat", "of4k.dat")]
 

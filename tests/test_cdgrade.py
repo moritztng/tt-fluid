@@ -12,6 +12,7 @@ import cdgrade  # noqa: E402
 REF = cdgrade.series(cdgrade.REF)
 H100 = ROOT / "results/nvidia/dgx-h100"
 QB2 = ROOT / "results/tenstorrent/quietbox2-p300x4"
+GLX = ROOT / "results/tenstorrent/galaxy-blackhole"
 
 
 def test_correct_runs_pass():
@@ -63,8 +64,8 @@ def test_reordered_runs_track_and_other_changes_do_not():
 
 @pytest.mark.parametrize("error, status", [(1.0, 0), (1.001, 1)])
 def test_a_short_run_gets_the_reorder_check_alone(tmp_path, monkeypatch, error, status):
-    """Eleven iterations decide whether a change is a reorder: no window, the exit status is the tracking check."""
-    hist = json.loads((QB2 / "qb2k2_D1A.hist.json").read_text())[:12]
+    """Six iterations decide whether a change is a reorder: no window, the exit status is the tracking check."""
+    hist = json.loads((QB2 / "qb2k2_D1A.hist.json").read_text())[:6]
     short = tmp_path / "short.hist.json"
     short.write_text(json.dumps([{**r, "Cd_in": r["Cd_in"] * error} for r in hist]))
     monkeypatch.setattr(sys, "argv", ["cdgrade.py", "--run", f"{short}:0", "--base", f"{QB2}/qb2k2_D1A.hist.json:0"])
@@ -90,6 +91,23 @@ def test_runs_of_one_arithmetic_pool_into_one_grade(monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:   # fp64 is another arithmetic: it does not track, so it is not pooled
         cdgrade.main()
     assert "not pooled" in str(e.value.code)
+
+
+def test_a_wrong_solve_fails():
+    """SPUMA with the inlet 1 % and 0.3 % too fast (forces still normalised with the nominal speed): both must fail."""
+    for f, counts in (("x1.010", 82.0), ("x1.003", 43.5)):
+        g = cdgrade.grade(cdgrade.series([str(ROOT / "results/nvidia/h100-wrong-inlet" / f"{f}.dat")]), REF)
+        assert g["grade"] == "FAIL" and round(g["Cd"]["diff"], 1) == counts and g["Cd"]["band"] < 18
+
+
+def test_device_runs_from_starts_one_rounding_step_apart_pool_to_a_grade_of_record():
+    """Seven 4-chip Galaxy runs whose start velocities differ by 1e-7: one arithmetic, pooled at the 12.5 bar."""
+    runs = [cdgrade.series([f"{f}:0"]) for f in [GLX / "d_l0_b0.hist.json", *sorted(GLX.glob("glx1_*.hist.json"))]]
+    early = [cdgrade.tracks(r, runs[0]) for r in runs[1:]]
+    assert len(runs) == 7 and max(early) < 0.3   # they track through TRACK_ITS; by iteration 10 one is 18 counts away
+    assert max(abs(r[i][0] - runs[0][i][0]) for r in runs[1:] for i in range(1, 11)) * 1e4 > 18
+    q = cdgrade.pooled([cdgrade.grade(r, REF) for r in runs])
+    assert q["record"] and q["grade"] == "PASS" and q["Cd"]["band"] == cdgrade.BAND and round(q["Cd"]["diff"], 1) == -3.3
 
 
 def test_another_case_gets_means_and_no_grade(monkeypatch, capsys):
