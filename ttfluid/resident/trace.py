@@ -56,7 +56,8 @@ class Tracer:
         self._const = {}
         self._label = 0
         self.trips = {}             # loop label -> typical passes (placement hint only, see Machine._place)
-        self.rounds = set()         # sums of a reduction round: kept where the trace put them (machine._lsched)
+        self.rounds = []            # reduction rounds, each a tuple of sum registers in trace order: one cross-core
+                                    # message per round (Machine._lower), members stay put (machine._lsched)
         self.index_space = {}       # id(index array) -> Space of the gather result
         self._arange = {}
         self.slotfold = {}          # register -> k: it is step k of a fold over ELL slots (program.TracedOps._fold)
