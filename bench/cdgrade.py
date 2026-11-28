@@ -29,12 +29,13 @@ import json
 import math
 import re
 import sys
+from pathlib import Path
 
 BAND = 12.5                       # counts, the accuracy bar on a window long enough to resolve it
 S100 = {"Cd": 20.0, "Cl": 18.0}   # counts, sd of a 100-iteration mean (OpenFOAM, SPUMA x18, two device builds)
 TRACK = {40: 0.3, 100: 5.2}       # counts, largest |Cd difference| through that iteration between reordered runs
 BLOCK, START, REF_FROM = 100, 201, 501
-REF = ["results/openfoam/of1k.dat", "results/openfoam/of4k.dat"]
+REF = [str(Path(__file__).resolve().parent.parent / "results/openfoam" / f) for f in ("of1k.dat", "of4k.dat")]
 
 
 def series(specs):

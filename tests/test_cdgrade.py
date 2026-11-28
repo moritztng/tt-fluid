@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "bench"))
 import cdgrade  # noqa: E402
 
-REF = cdgrade.series([str(ROOT / f) for f in cdgrade.REF])
+REF = cdgrade.series(cdgrade.REF)
 H100 = ROOT / "results/nvidia/dgx-h100"
 QB2 = ROOT / "results/tenstorrent/quietbox2-p300x4"
 
