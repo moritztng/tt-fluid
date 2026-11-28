@@ -16,8 +16,10 @@ space the global ids of the elements it owns with their (core, lane), so results
 """
 import hashlib
 import json
+import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -208,6 +210,10 @@ class Image:
                 X[np.asarray(ch["core/" + spn]), tt + lane // LANES, lane % LANES] = v[np.asarray(ch["ids/" + spn]), i]
 
 
+GAP, CHUNK = 1 << 18, 1 << 26      # read_into: stored ranges closer than GAP are one read; a read is at most CHUNK
+_READERS = ThreadPoolExecutor(int(os.environ.get("CFD_IMG_THREADS", 8)))   # preadv releases the GIL
+
+
 class _ChipFiles(dict):
     """A chip directory read lazily: each array is mapped when it is first asked for. Mapping all ~27 at once kept one
     file descriptor per array alive, and 32 chips uploading in parallel ran past `ulimit -n 1024` (EMFILE)."""
@@ -220,6 +226,38 @@ class _ChipFiles(dict):
 
     def get(self, name, default=None):
         return self[name] if name in self else default
+
+    def read_into(self, name, out):
+        """Array `name` read into out, a zeroed C-contiguous buffer of its byte size, from the byte ranges the file
+        stores. write_chip left the zero pages as holes and a hole is not read, so its pages of out stay untouched:
+        they take no time and no RAM (Small k2: 5.3 of 27.3 GB is stored). Ranges closer than GAP are read as one,
+        because the zero rows of the constants sit between data every ~60 KB and one read per range is slower than
+        reading the zeros between them."""
+        buf = memoryview(out).cast("B")
+        with open(dict.__getitem__(self, name), "rb") as f:
+            major, _ = np.lib.format.read_magic(f)
+            (np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0)(f)
+            off, fd = f.tell(), f.fileno()
+            end = os.fstat(fd).st_size
+            assert end - off == len(buf), (name, end - off, len(buf))
+            runs, p = [], off
+            while p < end:
+                try:
+                    a = os.lseek(fd, p, os.SEEK_DATA)
+                except OSError:      # ENXIO: a hole to the end of the file
+                    break
+                p = os.lseek(fd, a, os.SEEK_HOLE)
+                if runs and a - runs[-1][1] <= GAP:
+                    runs[-1][1] = p
+                else:
+                    runs.append([a, p])
+
+            def read(lo, hi):
+                while lo < hi:
+                    n = os.preadv(fd, [buf[lo - off:hi - off]], lo)
+                    assert n > 0, (name, lo, hi)
+                    lo += n
+            list(_READERS.map(lambda r: read(*r), [(a, min(a + CHUNK, hi)) for lo, hi in runs for a in range(lo, hi, CHUNK)]))
 
     def values(self):
         return [self[n] for n in self]
