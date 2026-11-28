@@ -1,10 +1,12 @@
 #!/bin/bash
 # Box-side plan: k independent SPUMA SPDP cases at once on ONE GPU, HPC_motorbike Small (8,662,309 cells), forceCoeffs
 # on, from the potentialFoam start, each case through spuma_run.sh exactly as the one-case-per-GPU baseline ran.
-# A cell is <k>:<mode>[:<variant>[:<its>[:<need-s>]]]. Mode "mps" shares the GPU through CUDA MPS (kernels of different
+# A cell is <k>:<mode>[:<variant>[:<its>[:<need-s>[:<case>]]]]. Mode "mps" shares the GPU through CUDA MPS (kernels of different
 # cases overlap), "off" leaves the default time-slicing. A variant runs fvSolution.spuma.mbs.<variant> instead of the
 # baseline dictionary (tag P_<mode>_k<k>_<variant>; empty or "-" = baseline). <its> other than IT makes a timing screen
 # (tag suffix _it<its>): compare its ClockTime with a full cell's at the same iteration, it carries no Cd grade.
+# <case> runs the copy of the case in <work-dir>/mbs_np1_<case> (tag suffix _<case>): `bin` is the same mesh and start
+# fields after foamFormatConvert, so the solver reads 1.0 GB of binary instead of parsing 1.8 GB of text at start.
 # <need-s> is the time the cell must have left to start (default NEED, else 400 + 500 k); given in the cell, it also
 # ends the cell at 1.5x that, so a screen that thrashes cannot eat the cells after it. "auto" picks the next k from the two MPS cells before it: 8 (or 6) while packing still
 # pays and host RAM allows, else 3. The batch makespan (launch of the first case to exit of the last) is the number:
@@ -35,9 +37,11 @@ if [ -n "${CPG:-}" ]; then
 fi
 
 cell() {
-  local k=$1 mode=$2 var=${3:-} it=${4:-$IT} need=${5:-${NEED:-$(( 400 + 500 * $1 ))}} tag fvs L pool g i j=0 pids=() ta tb
+  local k=$1 mode=$2 var=${3:-} it=${4:-$IT} need=${5:-${NEED:-$(( 400 + 500 * $1 ))}} cs=mbs_np1${6:+_$6} tag fvs L pool g i j=0 pids=() ta tb
   [ "$var" = - ] && var=
   tag=P_${mode}_k$k${var:+_$var}; fvs=$H/fvSolution.spuma.mbs${var:+.$var}; [ $it != $IT ] && tag=${tag}_it$it
+  [ -n "${6:-}" ] && tag=${tag}_$6
+  [ -d $W/$cs/constant/polyMesh ] || { stamp "$tag skipped, no case $W/$cs"; return; }
   L=$(left); [ $L -lt $need ] && { stamp "$tag skipped, ${L}s left, needs $need"; return; }
   [ -n "${5:-}" ] && [ $L -gt $(( need * 3 / 2 )) ] && L=$(( need * 3 / 2 ))
   # GiB of managed memory per case. Only touched pages are backed (a case touches ~6.1 GiB, 60 GiB pool or 9), so
@@ -52,7 +56,7 @@ cell() {
   stamp "$tag: $k cases x $it it on GPU $GS, pool $pool GiB each, ${L}s left"
   local gi=-1
   for g in $GS; do gi=$((gi+1)); for i in $(seq 1 $k); do
-    R=$W/${tag}_c$j; rm -rf $R; mkdir -p $R; cp -al $W/mbs_np1/constant $W/mbs_np1/0 $R/; cp -r $W/mbs_np1/system $R/
+    R=$W/${tag}_c$j; rm -rf $R; mkdir -p $R; cp -al $W/$cs/constant $W/$cs/0 $R/; cp -r $W/$cs/system $R/
     CUDA_VISIBLE_DEVICES=$g SPUMA=spumaS BFX=$W/libspumaBoundFix_spdp.so ${PIN[$gi]:+taskset -c ${PIN[$gi]}} timeout -s TERM $L \
       bash $H/spuma_run.sh $R $it $pool $fvs 1 ${WRITE:+$it} > $W/run_${tag}_c$j.out 2>&1 &
     pids+=($!); j=$((j+1))
@@ -115,7 +119,7 @@ print(k)")
     stamp "auto -> k=$k (mps k2 ${m2:-none} s, k4 ${m4:-none} s)"
     cell $k mps; unset NEED
   else
-    IFS=: read -r ck cm cv ci cn <<< "$c"; cell $ck $cm "$cv" "$ci" "$cn"
+    IFS=: read -r ck cm cv ci cn cc <<< "$c"; cell $ck $cm "$cv" "$ci" "$cn" "$cc"
   fi
 done
 stamp "PLAN-END"

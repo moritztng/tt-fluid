@@ -10,7 +10,7 @@
 # and postProcessing/ carries the Cd history. Only forceCoeffsAll is kept (the case's coded wallClockTimeStatistics
 # needs a compiler; probes/minMax/wallShearStress are extra work the GPU is spared, which flatters NVIDIA, not us). A NaN in the log stops the solver at once (SIGTERM).
 # NP (env, default 1) > 1 runs a decomposed case with one MPI rank per GPU (MPIRUN names the launcher).
-# WRAP (env) prefixes simpleFoam with a profiler command. Writes log.simpleFoam, gpu.csv (1 s nvidia-smi samples), iters.tsv and summary.txt in the case.
+# WRAP (env) prefixes simpleFoam with a profiler command. Writes log.simpleFoam, gpu.csv (1 s nvidia-smi samples), start.tsv, iters.tsv and summary.txt in the case.
 set -u
 C=$1; IT=$2; POOL=$3; FVS=${4:-}; FO=${5:-0}; WI=${6:-100000}
 BF=${BFX:-$(cd $(dirname $0) && pwd)/libspumaBoundFix.so}  # boundfix/: SPUMA's device min() misses negative cells
@@ -55,11 +55,17 @@ SF=$!; trap 'kill -TERM $SF' TERM   # an outer timeout still gets the summary
     grep -qi "residual = -\?nan" log.simpleFoam && { echo "NaN at $(grep -c '^Time =' log.simpleFoam), stopping"; kill -TERM $SF; break; }
   done ) &
 NANW=$!
+# start.tsv: seconds since launch and lines in the log, twice a second until SIMPLE it 2. With the line numbers of
+# "Create mesh", "Reading field p", "patchDistMethod" it splits the start into mesh read, field read and wall distance.
+( while kill -0 $SF 2>/dev/null && ! grep -q "^Time = 2$" log.simpleFoam; do
+    awk -v a=$(date +%s.%N) -v b=$t0 -v n=$(wc -l < log.simpleFoam) 'BEGIN{printf "%.1f\t%d\n", a - b, n}'; sleep 0.5
+  done > start.tsv ) &
+STW=$!
 # The wall ends when the solver exits, not at the next poll (the poll used to add up to 10 s to every makespan).
 wait $SF; rc=$?; while kill -0 $SF 2>/dev/null; do wait $SF; rc=$?; done   # a trapped TERM returns from wait early
 echo "simpleFoam rc=$rc"
 t1=$(date +%s.%N)
-kill $SMI $NANW 2>/dev/null
+kill $SMI $NANW $STW 2>/dev/null
 awk '/^Time = /{t=$3} /^ExecutionTime/{print t"\t"$3}' log.simpleFoam > iters.tsv
 python3 - "$C" "$t0" "$t1" <<'EOF' | tee summary.txt
 import sys, statistics as st
