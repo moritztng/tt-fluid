@@ -70,7 +70,7 @@ def test_staged_upload_lays_the_array_a_full_upload_writes(tmp_path):
         full = np.zeros(home.shape, np.uint32)
         fill(0, full)
         assert st is None or not np.array_equal(full, home.view(np.uint32))
-        sg = image_dev.Staged([0], full.shape, fill, lambda k: image_dev.chip_pages(img, k, P, "home", st))
+        sg = image_dev.Staged([0], full.shape, fill, lambda k: image_dev.chip_pages(img, k, P, "home", st)).mark()
         assert sg.sparse and 9 <= sg.shape[0] < len(full) // 20      # a row lies across two blocks of its file
         stage = np.zeros(sg.shape, np.uint32)
         sg.fill(0, stage)

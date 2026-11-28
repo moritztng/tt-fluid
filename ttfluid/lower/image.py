@@ -14,6 +14,7 @@ output names and the state layout. Per chip k (cores k*P .. k*P+P-1): arena rows
 residue/halo tables (padded to the global width L0), table blob pages, the halo table offsets, and for every state
 space the global ids of the elements it owns with their (core, lane), so results are collected chip by chip.
 """
+import functools
 import hashlib
 import json
 import os
@@ -250,27 +251,13 @@ class _ChipFiles(dict):
         return self[name] if name in self else default
 
     def stored(self, name):
-        """(f, off, end, ranges): the open file of array `name`, the file offsets where its data starts and ends, and
-        the byte ranges [(lo, hi), ...] the file stores. write_chip left the zero pages as holes."""
-        f = open(dict.__getitem__(self, name), "rb")
-        major, _ = np.lib.format.read_magic(f)
-        (np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0)(f)
-        off, fd = f.tell(), f.fileno()
-        end = os.fstat(fd).st_size
-        ranges, p = [], off
-        while p < end:
-            try:
-                a = os.lseek(fd, p, os.SEEK_DATA)
-            except OSError:      # ENXIO: a hole to the end of the file
-                break
-            p = os.lseek(fd, a, os.SEEK_HOLE)
-            ranges.append((a, p))
-        return f, off, end, ranges
+        """(off, end, ranges): the file offsets where array `name` starts and ends, and the byte ranges
+        [(lo, hi), ...] its file stores. write_chip left the zero pages as holes."""
+        return _stored(str(dict.__getitem__(self, name)))
 
     def pages(self, name):
         """One bool per PAGE bytes of array `name`: the file stores some of the page. A page that is False is zero."""
-        f, off, end, ranges = self.stored(name)
-        f.close()
+        off, end, ranges = self.stored(name)
         r = np.array(ranges, np.int64).reshape(-1, 2) - off
         step = np.zeros(-(-(end - off) // PAGE) + 1, np.int32)
         np.add.at(step, r[:, 0] // PAGE, 1)
@@ -285,8 +272,8 @@ class _ChipFiles(dict):
         is slow, so ranges closer than GAP share one vectored read whose zeros between them land in a scratch buffer,
         not in out."""
         buf = memoryview(out).cast("B")
-        f, off, end, ranges = self.stored(name)
-        with f:
+        off, end, ranges = self.stored(name)
+        with open(dict.__getitem__(self, name), "rb") as f:
             fd = f.fileno()
             assert end - off == (len(buf) if row is None else len(row) * PAGE), (name, end - off, len(buf))
             # where the byte at file offset x goes: a stored range is whole pages in a row, so it stays one piece
@@ -310,6 +297,25 @@ class _ChipFiles(dict):
                 n = os.preadv(fd, views, lo)
                 assert n == size, (name, lo, size, n)
             list(_READERS.map(lambda r: read(*r), reads))
+
+
+@functools.lru_cache(None)
+def _stored(path):
+    """_ChipFiles.stored for one file, walked once: a Small k2 constants file has ~30,000 stored ranges."""
+    with open(path, "rb") as f:
+        major, _ = np.lib.format.read_magic(f)
+        (np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0)(f)
+        off, fd = f.tell(), f.fileno()
+        end = os.fstat(fd).st_size
+        ranges, p = [], off
+        while p < end:
+            try:
+                a = os.lseek(fd, p, os.SEEK_DATA)
+            except OSError:      # ENXIO: a hole to the end of the file
+                break
+            p = os.lseek(fd, a, os.SEEK_HOLE)
+            ranges.append((a, p))
+    return off, end, ranges
 
 
 def _disk_bytes(arr, page=4096):
