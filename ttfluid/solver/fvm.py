@@ -167,11 +167,14 @@ class FvMatrix:
               for k, b in self.psi.bc.items()}
         return f, fb
 
-    def setValues(self, cells, values):
+    def setValues(self, cells, values=None):
         """Fix psi in cells (fvMatrix::setValues): eliminate them from the system."""
         m = self.mesh
         x = self.psi.internal
-        x[cells] = values
+        if values is None:
+            values = x[cells]
+        else:
+            x[cells] = values
         nInt = m.nInternalFaces
         o, n = m.owner[:nInt], m.neighbour
         isfixed = np.zeros(m.nCells, bool)

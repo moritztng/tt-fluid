@@ -733,9 +733,22 @@ class KOmegaSST:
     def _bound_apply(self, f, lb):
         """bound() without its early return; a no-op when nothing is below lb (what a traced program runs)."""
         x = f.internal
-        xm = np.maximum(x, lb)
-        av = self.ops.face_average(self.ops.interp(xm, {n: np.maximum(b.value, lb) for n, b in f.bc.items()}))
-        f.internal[:] = np.maximum(np.maximum(x, av * (-x >= 0)), lb)
+        if hasattr(x, "space"):
+            # when every real cell has x > 0, (-x >= 0) is 0 everywhere so the face-average gather is dead: jump over it
+            from ..resident.krylov import Var
+            tr = x.tr
+            done = tr.new_label()
+            out = Var(np.maximum(x, lb))
+            bad = np.where(x > 0.0, 0.0, 1.0).sum()
+            tr.jumpif((bad <= 0.0).c[()], done)
+            av = self.ops.face_average(self.ops.interp(out.t, {n: np.maximum(b.value, lb) for n, b in f.bc.items()}))
+            out.set(np.maximum(np.maximum(x, av * (-x >= 0)), lb))
+            tr.label(done)
+            f.internal[:] = out.t
+        else:
+            xm = np.maximum(x, lb)
+            av = self.ops.face_average(self.ops.interp(xm, {n: np.maximum(b.value, lb) for n, b in f.bc.items()}))
+            f.internal[:] = np.maximum(np.maximum(x, av * (-x >= 0)), lb)
         for b in f.bc.values():
             if not isinstance(b, FixedValue):
                 b.value = np.maximum(b.value, lb)
@@ -790,7 +803,7 @@ class KOmegaSST:
         eq.relax(self.relax["omega"])
         for n in self.owf:   # boundaryManipulate: omegaWallFunction::manipulateMatrix
             fc = m.patch[n].faceCells
-            eq.setValues(fc, omega.internal[fc].copy())
+            eq.setValues(fc)
         self.res_omega = solver(eq, "omega")
         omega.correct_bc()
         self.bound(omega, self.omegaMin)
