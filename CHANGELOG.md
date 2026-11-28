@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 ### Added
 - `--lsplit 1` at lowering: a vector that holds an L1 slot across a solver loop that does not use it is parked in DRAM
   for the loop.
+- `--tabdense N` at lowering: gathers that read one L1 vector use a dense 16-bit index table (6.4 cycles a value on
+  Blackhole against 12.1). `--span 1|2`: a gather from a DRAM-homed vector reads an L1 copy of it through those tables.
+  Both keep the state bit-identical and are off by default; `--tscheck` decodes every dense table back to its map
+  (`tests/test_dense_span.py`). `ttfluid.tools.gbench`, `spancensus` and `regcensus` measure the gather loop forms and
+  count what the tables reach.
 - Images record the residue counts `--bpatch` needs, so a run from images chooses it by itself, as it already sized
   the gather cache.
 - Packed GPU baseline: `bench/nvidia/pack_plan.sh` runs several SPUMA cases at once on one GPU under MPS. The measured

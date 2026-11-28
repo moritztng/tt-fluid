@@ -77,6 +77,19 @@ on the chip exactly as OpenFOAM's `tolerance` and `relTol` would decide it.
    allocates SRAM. Small cases keep every vector in SRAM. Large cases home vectors in DRAM and stream them through SRAM
    pages (`--tabstream`, `--page`, `--nwin`).
 
+On a large case most of a core's time goes into gathers: every neighbour value of every cell passes through a map
+table. Two lowering options make a gathered value cheaper without changing a value or the order of a sum, so the state
+stays bit-identical. Both are off by default.
+
+- `--tabdense N` stores a map whose window and residue read one SRAM vector a second time as a dense table, one 16-bit
+  source index per lane, on every core where it has at least N residue entries per tile. The kernels gather such a tile
+  with eight loads followed by eight stores: 6.4 cycles a value on Blackhole, against 12.1 for the residue entry by
+  entry (`ttfluid.tools.gbench` measures both on a chip).
+- `--span 1` gives a gather whose source vector is homed in DRAM an SRAM copy of that vector to read. The copy lives
+  in the span, one reserved slot of T tiles, and is filled by a streamed copy unless the span already holds the
+  vector. The gather is then served by the dense tables, with no window read and no gather-cache miss. `--span 2`
+  also turns such a gather into a single reader page when its destination is in SRAM.
+
 `ttfluid.resident.encode` packs the result into three uint32 streams per core, one for each kernel:
 
 - `vm_brisc.cpp` (BRISC) loads the core's arena and code, then runs the B stream: signals and waits, halo pushes with
