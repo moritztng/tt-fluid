@@ -155,7 +155,7 @@ def amg_setup(ops, owner, log=print, kind="pairwise", shape=None):
         aggs = amg.matched(ops.cnbr, e.internal, w, owner, max_coarse=18 * (int(np.max(owner)) + 1))
     else:
         aggs = amg.pairwise(ops.cnbr, e.internal, w, owner)
-    levels = amg.build(ops.cnbr, e.internal, aggs, w, shape=shape)
+    levels = amg.build(ops.cnbr, e.internal, aggs, w, shape=shape, owner=owner if kind == "matched" else None)
     log(f"amg: levels {[e.nCells] + [L.nc for L in levels]}, coarse slots {[L.S for L in levels]}")
     return levels
 
@@ -223,7 +223,8 @@ def build(solver, max_outer=2000, amg_owner=None, amg_kind="pairwise", amg_smoot
                                                    shape=amg_vshape if amg_kind == "matched" else None), cells)
         for L in tops.amg_levels:          # Layout places every space the Program lists
             pspace[L.space.name] = L.space
-            pspace[L.fspace.name] = L.fspace
+            for sp_ in L.fspaces:
+                pspace[sp_.name] = sp_
 
     # ---- the state: every field's cells and patch values, and the flux
     state = []

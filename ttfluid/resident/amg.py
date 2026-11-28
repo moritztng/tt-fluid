@@ -25,11 +25,13 @@ DROP = int(os.environ.get("CFD_AMG_DROP", -1))
 class Level:
     """Static structure of one coarse level (host arrays)."""
 
-    def __init__(self, nbr, mask, agg, w=None, cap=None):
+    def __init__(self, nbr, mask, agg, w=None, cap=None, owner=None, fmax=None):
         """w (n, S): edge weights of the finer graph (strength); cap: at most this many coarse neighbours per row,
         kept by strength symmetrically (a pair survives only if it is in the top `cap` of BOTH rows); a dropped
         pair's coefficients are discarded (DROP = -1: symmetric, more diagonally dominant, lmax = 2 still bounds
-        D^-1 A). Lumping them into the diagonal instead gave NaN at cap <= 16 on motorBike (rows left empty)."""
+        D^-1 A). Lumping them into the diagonal instead gave NaN at cap <= 16 on motorBike (rows left empty).
+        owner (n,), fmax: the core of every finer row and the most lanes one core may hold of a flat coefficient
+        space; the coarse coefficients then go into several flat spaces (slot ranges), none wider than fmax."""
         n, S = nbr.shape
         if w is None:
             w = mask.astype(np.float64)
@@ -116,13 +118,37 @@ class Level:
         f, rows, s = f[o], self.M[I[o], j[o]], s[o]
         first = np.r_[0, np.nonzero(np.diff(f))[0] + 1] if len(f) else np.zeros(0, np.int64)
         rank = np.arange(len(f)) - np.repeat(first, np.diff(np.r_[first, len(f)]))
-        self.layers = []                                    # per layer: [(s, F lanes, fine rows)]
-        for t in range(int(rank.max()) + 1 if len(f) else 0):
-            sel = rank == t
-            self.layers.append([(int(q), f[sel][s[sel] == q], rows[sel][s[sel] == q]) for q in np.unique(s[sel])])
-        self.nF = len(pairs)
-        self.fcells = pairs[:, 0].copy()                    # owner aggregate of every F lane (attach -> leader cell)
-        self.flat = [(np.nonzero(ccnt > k)[0], cstart[ccnt > k] + k) for k in range(Sc)]   # slot k: (rows, F lanes)
+        # F chunks: slot ranges [fb[c], fb[c + 1]) of the coarse rows, each within fmax lanes on every core, so a flat
+        # space is never wider than the cells (the widest vector space sets the machine's tile count and L1 slot size)
+        fb = [0]
+        if fmax is not None and owner is not None and len(pairs):
+            pc = np.asarray(owner)[self.M[pairs[:, 0], 0]]
+            cntk = np.zeros((int(pc.max()) + 1, Sc), np.int64)
+            np.add.at(cntk, (pc, cslot), 1)
+            acc = np.zeros(len(cntk), np.int64)
+            for k in range(Sc):
+                if k > fb[-1] and (acc + cntk[:, k]).max() > fmax:
+                    fb.append(k)
+                    acc[:] = 0
+                acc += cntk[:, k]
+        fb.append(Sc)
+        nch = len(fb) - 1
+        fchunk = np.searchsorted(fb, cslot, side="right") - 1    # chunk and lane in it of every coefficient
+        flane = np.zeros(len(pairs), np.int64)
+        for c in range(nch):
+            flane[fchunk == c] = np.arange(int((fchunk == c).sum()))
+        self.layers = []                                    # per chunk, per layer: [(s, lanes of the chunk, fine rows)]
+        for c in range(nch):
+            lay = []
+            for t in range(int(rank.max()) + 1 if len(f) else 0):
+                sel = (rank == t) & (fchunk[f] == c)
+                if sel.any():
+                    lay.append([(int(q), flane[f[sel][s[sel] == q]], rows[sel][s[sel] == q]) for q in np.unique(s[sel])])
+            self.layers.append(lay)
+        self.nF = [int((fchunk == c).sum()) for c in range(nch)]
+        self.fcells = [pairs[fchunk == c, 0].copy() for c in range(nch)]   # owner aggregate of every lane (attach -> leader cell)
+        self.fslot = np.searchsorted(fb, np.arange(Sc), side="right") - 1  # the chunk of slot k
+        self.flat = [(np.nonzero(ccnt > k)[0], flane[cstart[ccnt > k] + k]) for k in range(Sc)]   # slot k: (rows, lanes)
 
 
 def pairwise(nbr, mask, w, part, rounds=3, max_coarse=200, min_ratio=0.7):
@@ -299,15 +325,19 @@ class Levels(list):
     shape = None
 
 
-def build(nbr, mask, aggs, w=None, cap=CAP, shape=None):
+def build(nbr, mask, aggs, w=None, cap=CAP, shape=None, owner=None):
     """aggs: one fine->coarse map per level (level l's map indexes level l-1's rows); w: fine edge weights (n, S),
-    cap: coarse ELL width limit (Level), shape: the cycle Ops runs (Ops.cycle)."""
+    cap: coarse ELL width limit (Level), shape: the cycle Ops runs (Ops.cycle), owner: the core of every fine row
+    (the flat coefficient spaces then stay within the fullest core's cells, Level)."""
     levels = Levels()
     levels.shape = shape
+    fmax = int(np.bincount(np.asarray(owner)).max()) if owner is not None else None
     for agg in aggs:
-        L = Level(nbr, mask, np.asarray(agg), w, cap)
+        L = Level(nbr, mask, np.asarray(agg), w, cap, owner, fmax)
         levels.append(L)
         nbr, mask, w = L.nbr, L.mask, L.cw
+        if owner is not None:
+            owner = np.asarray(owner)[L.M[:, 0]]
     return levels
 
 
@@ -327,7 +357,8 @@ def attach(tr, levels, cells):
         L.space = Space(f"amg{l + 1}", L.nc, cells=leader.copy())
         L.leader, L.cells = leader.copy(), cells
         L.fine_space = fine
-        L.fspace = Space(f"amg{l + 1}f", L.nF, cells=leader[L.fcells])
+        L.fspaces = [Space(f"amg{l + 1}f" + (str(c) if len(L.nF) > 1 else ""), n, cells=leader[fc])
+                     for c, (n, fc) in enumerate(zip(L.nF, L.fcells))]
         L.Mcols = [np.ascontiguousarray(L.M[:, j]) for j in range(L.M.shape[1])]
         for a in [L.M, L.nbr] + L.Mcols:
             tr.index_space[id(a)] = L.space
@@ -367,9 +398,9 @@ def galerkin(L, d, off, dtype):
     fine = getattr(L, "fine_space", None)
     q = total([d] + [gather(fine, L.n, [(off[:, s], r, r)]) for s, r in L.inner])
     dc = total([gather(getattr(L, "space", None), L.nc, [(q, live, rows)]) for live, rows in L.members])
-    F = total([gather(getattr(L, "fspace", None), L.nF, [(off[:, s], f, r) for s, f, r in layer])
-               for layer in L.layers]) if L.layers else None
-    cols = [gather(getattr(L, "space", None), L.nc, [(F, *L.flat[k])]) if F is not None
+    F = [total([gather(sp_, n, [(off[:, s], f, r) for s, f, r in layer]) for layer in lay]) if lay else None
+         for sp_, n, lay in zip(getattr(L, "fspaces", [None] * len(L.nF)), L.nF, L.layers)]
+    cols = [gather(getattr(L, "space", None), L.nc, [(F[L.fslot[k]], *L.flat[k])]) if F[L.fslot[k]] is not None
             else (dc * 0) for k in range(L.S)]
     if tr is not None:
         return dc, T(tr, L.space, np.array([c.c[()] for c in cols], object))
