@@ -310,8 +310,23 @@ else:
                            source=lcache.source_digest(["ttfluid.solver", "ttfluid.resident.trace", "ttfluid.resident.program", "ttfluid.resident.krylov",
                                                         "ttfluid.resident.sa", "ttfluid.resident.amg", "ttfluid.resident.synth"]),
                            rcb=a.amg and lcache.source_digest(["ttfluid.resident.machine"]))   # --amg aggregates on the cores' partition
+            CACHE = lcache.Cache(a.cache, omit=a.cache_omit.split(","))
+            if not a.owner:   # the cores' partition is a stage of its own, keyed by the points and faces it cuts: a changed trace keeps it
+                import inspect
+                _rcb, _busy = ttfluid.resident.machine.rcb, []
+
+                def rcb(xyz, P, chips=None, faces=None):
+                    if _busy:   # rcb's own recursion into the strips
+                        return _rcb(xyz, P, chips, faces)
+                    _busy.append(1)
+                    try:
+                        k = dict(P=P, chips=chips, xyz=lcache.array_digest(xyz), faces=faces and [lcache.array_digest(f) for f in faces], source=inspect.getsource(_rcb))
+                        return CACHE.get("partition", k, lambda: _rcb(xyz, P, chips, faces))
+                    finally:
+                        _busy.pop()
+                ttfluid.resident.machine.rcb = rcb
             with ST("trace stage"):
-                mesh, prog = lcache.Cache(a.cache, omit=a.cache_omit.split(",")).get("trace", key, trace)
+                mesh, prog = CACHE.get("trace", key, trace)
         else:
             mesh, prog = trace()
         if a.layout == "rcb" and K > 1:

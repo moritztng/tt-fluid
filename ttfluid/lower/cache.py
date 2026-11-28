@@ -38,6 +38,11 @@ def _file_digest(p):
     return h.hexdigest()
 
 
+def array_digest(a):
+    a = np.ascontiguousarray(a)
+    return hashlib.blake2b(a.reshape(-1).view(np.uint8), digest_size=16, person=("%s%s" % (a.dtype.str, a.shape)).encode()[:16]).hexdigest() + str(a.shape)
+
+
 def tree_digest(path):
     """Content digest of a file, or of every file under a directory (names and bytes; an OpenFOAM case)."""
     path = Path(path)
