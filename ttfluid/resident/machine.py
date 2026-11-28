@@ -950,7 +950,7 @@ def slot_extents(code, space, cells, slotfold, L, T):
 class Machine:
     def __init__(self, prog, mesh, P, nslot=NSLOT, log=print, layout="rcb", tiles=None, l1_vec=None, fuse=False, scratch_cap=32,
                  span_homes=False, hoist=False, cap_min=False, sched=False, amg_vec=False, ptiles=False, bcast_run=False, joint_red=False, fold1=False,
-                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0):
+                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, levels=0):
         # two-stage reductions: fold the chip's partials, then the K chip sums; no joint reductions then. Needed when
         # K * P partials do not fit one fold tile, and the default from 8 chips (r13 2x4: 520.3 vs 546.9 ms/it)
         self.red2 = bool(chip_cores) and ((P > LANES or P >= 8 * chip_cores) if red2 is None else red2)
@@ -967,6 +967,7 @@ class Machine:
         self.hlate = hlate     # a halo goes out right before its first gather, not after its source's last write
         self.hre = hre         # >0: a halo last read more than hre MIR back is sent again, not held in its slot
         self.pseg = pseg
+        self.levels = levels
         self.narrow_on, self.narrow, self.narrow_slot, self.pre_h, self.narrow_home = narrow, set(), {}, {}, set()   # narrow: bf16 DRAM pages for eligible constants (_narrow)
         self.coff, self.cpages, self.hpages, self.dslots = {}, 0, 0, []
         self.F = prog.dtype.type
@@ -1055,8 +1056,13 @@ class Machine:
         self.scratch_cap, self.span_homes, self.hoist, self.cap_min = scratch_cap, span_homes, hoist, cap_min
         self.sched = sched
         if fuse and self.T > 1:
+            if self.levels:
+                self._levels()
             self._segments()
             self._scratch()
+            if self.levels:
+                log(f"levels: {len(self.level_runs)} pieces, levels {[a for a, _ in self.level_runs]}, units "
+                    f"{[b for _, b in self.level_runs]}; run ends {dict(self.cuts)}")
         self._allocate()
         self.dedup = dedup
         self._pre_place = (list(self.mir), dict(self.phys), self.ntiles, self.nvec, self.nsmall)
@@ -1551,6 +1557,161 @@ class Machine:
                 continue
             out.append(ins)
         self.mir = out
+
+    # ---- gather levels: the outer iteration's body, one run per level
+    def _levels(self):
+        """Order each straight-line piece of the outer iteration's body by gather level, so a level's blocks stand
+        together and _segments fuses them. A value's level is the number of barriers on its longest path from the
+        piece's inputs; a barrier is a read that needs every tile of its operand before the first tile of the result:
+        a gather or halo push of it, a shifted load, a read of a sum a tile loop accumulated. Inside a level the
+        gathers, halo pushes and one-tile blocks that depend on earlier levels only come first (grouped by source
+        value, so a halo push stays next to its gathers), then the vector blocks, same tile count together (a run has
+        one tile count). Every dependence is kept (read/write, write/read, write/write on every register), so each
+        block computes what it did. The solves' loops are left alone."""
+        from .census import region_of
+        mir = self.mir
+        reg = region_of(mir)
+        out, cur = [], []
+        self.level_runs = []       # (levels, units) per reordered piece (census only)
+
+        def flush():
+            if len(cur) > 2:
+                out.extend(self._level_order(cur))
+            else:
+                out.extend(cur)
+            cur.clear()
+        for j, ins in enumerate(mir):
+            if reg[j] == "outer" and ins[0] in ("blk", "gather", "halo", "red", "red2", "fetch", "out"):
+                cur.append(ins)
+            else:
+                flush()
+                out.append(ins)
+        flush()
+        assert len(out) == len(mir)
+        self.mir = out
+
+    def _level_order(self, piece):
+        vecblk = lambda x: x[0] == "blk" and any(self.is_vec(r) for r in set(_mir_uses(x)) | set(_mir_defs(x)))
+        units, i = [], 0           # a split gather's two halves are one unit: they stay adjacent
+        while i < len(piece):
+            ins, nxt = piece[i], piece[i + 1] if i + 1 < len(piece) else None
+            pair = ins[0] == "blk" and nxt is not None and nxt[0] == "gather" and nxt[2] in self.base and \
+                any(x == nxt[1] for _, x in ins[2])
+            units.append([ins, nxt] if pair else [ins])
+            i += 2 if pair else 1
+        n = len(units)
+        U, D, B, acc = [], [], [], []
+        for u in units:
+            d = [r for x in u for r in _mir_defs(x)]
+            us = {r for x in u for r in _mir_uses(x)} - {"__anchor__"}
+            if len(u) == 2:
+                us -= set(d)        # the residue gather patches what the first half wrote
+            bar = set()            # operands read whole
+            for x in u:
+                if x[0] == "blk":
+                    bar |= {v[2] for v in x[1] if v[0] == "lds"}
+                elif x[0] in ("gather", "halo"):
+                    bar |= set(_mir_uses(x))
+            if u[0][0] == "out":    # outputs keep their order
+                us.add("__out__")
+                d.append("__out__")
+            U.append(us)
+            D.append(set(d))
+            B.append(bar & us)
+            # a one-tile value a tile loop writes is complete after the loop only
+            acc.append({r for r in d if not self.is_vec(r)} if len(u) == 1 and vecblk(u[0]) else set())
+        lvl, pred = [0] * n, [set() for _ in range(n)]
+        lastw, reads = {}, defaultdict(list)
+        for k in range(n):
+            L = 0
+            for r in U[k]:
+                if r in lastw:
+                    w = lastw[r]
+                    pred[k].add(w)
+                    L = max(L, lvl[w] + (1 if r in B[k] or r in acc[w] else 0))
+            for r in D[k]:
+                for w in ([lastw[r]] if r in lastw else []) + reads[r]:
+                    if w != k:
+                        pred[k].add(w)
+                        L = max(L, lvl[w])
+            lvl[k] = L
+            for r in U[k]:
+                reads[r].append(k)
+            for r in D[k]:
+                lastw[r], reads[r] = k, []
+        cls = [self.tiles(u) if len(u) == 1 and vecblk(u[0]) else 0 for u in units]     # 0: not a vector block
+        key = {}                   # head order: a source value's halo push and gathers stand together
+        for k in range(n):
+            src = sorted((r for r in U[k] if isinstance(r, int)), key=lambda r: lastw.get(r, -1))
+            h = sorted(r for r in U[k] | D[k] if isinstance(r, tuple))
+            key[k] = (0, self.halo_regs[h[0][1]], k) if h else (1, src[0] if src else -1, k)
+        order = []
+        for L in range(max(lvl) + 1 if n else 0):
+            mine = [k for k in range(n) if lvl[k] == L]
+            head, hs = [], set()
+            for k in mine:        # program order: a head unit's same-level predecessors are head units before it
+                if not cls[k] and all(lvl[q] < L or q in hs for q in pred[k]):
+                    head.append(k)
+                    hs.add(k)
+            wait = {k: len(pred[k] & hs) for k in head}
+            ready = sorted((k for k in head if not wait[k]), key=key.get)
+            while ready:
+                k = ready.pop(0)
+                order.append(k)
+                for q in head:
+                    if k in pred[q]:
+                        wait[q] -= 1
+                        if not wait[q]:
+                            bisect.insort(ready, q, key=key.get)
+            body = [k for k in mine if k not in hs]
+            left = {k: sum(1 for q in pred[k] if lvl[q] == L and q not in hs) for k in body}
+            succ = defaultdict(list)
+            for k in body:
+                for q in pred[k]:
+                    if q in left:
+                        succ[q].append(k)
+            ready, c = sorted(k for k in body if not left[k]), None
+            while ready:
+                same = [k for k in ready if cls[k] == c]
+                # the run goes on while a block of its tile count is ready; then the others, widest first
+                k = same[0] if same else min(ready, key=lambda k: (cls[k] != 0, -cls[k], k))
+                c = cls[k]
+                ready.remove(k)
+                order.append(k)
+                for q in succ[k]:
+                    left[q] -= 1
+                    if not left[q]:
+                        bisect.insort(ready, q)
+        if self.levels >= 2:
+            order = self._sink(order, pred, cls)
+        assert sorted(order) == list(range(n))
+        pos = {k: i for i, k in enumerate(order)}
+        assert all(pos[q] < pos[k] for k in range(n) for q in pred[k]), "level order broke a dependence"
+        self.level_runs.append((max(lvl) + 1 if n else 0, n))
+        return [x for k in order for x in units[k]]
+
+    @staticmethod
+    def _sink(order, pred, cls):
+        """Level order with its heads sunk: a unit that is not a vector block (gather, halo push, one-tile block) moves
+        down to the start of the same-tile-count run that holds its first reader, so a gathered vector is live for
+        that run only and a short one keeps its place in L1. Nothing between the two places depends on it."""
+        seq = list(order)
+        i = len(seq) - 1
+        while i >= 0:               # from the end: a reader has found its place before what it reads moves
+            h = seq[i]
+            if not cls[h]:
+                j = i + 1
+                while j < len(seq) and h not in pred[seq[j]]:
+                    j += 1
+                if i + 1 < j < len(seq):    # no reader in this piece: it stays
+                    r, c = j, cls[seq[j]]
+                    while c and r - 1 > i and cls[seq[r - 1]] == c:
+                        r -= 1
+                    if r > i + 1:
+                        seq.insert(r, h)
+                        del seq[i]
+            i -= 1
+        return seq
 
     # ---- halos: one push per (straight-line segment, source value), hoisted to just after the source's last write
     def _segments(self):

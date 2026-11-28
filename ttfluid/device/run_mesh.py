@@ -132,6 +132,7 @@ ap.add_argument("--hre", type=int, default=0, help="G > 0: a halo whose last gat
 ap.add_argument("--forces", default=None, metavar="FUNC", help="Cd/Cl of each outer iteration's incoming state in the history (result keys Cd_in, Cl_in), from the controlDict function FUNC (ttfluid.solver.forces.coeff_hook)")
 ap.add_argument("--phase", action="store_true", help="per-SIMPLE-phase device cycles (program.PHASES markers, CFD_PHASE): result key phase")
 ap.add_argument("--cap", type=int, default=32, help="as run_vm.py: scratch cap, live one-tile values per fused run")
+ap.add_argument("--levels", type=int, default=0, help="Machine(levels=1): the outer iteration's body is ordered by gather level before the fused runs are formed (a level's blocks in one run per tile count); 2: its gathers, halo pushes and one-tile blocks stand right before the run that first reads them instead of at the head of the level; the values are unchanged")
 ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3, 4 need --tabstream (mesh has no trid). Default 0 keeps the built images unchanged")
 ap.add_argument("--os", type=int, default=0, help="1: BRISC built for size (#pragma GCC optimize Os), 2: NCRISC too, for a program over the kernel config buffer")
 ap.add_argument("--prof", action="store_true", help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores")
@@ -196,7 +197,7 @@ t0 = time.time()
 # the flags that shape the lowering and the encoding: a --load must carry the ones its --save had
 LOWER = {k: getattr(a, k) for k in ("what", "n", "case", "mesh", "layout", "tiles", "l1", "red2", "strips", "fuse", "redm", "sched",
                                     "hoist", "jointred", "fold1", "fusepart", "gsplit", "wplace", "bcast", "cg1", "page", "tabstream",
-                                    "bgather", "bscal", "bjoint", "cap")}
+                                    "bgather", "bscal", "bjoint", "cap", "levels")}
 if a.phase:
     LOWER["phase"] = True
 if a.tsort:   # images and --save files from before the flag have unsorted tables, so 0 stays out of LOWER
@@ -290,7 +291,7 @@ else:
                     l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
                     joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
                     bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg)
+                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, levels=a.levels)
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))
