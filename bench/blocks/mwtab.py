@@ -63,6 +63,8 @@ def table(path, its, T):
     per = lambda x: x / (its * T) / 1e6
     rows = {}
     for k, v in w["load"].items():
+        if k[:1] == "u" and k[1:2].isdigit():   # legs of 132b2c2: words 952 and 954 (the acquire's cross-checks) were also read as load buckets "u7 | n14/15"
+            continue
         u, n = k.split(" | ")
         rows[cause(u, n)] = rows.get(cause(u, n), 0) + v
     out = ["%s  ms_device %.2f  MATH %.4g cycles a core = %.1f M per tile-it (its %d, T %d)" % (path, ms(r), tot, per(tot), its, T),
