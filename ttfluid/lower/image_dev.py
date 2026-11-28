@@ -183,7 +183,9 @@ class Staged:
                     self.on = dict(zip(self.DEVBLK, ex.map(self.pages, self.DEVBLK)))
                 c = [np.concatenate([[0], np.cumsum(o)]) for o in self.on.values()]
                 self.shape = (max(1, max(int(x[-1]) for x in c)), self.full[1])
-                self.sparse = 2 * self.shape[0] < self.full[0]
+                full_bytes = self.full[0] * len(c) * 4 * self.full[1]
+                # Stage whenever at least 20% of pages are zero, or the full array exceeds the host RAM cap.
+                self.sparse = 5 * self.shape[0] < 4 * self.full[0] or (self.cap is not None and full_bytes > self.cap)
                 n = 1
                 while True:
                     self.size = -(-self.full[0] // n)
