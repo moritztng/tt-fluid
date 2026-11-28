@@ -203,11 +203,13 @@ MW_P = ("at work", "writer page", "code page", "BRISC token page", "NCRISC token
 
 def mwait(hdr):
     """Cycles a core (mean over cores) MATH spent draining its Tensix pipeline, by cause: load[unpack state | reader
-    class] after a load, acq[pack state] after an acquire, own = its own queued work before either; tail = the last poll
+    class] at a load's wait for the unpacker, acq[pack state] after an acquire, own = its own queued work before either,
+    load_after = the drain after a load (the get and the clears); tail = the last poll
     of each kind (nobody waited for), n = drains of each kind."""
     w64 = lambda i: float((hdr[:, i].astype("float64") + hdr[:, i + 1].astype("float64") * 2.0 ** 32).mean())
     load = {"%s | %s" % (MW_U[u], MW_N[n]): w64(700 + 2 * (16 * u + n)) for u in range(8) for n in range(16)}
     acq = {MW_P[q]: w64(960 + 2 * q) for q in range(8)}
     return dict(load={k: round(v) for k, v in load.items() if v}, acq={k: round(v) for k, v in acq.items() if v},
-                own=round(w64(976)), tail=dict(load=round(w64(980)), acq=round(w64(982)), own=round(w64(984))),
+                own=round(w64(976)), load_after=round(w64(978)),
+                tail=dict(load_after=round(w64(980)), acq=round(w64(982)), own=round(w64(984)), load=round(w64(986))),
                 n=dict(load=float(hdr[:, 988].mean()), acq=float(hdr[:, 989].mean()), own=float(hdr[:, 990].mean())))
