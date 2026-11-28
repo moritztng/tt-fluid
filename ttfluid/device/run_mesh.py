@@ -121,6 +121,7 @@ for k, h in [("jointred", "krylov.JOINT + Machine(joint_red=True)"), ("cg1", "kr
              ("bcast", "Machine(bcast_run=True)"), ("bgather", "Machine(bgather=True)"), ("bscal", "Machine(bscal=True)"),
              ("bjoint", "krylov.BJOINT (pair with --jointred 1)"), ("ufuse", "krylov.UFUSE: the components of a vector solve (U) in one lockstep BiCGStab loop, bitwise the sequential solves"), ("cse", "Machine(cse_ir=True): value numbering over the traced IR, bit-exact"), ("narrow", "bf16 in-place DRAM constants (Machine(narrow=True), C_LDRH)")]:
     ap.add_argument("--" + k, type=int, default=0, help="as run_vm.py: " + h)
+ap.add_argument("--uremake", type=int, default=0, help="with --ufuse: 1 = the x update makes y = rD p and z = rD s again (krylov.UFUSE_REMAKE), so each SpMV source dies with its SpMV; same bits, two more products per component")
 ap.add_argument("--utrips", type=int, default=5, help="with --ufuse: the fused U loop's placement weight (krylov.UFUSE_TRIPS; the p loop's is 300), a placement hint only")
 ap.add_argument("--gtile", type=int, default=0, help="1 (with --tabstream): a gather whose next sync hands it to a tile loop that reads it "
                 "plainly posts one token per finished tile and compute waits once per pass, so the loop starts on tile 0 "
@@ -192,6 +193,7 @@ ttfluid.resident.krylov.CG1 = bool(a.cg1)
 ttfluid.resident.krylov.BJOINT = bool(a.bjoint)
 ttfluid.resident.krylov.UFUSE = bool(a.ufuse)
 ttfluid.resident.krylov.UFUSE_TRIPS = a.utrips
+ttfluid.resident.krylov.UFUSE_REMAKE = bool(a.uremake)
 ttfluid.resident.krylov.UFUSE_NOFREEZE = a.ufuse == 2   # the broken arm of the bitwise check
 stamp("python imports done")
 
@@ -206,7 +208,7 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "ufuse", "utrips") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "ufuse", "utrips", "uremake") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None

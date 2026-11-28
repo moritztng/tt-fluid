@@ -59,6 +59,7 @@ CG1 = False     # pcg, amg_pcg as _pcg_cg1 (one reduction per iteration; needs M
 BJOINT = False  # pbicgstab as _pbicgstab_joint (three cross-core reductions per iteration, not five)
 UFUSE = False   # a vector solve's components in one lockstep loop (pbicgstab_fused), not one loop after another
 UFUSE_NOFREEZE = False   # self-test only (--ufuse 2): a component that has left keeps updating x, so the comparison with the one-by-one solve must fail
+UFUSE_REMAKE = False   # pbicgstab_fused makes y and z a second time for the x update (--uremake 1), so no SpMV source outlives its SpMV
 UFUSE_TRIPS = 5   # pbicgstab_fused's placement weight (Tracer.trips of its loop; pbicgstab's is 5, pcg's 300)
 
 
@@ -567,9 +568,12 @@ def pbicgstab_fused(As, xs, bs, c):
         sdone.append(d if gate[k] is None else d * gate[k])
         omega.append(np.where(tt > 0, ts / tt, 0.0))
         OMEGA[k].set(omega[k])
-        ay = alpha[k] * y[k]
+        # UFUSE_REMAKE: y = rD p and z = rD s are made again here from the stored p and s (the same product, the same
+        # bits), so each SpMV source dies with its SpMV and the six of them can take turns in one L1 home
+        yk, zk = (rD[k] * P[k].t, rD[k] * s[k]) if UFUSE_REMAKE else (y[k], z[k])
+        ay = alpha[k] * yk
         # leaving on s: x += alpha y; otherwise x += alpha y + omega z; a frozen component keeps its x
-        xn = X[k].t + np.where(sdone[k], ay, ay + omega[k] * z[k])
+        xn = X[k].t + np.where(sdone[k], ay, ay + omega[k] * zk)
         X[k].set(xn if UFUSE_NOFREEZE else np.where(ACT[k].t, xn, X[k].t))
         R[k].set(s[k] - omega[k] * t[k])
         rn = R[k].t
