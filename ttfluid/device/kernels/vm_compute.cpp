@@ -171,7 +171,9 @@ void kernel_main() {
         ckernel::math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::DestReg>(dst);
         uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
         while (ckernel::semaphore_read(ckernel::semaphore::UNPACK_TO_DEST) == 0) {
-            const uint32_t i = 700 + 2 * (16 * (hw[300] & 7) + ncls());
+            const uint32_t u = hw[300] & 7;   // at BRISC's token (3) the class is the writer's op (1 + op, word 956; 13..15 = GATHER, SCAL, PH), else the reader's
+            const uint32_t qb = hw[956];
+            const uint32_t i = 700 + 2 * (16 * u + (u == 3 ? (qb <= 12 ? qb : qb == 16 ? 13 : qb == 17 ? 14 : 15) : ncls()));
             const uint32_t t = static_cast<uint32_t>(ckernel::read_wall_clock());
             wadd(i, t - tp);
             tp = t;

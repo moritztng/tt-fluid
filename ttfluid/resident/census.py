@@ -198,6 +198,7 @@ def prof(hdr, log=print):
 MW_U = ("at the load", "reader page", "NCRISC token", "BRISC token", "PACK token", "code page", "u6", "u7")
 MW_N = ("idle", "WAITC", "WAITB", "GATHER", "patch barrier", "halo wait", "scatter", "STREAM", "DRAM barrier", "slot wait",
         "HALO", "other op", "other part", "n13", "n14", "n15")
+MW_B = ("unpublished", "END", "SIGC", "WAITC", "SIGN", "WAITN", "HALO", "RED", "OUT", "FETCH", "JMP", "BRT", "SINK", "GATHER", "SCAL", "PH")
 MW_P = ("at work", "writer page", "code page", "BRISC token page", "NCRISC token page", "p5", "p6", "p7")
 
 
@@ -208,7 +209,8 @@ def mwait(hdr):
     tail = the last poll
     of each kind (nobody waited for), n = drains of each kind."""
     w64 = lambda i: float((hdr[:, i].astype("float64") + hdr[:, i + 1].astype("float64") * 2.0 ** 32).mean())
-    load = {"%s | %s" % (MW_U[u], MW_N[n]): w64(700 + 2 * (16 * u + n)) for u in range(6) for n in range(13)}   # the states and classes the kernels publish; 952 and 954 above them are the acquire's cross-checks
+    load = {"%s | %s" % (MW_U[u], MW_N[n]): w64(700 + 2 * (16 * u + n)) for u in range(6) if u != 3 for n in range(13)}   # the states and classes the kernels publish; 952 and 954 above them are the acquire's cross-checks
+    load.update({"BRISC token | writer in %s" % MW_B[n]: w64(700 + 2 * (16 * 3 + n)) for n in range(16)})   # at the writer's token the class is the writer's op
     acq = {MW_P[q]: w64(960 + 2 * q) for q in range(8)}
     return dict(load={k: round(v) for k, v in load.items() if v}, acq={k: round(v) for k, v in acq.items() if v},
                 own=round(w64(976)), load_after=round(w64(978)), acq_after=round(w64(952)),

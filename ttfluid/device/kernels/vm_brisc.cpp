@@ -560,6 +560,9 @@ void kernel_main() {
         }
 #endif
         hdr[16] = pc;
+#ifdef CFD_PROFW
+        hdr[956] = 1 + op;   // --prof 2: the op this agent is in, for MATH's polls while compute waits for its token
+#endif
 #ifdef CFD_PHASE
         const uint64_t pho = (op == B_RED || op == B_HALO || op == B_WAITC) ? get_timestamp() : 0;
 #endif
