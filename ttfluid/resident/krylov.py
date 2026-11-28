@@ -59,6 +59,7 @@ CG1 = False     # pcg, amg_pcg as _pcg_cg1 (one reduction per iteration; needs M
 BJOINT = False  # pbicgstab as _pbicgstab_joint (three cross-core reductions per iteration, not five)
 UFUSE = False   # a vector solve's components in one lockstep loop (pbicgstab_fused), not one loop after another
 UFUSE_NOFREEZE = False   # self-test only (--ufuse 2): a component that has left keeps updating x, so the comparison with the one-by-one solve must fail
+UFUSE_TRIPS = 5   # pbicgstab_fused's placement weight (Tracer.trips of its loop; pbicgstab's is 5, pcg's 300)
 
 
 def pcg(A, x, b, c):
@@ -534,7 +535,7 @@ def pbicgstab_fused(As, xs, bs, c):
         return n
 
     tr.jumpif((live() < 0.5).c[()], END)
-    tr.trips[LOOP] = 5
+    tr.trips[LOOP] = UFUSE_TRIPS
     tr.label(LOOP)
     y = []
     for k in K:
