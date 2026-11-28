@@ -20,6 +20,8 @@ A --cfg is a list of key=value:
   w      weight of every coarse correction (piecewise-constant aggregation under-corrects; 1 = none)
   local  levels from this one down drop their couplings between cores, so their SpMVs need no halo exchange
          (1 = every coarse level is solved inside its core; default: none)
+  chipl  levels from this one down drop their couplings between chips (the device's coarse halo plans stay on a chip)
+  aggfrom  take the aggregates another system's run cached (aggfrom=pf): the device fixes them when it lowers
   glob   levels from this one down keep their couplings again (local=1 glob=3: levels 1 and 2 inside the core, the
          small levels below them across cores)
   fp32   1 = vectors and matrices in fp32
@@ -36,6 +38,7 @@ import numpy as np
 import scipy.sparse as sp
 
 SMALL = 1e-20
+CPC = 1                                                            # cores a chip, set by main
 AGG = "p1"                                                         # aggregation version: names the cache and tags the rows
 T0 = time.time()
 
@@ -104,7 +107,16 @@ class Level:
         self.dinv = (1.0 / d).astype(A.dtype)
         self.lmax = float((np.abs(A).sum(axis=1).A1 / d).max())       # Gershgorin bound of D^-1 A: one reduction
         self.agg = None                                               # node -> node of the next level
-        self._own = None
+        self._own = self._chip = None
+
+    @property
+    def chip(self):
+        """The level without its couplings between chips (CPC cores a chip)."""
+        if self._chip is None:
+            i = np.repeat(np.arange(self.n), np.diff(self.A.indptr))
+            keep = self.core[i] // CPC == self.core[self.A.indices] // CPC
+            self._chip = sp.csr_matrix((self.A.data[keep], (i[keep], self.A.indices[keep])), shape=self.A.shape)
+        return self._chip
 
     @property
     def own(self):
@@ -200,7 +212,9 @@ class Cycle:
         self.lev, self.c, self.W = lev, c, W
 
     def A(self, l):
-        return self.lev[l].own if self.c["local"] <= l < self.c["glob"] else self.lev[l].A
+        if self.c["local"] <= l < self.c["glob"]:
+            return self.lev[l].own
+        return self.lev[l].chip if l >= self.c["chipl"] else self.lev[l].A
 
     def coarse(self, l, r):
         """The correction of level l - 1 from level l: gamma cycles."""
@@ -266,7 +280,7 @@ def fpcg(A, b, x0, M, ctl, W):
 
 # ---- driver --------------------------------------------------------------------------------------------------------
 
-DEF = dict(agg="3", mode="post", k=1, a=4.0, cmode="sym", ck=2, ca=4.0, gamma=1, kc=16, ac=30.0, depth=None, local=99, glob=99, w=1.0, fp32=0)
+DEF = dict(agg="3", mode="post", k=1, a=4.0, cmode="sym", ck=2, ca=4.0, gamma=1, kc=16, ac=30.0, depth=None, local=99, glob=99, w=1.0, fp32=0, aggfrom=None, chipl=99)
 
 
 def parse_cfg(s):
@@ -274,7 +288,7 @@ def parse_cfg(s):
     for kv in s.split():
         k, v = kv.split("=")
         assert k in DEF, k
-        c[k] = v if k in ("agg", "mode", "cmode") else float(v) if k in ("a", "ca", "ac", "w") else int(v)
+        c[k] = v if k in ("agg", "mode", "cmode", "aggfrom") else float(v) if k in ("a", "ca", "ac", "w") else int(v)
     c["name"] = s
     return c
 
@@ -304,6 +318,8 @@ def main():
     a = ap.parse_args()
     d = Path(a.dir)
     cfgs = [parse_cfg(s) for s in a.cfg]
+    global CPC
+    CPC = a.cores // a.chips
     core = partition(d, a.cores, a.chips)
     log(f"partition {a.cores} cores on {a.chips} chips, cells per core {np.bincount(core).min()}-{np.bincount(core).max()}")
     for label in a.sys.split(","):
@@ -315,7 +331,7 @@ def main():
         built = {}
         for c in cfgs:
             F = np.float32 if c["fp32"] else np.float64
-            key = (c["agg"] if c["mode"] != "jac" else "jac", c["fp32"])
+            key = (c["agg"] if c["mode"] != "jac" else "jac", c["fp32"], c["aggfrom"])
             if key not in built:
                 Af = A.astype(F)
                 if c["mode"] == "jac":
@@ -323,7 +339,7 @@ def main():
                 else:
                     t1 = time.time()
                     h = hierarchy(Af, core, [int(v) for v in c["agg"].split(",")], a.coarsest,
-                                  d / f"agg_{label}_{c['agg'].replace(',', '-')}_{a.cores}_{a.chips}_{a.coarsest}_{a.extra}_{a.q:g}_{AGG}.npz",
+                                  d / f"agg_{c['aggfrom'] or label}_{c['agg'].replace(',', '-')}_{a.cores}_{a.chips}_{a.coarsest}_{a.extra}_{a.q:g}_{AGG}.npz",
                                   a.extra, a.q)
                     built[key] = h, [stats(L, a.cores, a.chips) for L in h]
                     log(f"  hierarchy agg={c['agg']}: rows {[L.n for L in h]} nnz {[L.A.nnz for L in h]} "
