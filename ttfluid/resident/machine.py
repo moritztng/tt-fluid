@@ -1082,7 +1082,7 @@ class Machine:
             self._scratch()
         self._allocate()
         if lsplit:
-            k = self._split_loops(l1_vec)
+            k = self._split_loops(l1_vec, cold=lsplit > 1)
             log("lsplit: %d live ranges split around innermost loops" % k)
             if k:
                 self._allocate()
@@ -2057,7 +2057,7 @@ class Machine:
         self.adj = adj
         self.live_entry = live0
 
-    def _split_loops(self, l1_vec):
+    def _split_loops(self, l1_vec, cold=False):
         """lsplit: free the L1 colours that values merely live across a Krylov loop hold while it runs. A written vector
         with an L1 colour that the solve neither reads nor writes is copied to a new register in front of it and back
         behind it: in between it is dead, so the loop's own vectors can take its colour, and the copy (two uses) goes
@@ -2065,7 +2065,12 @@ class Machine:
         to its exits and to the jumps that skip it (label LOOP .. label END, from the first jump to END): one way in
         at the top, one way out at the bottom, or the loop is left alone. Only for a loop with a vector the placement
         without the split left in DRAM (the U, k, omega solves: the other velocity components held colours through
-        each of them, unused). Data movement only: same values. Returns the number of (loop, register) splits."""
+        each of them, unused). cold (lsplit 2): a colour holder the region does touch, but less often than a vector the
+        trial left in DRAM, is split the same way and the region works on the copy (the solution of a BiCGStab solve
+        is read and written once a pass and is a state register that holds a colour everywhere else: U_y and U_z had
+        3 L1 homes in their own solves where U_x, whose state register lost the colour, had 16). Only when every touch
+        in the region is a plain block load or a block result. Data movement only: same values. Returns the number
+        of (loop, register) splits."""
         if l1_vec is None or self.T == 1:
             return 0
         snap = (self.mir, dict(self.phys), self.ntiles, self.nvec, self.nsmall)
@@ -2092,15 +2097,26 @@ class Machine:
                 continue
             if not {r for ins in mir[i:j + 1] for r in touch(ins)} & dram:
                 continue
-            inside = {r for ins in mir[lo:hi + 1] for r in touch(ins)}
-            for r in sorted(r for r in live_in[lo] if isv(r) and r in l1 and r not in inside and r in writes
-                            and r not in fetched and not self.space[r].stack):
+            cnt = Counter(r for ins in mir[lo:hi + 1] for r in touch(ins))
+            ok = lambda r: isv(r) and r in l1 and r in writes and r not in fetched and not self.space[r].stack
+            ren = {}
+            if cold:
+                hot = max((k for r, k in cnt.items() if isv(r) and r in dram), default=0)
+                flat = [x for ins in mir[lo:hi + 1] for x in (ins[1] if ins[0] == "seg" else [ins])]
+                plain = lambda x, r: x[0] == "blk" and all(u[0] == "ld" or r not in _mir_uses(("blk", [u], [])) for u in x[1])
+                ren = {r: None for r in live_in[lo] if ok(r) and 0 < cnt[r] < hot
+                       and all(plain(x, r) for x in flat if r in _mir_uses(x) or r in _mir_defs(x))}
+            for r in sorted(r for r in live_in[lo] if ok(r) and (cnt[r] == 0 or r in ren)):
                 c = self._tmp(self.space[r])
                 if r in self.ext:
                     self.ext[c] = self.ext[r]
                 front[lo].append(("blk", [("ld", 0, r)], [(0, c)]))
                 behind[hi].append(("blk", [("ld", 0, c)], [(0, r)]))
+                if r in ren:
+                    ren[r] = c
                 n += 1
+            if ren:
+                mir[lo:hi + 1] = [_rename_regs(ins, ren) for ins in mir[lo:hi + 1]]
         if n:
             self.mir = [x for k, ins in enumerate(mir) for x in front.get(k, []) + [ins] + behind.get(k, [])]
         return n
@@ -2831,6 +2847,16 @@ def _rename_uses(ins, ren):
     if op == "keep":
         return ("keep", [f(r) for r in ins[1]])
     return ins
+
+
+def _rename_regs(ins, ren):
+    """ins with the registers of ren replaced as plain block loads and as block results (the members of a run too)."""
+    if ins[0] == "seg":
+        return ("seg", [_rename_regs(x, ren) for x in ins[1]])
+    if ins[0] != "blk":
+        return ins
+    f = lambda r: ren.get(r, r)
+    return ("blk", [(u[0], u[1], f(u[2])) + tuple(u[3:]) if u[0] == "ld" else u for u in ins[1]], [(k, f(r)) for k, r in ins[2]])
 
 
 def _adjacent_reduces(code, window=64):
