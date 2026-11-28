@@ -950,7 +950,7 @@ def slot_extents(code, space, cells, slotfold, L, T):
 class Machine:
     def __init__(self, prog, mesh, P, nslot=NSLOT, log=print, layout="rcb", tiles=None, l1_vec=None, fuse=False, scratch_cap=32,
                  span_homes=False, hoist=False, cap_min=False, sched=False, amg_vec=False, ptiles=False, bcast_run=False, joint_red=False, fold1=False,
-                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0):
+                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0):
         # two-stage reductions: fold the chip's partials, then the K chip sums; no joint reductions then. Needed when
         # K * P partials do not fit one fold tile, and the default from 8 chips (r13 2x4: 520.3 vs 546.9 ms/it)
         self.red2 = bool(chip_cores) and ((P > LANES or P >= 8 * chip_cores) if red2 is None else red2)
@@ -1053,6 +1053,7 @@ class Machine:
         self._split_gathers()
         self._halos()
         self.scratch_cap, self.span_homes, self.hoist, self.cap_min = scratch_cap, span_homes, hoist, cap_min
+        self.span = span
         self.sched = sched
         if fuse and self.T > 1:
             self._segments()
@@ -2131,6 +2132,11 @@ class Machine:
                     used += vsize[c]
             keep.sort()
             dslot = {c: i for i, c in enumerate(c for c in range(self.nvec) if c not in keep)}
+        span = "span" if self.span else None
+        if span:   # one more L1 slot of T tiles that no register is coloured into (_span_fill)
+            keep = list(keep) + [span]
+            vsize = dict(vsize) if isinstance(vsize, dict) else dict(enumerate(vsize))
+            vsize[span] = T
         koff = np.concatenate([[0], np.cumsum([vsize[c] for c in keep])]).astype(int)
         newc = {c: int(koff[i]) for i, c in enumerate(keep)}
         dord = sorted(dslot, key=dslot.get)
@@ -2181,6 +2187,8 @@ class Machine:
             self._log("wplace 2: %d vector registers overlaid on one-tile slots (%d offsets), %d stay in %d L1 colours" % (
                 len(self.ovl), len(wid), sum(1 for r in phys if r not in self.ovl and isv(r) and r not in self.dram), len(keep)))
         D = self.dram
+        if span:
+            mir = self._span_fill(mir, D, self.nsmall + newc[span])
 
         def blk(ins, nxt):
             """A block with its DRAM-homed loads made ldr pages: (new block, instructions consumed)."""
@@ -2220,6 +2228,54 @@ class Machine:
             out.append(ins)
             i += 1
         self.mir = out
+
+    # ---- span (--span 1): a split gather whose window and whole residue read ONE DRAM-homed vector reads an L1 copy
+    # of that vector instead. The copy lives in the span, one reserved L1 slot of T tiles; an ordinary copy block in
+    # front of the gather fills it through the reader ring (T pages, what the gather's window read cost) unless the
+    # span already holds that vector. The gather is then the single-L1-vector case the dense tables serve
+    # (--tabdense), with no window read and no gather-cache miss. The span is dropped at every label and jump and by
+    # a store to its vector. Halo parts, in-place constants (narrow would start to round them) and gathers with no
+    # window keep today's path. Values are unchanged: the same lanes are read, from a copy.
+    def _span_fill(self, mir, D, base):
+        out, cur, held, nfill, npage, skipped = [], None, None, 0, 0, Counter()
+        i = 0
+        while i < len(mir):
+            ins = mir[i]
+            nxt = mir[i + 1] if i + 1 < len(mir) else None
+            if ins[0] in ("label", "jump", "jumpif"):
+                cur = None
+            src = None
+            if ins[0] == "blk" and nxt is not None and nxt[0] == "gather" and len(ins[2]) == 1 and \
+                    nxt[1] == ins[2][0][1] and nxt[2] in self.base:
+                u = ins[1][-1]
+                if u[0] == "lds" and u[2] in D and (len(ins[1]) == 1 or (len(ins[1]) == 2 and ins[1][0][2] == "__anchor__")):
+                    why = "constant" if u[2] in self.alias else "parts" if any(x != u[2] or h is not None for x, h in nxt[3]) \
+                        else "self" if nxt[1] == u[2] else None
+                    if why is None:
+                        src = u[2]
+                    else:
+                        skipped[why] += 1
+            if src is not None:
+                if cur != src:
+                    held = self._tmp(self.space[src])
+                    if src in self.ext:
+                        self.ext[held] = self.ext[src]
+                    self.phys[held] = base
+                    out.append(("blk", [("ld", 0, src)], [(0, held)]))
+                    cur, nfill = src, nfill + 1
+                out.append(("blk", list(ins[1][:-1]) + [("lds", u[1], held, u[3])], ins[2]))
+                out.append(("gather", nxt[1], nxt[2], [(held, h) for _, h in nxt[3]]))
+                npage += 1
+                i += 2
+                continue
+            if cur is not None and cur in _mir_defs(ins):
+                cur = None
+            out.append(ins)
+            i += 1
+        self.span_stat = (nfill, npage, dict(skipped))
+        self._log("span: %d gathers read the L1 span at tile %d, %d fills (static), kept on today's path: %s" % (
+            npage, base, nfill, ", ".join("%s %d" % kv for kv in sorted(skipped.items())) or "none"))
+        return out
 
     def _overlay(self, regs, T, isv):
         """wplace 2: home a vector register (heaviest first) on consecutive one-tile slots that no register live with it

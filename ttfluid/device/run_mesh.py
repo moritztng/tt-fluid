@@ -86,6 +86,9 @@ ap.add_argument("--gcache", type=int, default=-1, help="as run_vm.py: N gather t
 ap.add_argument("--icache", type=int, default=1, help="as run_vm.py: compute skips a repeated op _init (CFD_ICACHE)")
 ap.add_argument("--sched", type=int, default=3, help="as run_vm.py: 1 greedy reorder of each fused run's blocks so values die early, 2 greedy or depth-first, 3 (default) the same at min-store cut points (Machine(sched=K))")
 ap.add_argument("--dedup", type=int, default=0, help="as run_vm.py: a fused run streams each DRAM page once (Machine(dedup=True))")
+ap.add_argument("--span", type=int, default=0, help="1 with --l1 N: a split gather whose window and whole residue read one "
+                "DRAM-homed vector reads an L1 copy of it (one reserved L1 slot of T tiles, filled by a copy block when the vector "
+                "changes), which --tabdense then serves like any L1 vector (Machine(span=1)); values unchanged")
 ap.add_argument("--tabdense", type=int, default=0, help="N > 0 with --tabstream: a reader-patched map with at least N local residue entries "
                 "per tile on a core is streamed as a dense destination-ordered uint16 index table (512 words a tile) and the reader "
                 "gathers the page in one pass with no window read (CFD_DENSE; encode.py tab_dense). The same page values. "
@@ -205,7 +208,7 @@ stamp("python imports done")
 
 t0 = time.time()
 # the flags that shape the lowering and the encoding: a --load must carry the ones its --save had
-LOWER = {k: getattr(a, k) for k in ("what", "n", "case", "mesh", "layout", "tiles", "l1", "red2", "strips", "fuse", "redm", "sched",
+LOWER = {k: getattr(a, k) for k in ("what", "n", "case", "mesh", "layout", "tiles", "l1", "span", "red2", "strips", "fuse", "redm", "sched",
                                     "hoist", "jointred", "fold1", "fusepart", "gsplit", "wplace", "bcast", "cg1", "page", "tabstream",
                                     "bgather", "bscal", "bjoint", "cap")}
 if a.phase:
@@ -298,7 +301,7 @@ else:
                     l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
                     joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
                     bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg)
+                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span)
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))
