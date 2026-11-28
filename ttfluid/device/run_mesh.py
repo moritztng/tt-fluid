@@ -18,7 +18,11 @@ T_START = time.time()
 
 
 def stamp(what):   # host step timestamps, seconds from process start: where a launch spends its wall clock
-    print("[t %7.1f s] %s" % (time.time() - T_START, what), flush=True)
+    rss = ""
+    if os.environ.get("CFD_UPLOAD_PROFILE"):   # and its host RAM: resident now and the peak so far
+        kb = dict(l.split()[:2] for l in open("/proc/self/status") if l.startswith(("VmRSS:", "VmHWM:")))
+        rss = "  (rss %.1f GB, peak %.1f GB)" % (int(kb["VmRSS:"]) / 2 ** 20, int(kb["VmHWM:"]) / 2 ** 20)
+    print("[t %7.1f s] %s%s" % (time.time() - T_START, what, rss), flush=True)
 
 
 HERE = Path(__file__).resolve().parent
