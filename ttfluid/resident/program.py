@@ -218,7 +218,8 @@ def build(solver, max_outer=2000, amg_owner=None, amg_kind="pairwise", amg_smoot
     elif amg_owner is not None:
         assert amg_chip_cores is None, "chip-local multigrid: --amg-kind sa only"
         from . import amg
-        tops.amg_levels = amg.attach(tr, amg_setup(ops, np.asarray(amg_owner)), cells)
+        tops.amg_levels = amg.attach(tr, amg_setup(ops, np.asarray(amg_owner), kind=amg_kind,
+                                                   shape=amg_vshape if amg_kind == "matched" else None), cells)
         for L in tops.amg_levels:          # Layout places every space the Program lists
             pspace[L.space.name] = L.space
             pspace[L.fspace.name] = L.fspace
