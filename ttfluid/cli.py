@@ -1,7 +1,7 @@
 """ttfluid: run an OpenFOAM simpleFoam case on Tenstorrent chips, or on the CPU emulator of the same program.
 
-    ttfluid run CASE [-n ITERS] [--arch bh|wh] [--chips K] [--write DIR] [-- RUNNER FLAGS]
-    ttfluid check CASE [-n ITERS] [--arch bh|wh] [--chips K]
+    ttfluid run CASE [-n ITERS] [--arch bh|bh12|wh] [--chips K] [--write DIR] [-- RUNNER FLAGS]
+    ttfluid check CASE [-n ITERS] [--arch bh|bh12|wh] [--chips K]
 
 Both commands lower the case the same way and hand it to ttfluid.device.run_mesh (every runner flag passes through
 after `--`). `run` executes on the device and, unless --no-check, first runs the CPU emulator, which is the exact
@@ -22,7 +22,7 @@ SRAM = ["--layout", "rcb", "--amg", "--amg-depth", "0", "--amg-stack", "--amg-ve
 P300_SUBSYSTEMS = {"0x0044", "0x0045", "0x0046"}
 # Blackhole Galaxy: a tray of 8 chips is a 4x2 ladder (0-1-2-3 over 4-5-6-7), so these are one chip and physical 1x2 and
 # 2x2 blocks. Other blocks: set TT_VISIBLE_DEVICES (docs/architecture.md).
-GALAXY_BLOCK = {1: "0", 2: "0,1", 4: "0,1,4,5"}
+GALAXY_BLOCK = {1: "0", 2: "0,1", 4: "0,1,4,5", 8: "0,1,2,3,4,5,6,7"}
 
 
 def mesh_shape(chips):
@@ -87,7 +87,7 @@ def main(argv=None):
         p.add_argument("case", help="OpenFOAM case directory (constant/polyMesh, 0/, system/)")
         p.add_argument("-n", "--iterations", type=int, default=100, help="SIMPLE iterations, at most (residualControl "
                        "in fvSolution can stop earlier)")
-        p.add_argument("--arch", default="bh", choices=["bh", "wh"], help="bh: Blackhole p150 / p300; wh: Wormhole")
+        p.add_argument("--arch", default="bh", choices=["bh", "bh12", "wh"], help="bh: Blackhole 11x10 (p150 / p300); bh12: Blackhole 12x10 (Galaxy); wh: Wormhole")
         p.add_argument("--chips", type=int, default=1, choices=[1, 2, 4, 8, 16, 32])
         p.add_argument("--out", default="ttfluid_runs.jsonl", help="append one JSON result row per run here")
         if name == "run":
@@ -100,7 +100,7 @@ def main(argv=None):
         ap.error(f"{case} has no constant/polyMesh")
     r = ["case", str(a.iterations), "--case", str(case), "--arch", a.arch, "--mesh", mesh_shape(a.chips),
          "--out", a.out, "--runs", "1", *SRAM]
-    if a.chips >= 2 and a.arch == "bh":
+    if a.chips >= 2 and a.arch.startswith("bh"):
         # Blackhole neighbours (a p300 board, a Galaxy) share Ethernet links 0 and 1: halos on 0, the reductions on 1
         r += ["--gw", "1", "--links", "0", "--rlink", "1"]
         if a.chips >= 4:   # the chips are a physical R x C block, cut into strips
@@ -112,7 +112,7 @@ def main(argv=None):
             r += ["--write", str(Path(a.write).resolve())]
         if a.no_check:
             r.append("--noemu")
-        if a.arch == "bh":
+        if a.arch.startswith("bh"):
             _mesh_descriptor(a.chips)
         os.environ.setdefault("TT_VISIBLE_DEVICES", ",".join(str(i) for i in range(a.chips)))
     sys.argv = ["ttfluid.device.run_mesh", *r, *extra]

@@ -24,9 +24,9 @@ def stamp(what):   # host step timestamps, seconds from process start: where a l
 HERE = Path(__file__).resolve().parent
 DEV = HERE / "kernels"
 # per arch: worker grid, CB bytes the auto placement may use, CBs per core and the DRAM read alignment
-# (NOC_DRAM_READ_ALIGNMENT_BYTES). Blackhole on ttnn 0.68: 11x10 Tensix, 1.5 MB L1, 64 CBs. The L1 CB region is read from
-# the opened device (L1_CB below).
-ARCH = dict(wh=((8, 9), 1_300_000, 32, 32), bh=((11, 10), 1_370_000, 64, 64))
+# (NOC_DRAM_READ_ALIGNMENT_BYTES). Blackhole on ttnn 0.68: 11x10 Tensix on p150a/p300c (`bh`), 12x10 on a
+# 120-core Blackhole Galaxy chip (`bh12`), 1.5 MB L1, 64 CBs. The L1 CB region is read from the opened device (L1_CB).
+ARCH = dict(wh=((8, 9), 1_300_000, 32, 32), bh=((11, 10), 1_370_000, 64, 64), bh12=((12, 10), 1_370_000, 64, 64))
 ap = argparse.ArgumentParser()
 ap.add_argument("what", choices=["synth", "case"])
 ap.add_argument("n", type=int, nargs="?", default=5)
@@ -57,7 +57,7 @@ ap.add_argument("--cores", type=int, default=None, help="lower for this many cor
 ap.add_argument("--l1", default=None)
 ap.add_argument("--ring", type=int, default=4, help="as run_vm.py: pages in the DRAM reader and writer rings")
 ap.add_argument("--l1-bytes", type=int, default=None, help="CB bytes per core the auto placement may use (default: per --arch)")
-ap.add_argument("--arch", default="wh", choices=list(ARCH), help="wh: Wormhole n150/Galaxy chips; bh: Blackhole p150a/p300c chips")
+ap.add_argument("--arch", default="wh", choices=list(ARCH), help="wh: Wormhole n150/Galaxy chips; bh: Blackhole 11x10 (p150a/p300c); bh12: Blackhole 12x10 (Galaxy 120-core)")
 ap.add_argument("--hist", type=int, default=4096)
 ap.add_argument("--limit", type=int, default=1_500_000_000)
 ap.add_argument("--bnoc", type=int, default=1, help="NoC of the B agent on BRISC (N gets the other)")
@@ -103,7 +103,7 @@ ap.add_argument("--bpatch", type=int, default=None, help="as run_vm.py: -1 / uns
 ap.add_argument("--bpatch-min", type=float, default=64.0)
 ap.add_argument("--bgts", type=int, default=None, help="K in 1..7: BRISC scatters the upper (8 - K) / 8 of every L1-source and halo section of a "
                 "--tabstream GATHER tile, NCRISC the rest (CFD_BGTS, the --bpatch mailbox); 0 off. Data movement only: bit-exact. "
-                "Both shares unset: 6 with --tgts 3 on --arch bh with streamed 16-bit tables (reader 3/8, UNPACK 3/8, BRISC 2/8), else 0")
+                "Both shares unset: 6 with --tgts 3 on --arch bh/bh12 with streamed 16-bit tables (reader 3/8, UNPACK 3/8, BRISC 2/8), else 0")
 ap.add_argument("--tgts", type=int, default=None, help="J in 1..7: compute's UNPACK copies the top J / 8 of every L1-source and halo section of a "
                 "--tabstream GATHER tile (of what --bgts leaves NCRISC) from inside its waits (CFD_TGTS, a second mailbox); 0 off. Bit-exact. "
                 "Unset: see --bgts")
@@ -207,7 +207,7 @@ def gshare():
     """(--bgts, --tgts) as given (one alone leaves the other off), or the default when both are unset: the measured
     share of a GATHER tile on Blackhole with streamed 16-bit tables, 6 / 3; 0 / 0 everywhere else. Needs encode.WIDE set."""
     if a.bgts is None and a.tgts is None:
-        return (6, 3) if a.arch == "bh" and a.tabstream and not ttfluid.resident.encode.WIDE else (0, 0)
+        return (6, 3) if a.arch.startswith("bh") and a.tabstream and not ttfluid.resident.encode.WIDE else (0, 0)
     return a.bgts or 0, a.tgts or 0
 from ttfluid.resident.program import build  # noqa: E402
 import ttfluid.resident.krylov  # noqa: E402
