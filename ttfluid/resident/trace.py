@@ -34,6 +34,9 @@ class Space:
     def __repr__(self):
         return f"Space({self.name}, {self.n})"
 
+    def __reduce_ex__(self, protocol):   # SCALAR is compared by identity: a pickle (lower/cache.py, --mcache) names it
+        return "SCALAR" if self is SCALAR else super().__reduce_ex__(protocol)
+
 
 SCALAR = Space("scalar", 1)
 # run_mesh --hlate: x[idx] gathers component by component (every slot of one component, then the next), so a
