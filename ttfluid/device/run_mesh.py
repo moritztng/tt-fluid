@@ -50,8 +50,9 @@ ap.add_argument("--tiles", type=int, default=None)
 ap.add_argument("--solve-census", help="CPU: after lowering, write tools/solve_census.py's per-core pages of every Krylov loop pass "
                 "and outer phase to this JSON (cores from --sc-cores) and exit")
 ap.add_argument("--sc-cores", default="0", help="--solve-census: comma list of global cores")
-ap.add_argument("--cores", type=int, default=None, help="CPU only (--plan / --emuonly): lower for this many cores per chip instead of "
-                "the --arch grid's, so a small case reaches a big case's cells per core (and its T)")
+ap.add_argument("--cores", type=int, default=None, help="lower for this many cores per chip instead of the --arch grid's, so a small "
+                "case reaches a big case's cells per core (and its T). On a device: one chip only, and the count must fill a "
+                "sub-rectangle of the grid (15 on Blackhole runs on its 5 x 3 corner)")
 ap.add_argument("--l1", default=None)
 ap.add_argument("--ring", type=int, default=4, help="as run_vm.py: pages in the DRAM reader and writer rings")
 ap.add_argument("--l1-bytes", type=int, default=None, help="CB bytes per core the auto placement may use (default: per --arch)")
@@ -168,7 +169,12 @@ assert min(R, C) == 1 or a.block2d or a.plan or a.emuonly, "2D mesh %dx%d needs 
 GRID, l1_default, NCB, DA = ARCH[a.arch]
 a.l1_bytes = a.l1_bytes or l1_default
 K, P = R * C, GRID[0] * GRID[1]
-assert not a.cores or a.plan or a.emuonly or a.solve_census, "--cores: a CPU lowering only (the device grid is --arch's)"
+if a.cores:
+    # the widest sub-rectangle of the arch grid that holds exactly --cores: the device launches its kernels on that corner
+    w = max((w for w in range(1, GRID[0] + 1) if a.cores % w == 0 and a.cores // w <= GRID[1]), default=0)
+    assert (w and K == 1) or a.plan or a.emuonly or a.solve_census or a.images, \
+        "--cores %d on a device: one chip, and a sub-rectangle of its %dx%d grid" % (a.cores, GRID[0], GRID[1])
+    GRID = (w, a.cores // w) if w else GRID
 P = a.cores or P
 PP = -(-P // 4) * 4   # one chip's partials padded to 16 B (vm_brisc.cpp PP): P = 110 on BH, 72 on WH (unchanged)
 import ttfluid.resident.encode  # noqa: E402
