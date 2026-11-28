@@ -139,7 +139,7 @@ def core(c):
             lane[np.lexsort((K[key], cl))] = np.arange(n)
         if quart:       # q<Q>: stretches of 4Q lanes of a class quartered (0: the whole class); qp: each lattice piece
             od = np.argsort(lane)
-            run_of = cl[od] * (len(size) + 1) + crank[od] if quart == "p" else cl[od]
+            run_of = cl[od] * len(size) + comp[od] if quart == "p" else cl[od]
             start = np.flatnonzero(np.r_[True, run_of[1:] != run_of[:-1]])
             run = np.diff(np.r_[start, n])
             m = np.arange(n) - np.repeat(start, run)
