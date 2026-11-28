@@ -143,24 +143,39 @@ class Cache:
 
     @staticmethod
     def _store(d, value, floor=0):
-        """value.pkl + buffers.bin: every out-of-band buffer at a 4-KB boundary, its offset and length in the index.
-        Returns the bytes written, or None when they would leave the disk under `floor` bytes free."""
+        """value.pkl + buffers.bin: every out-of-band buffer at a 4-KB boundary (zero 4-KB blocks left as holes),
+        its offset and length in the index. Returns the stored bytes, or None when they would leave the disk under
+        `floor` bytes free."""
         bufs = []
         with open(d / "value.pkl", "wb") as f:
             _Pickler(f, protocol=5, buffer_callback=bufs.append).dump(value)
-        if shutil.disk_usage(d).free - sum(b.raw().nbytes for b in bufs) < floor:
+        raws = [b.raw() for b in bufs]
+        used_list, need = [], 0
+        for m in raws:
+            if m.nbytes:
+                a = np.frombuffer(m, np.uint8)
+                n = len(a) // 4096
+                u = np.r_[a[:n * 4096].reshape(n, 4096).any(1), a[n * 4096:].any() if len(a) > n * 4096 else np.zeros(0, bool)]
+                used_list.append(u)
+                need += int(u.sum()) * 4096
+            else:
+                used_list.append(None)
+        if shutil.disk_usage(d).free - need < floor:
             return None
         index, off = [], 0
         with open(d / "buffers.bin", "wb") as f:
-            for b in bufs:
-                m = b.raw()
-                f.seek(off)
-                f.write(m)
+            for m, u in zip(raws, used_list):
+                if u is not None:
+                    a = memoryview(m).cast("B")
+                    edge = np.flatnonzero(np.diff(np.r_[False, u, False]))
+                    for lo, hi in zip(edge[::2].tolist(), edge[1::2].tolist()):
+                        f.seek(off + lo * 4096)
+                        f.write(a[lo * 4096:min(hi * 4096, len(a))])
                 index.append((off, m.nbytes))
                 off = -(-(off + max(m.nbytes, 1)) // 4096) * 4096   # an empty array keeps an address of its own
             f.truncate(off)
         (d / "index.json").write_text(json.dumps(index))
-        return off
+        return need
 
     def _load(self, d):
         index = json.loads((d / "index.json").read_text())
