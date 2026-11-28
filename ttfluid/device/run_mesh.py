@@ -467,6 +467,9 @@ if a.blocks and a.blktab:
     BLKB = 4 * (len(json.loads(Path(a.from_images, "blk_tab.json").read_text())) if IMG is not None else sum(len(p) for p in ttfluid.resident.encode.BLOCKS["tab"]))
     BLKB = -(-BLKB // 4096) * 4096
     print("blktab: kernel config buffer 69 KB + %d B, worker L1 %d B" % (BLKB, ttnn.device.get_max_worker_l1_unreserved_size() - 69 * 1024 - BLKB), flush=True)
+if a.prof > 1:   # --prof 2: the wait instrument's code (program 71392 B against the 70656 B buffer on the hood k1) gets 4 KB of the workers' L1
+    BLKB += 4096
+    print("prof 2: kernel config buffer 69 KB + %d B, worker L1 %d B" % (BLKB, ttnn.device.get_max_worker_l1_unreserved_size() - 69 * 1024 - BLKB), flush=True)
 md = ttnn.open_mesh_device(ttnn.MeshShape(R, C), num_command_queues=2 if OVL else 1,
                            **({"worker_l1_size": ttnn.device.get_max_worker_l1_unreserved_size() - 69 * 1024 - BLKB} if BLKB else {}))   # all of L1 but the buffer
 stamp("mesh + fabric up")

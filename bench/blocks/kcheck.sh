@@ -28,7 +28,11 @@ for n in UNPACK MATH PACK; do
   [ $r != 0 ] && { rc=1; grep -a "error\|Error" $W/$l.log | head -n ${KCHECK_N:-8} | cut -c1-330; }
   # KCHECK_SIZE=1: the object's text bytes at -O3 without LTO, a proxy for the kernel's share of the 69 KB kernel
   # config buffer (the device build links with LTO: compare two trees with it, do not read it as the linked size)
-  [ -n "$KCHECK_SIZE" ] && [ $r = 0 ] && $B/riscv-tt-elf-g++ ${FL/-fsyntax-only/-c -o $W/$l.o} $DEF -DCOMPILE_FOR_TRISC=$i -DUCK_CHLKC_$n -DNAMESPACE=chlkc_$l -DPROCESSOR_INDEX=$((i + 2)) $INC $M/hw/firmware/src/tt-1xx/trisck.cc > /dev/null 2>&1 && echo "kcheck $n text+data bytes (no LTO): $($B/riscv-tt-elf-size $W/$l.o | tail -n 1 | awk '{print $1 + $2}')"
+  if [ -n "$KCHECK_SIZE" ] && [ $r = 0 ]; then   # code generation warns in dprint.h (array bounds): no -Werror here
+    FS=${FL/-fsyntax-only/-c -o $W/$l.o}; FS=${FS/-Werror /}
+    $B/riscv-tt-elf-g++ $FS $DEF -DCOMPILE_FOR_TRISC=$i -DUCK_CHLKC_$n -DNAMESPACE=chlkc_$l -DPROCESSOR_INDEX=$((i + 2)) $INC $M/hw/firmware/src/tt-1xx/trisck.cc > $W/$l.size.log 2>&1
+    [ -e $W/$l.o ] && echo "kcheck $n text+data bytes (no LTO): $($B/riscv-tt-elf-size $W/$l.o | tail -n 1 | awk '{print $1 + $2}')" || { echo "kcheck $n size: no object"; grep -a "error" $W/$l.size.log | head -n 2 | cut -c1-300; }
+  fi
   i=$((i + 1))
 done
 # the reader (vm_ncrisc.cpp) on NCRISC: its defines arrive on the command line in a device build; here the compute
