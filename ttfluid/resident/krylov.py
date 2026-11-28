@@ -474,11 +474,9 @@ def _pbicgstab_joint(A, x, b, c):
 
 
 def _round(tr, sums):
-    """Mark the sums of all components at one point of a lockstep loop as one reduction round: the lowering keeps
-    them adjacent (machine._lsched), so they can leave in one message."""
-    for v in sums:
-        for t in (v if isinstance(v, (tuple, list)) else (v,)):
-            tr.rounds.add(t.c[()])
+    """Mark the sums of all components at one point of a lockstep loop as one reduction round: each partial is made
+    where its sum stands and the round leaves in one cross-core message with its last member (Machine._lower)."""
+    tr.rounds.append(tuple(t.c[()] for v in sums for t in (v if isinstance(v, (tuple, list)) else (v,))))
 
 
 def pbicgstab_fused(As, xs, bs, c):
@@ -500,10 +498,11 @@ def pbicgstab_fused(As, xs, bs, c):
     K = range(len(As))
     Ax = [As[k](xs[k]) for k in K]
     xm = [xs[k].mean() for k in K]
-    tv = [As[k].sumA() * xm[k] for k in K]
-    r = [bs[k] - Ax[k] for k in K]
-    e = [(np.abs(Ax[k] - tv[k]), np.abs(bs[k] - tv[k]), np.abs(r[k])) for k in K]
-    e = [tuple(v.sum() for v in e[k]) for k in K]
+    r, e = [], []
+    for k in K:   # component by component up to each round: a sum's operand is folded where it is made
+        tv = As[k].sumA() * xm[k]
+        r.append(bs[k] - Ax[k])
+        e.append((np.abs(Ax[k] - tv).sum(), np.abs(bs[k] - tv).sum(), np.abs(r[k]).sum()))
     _round(tr, e)
     nf = [e[k][0] + e[k][1] + SMALL for k in K]
     r0n = [e[k][2] / nf[k] for k in K]
@@ -516,8 +515,7 @@ def pbicgstab_fused(As, xs, bs, c):
     IT, RES = [Var(nil) for k in K], [Var(v) for v in r0n]
     rD = [1.0 / As[k].d for k in K]
     r0 = [r[k].copy() for k in K]
-    g = [r0[k] * r[k] for k in K]
-    rho0 = [v.sum() for v in g]
+    rho0 = [(r0[k] * r[k]).sum() for k in K]
     _round(tr, rho0)
     RHO = [Var(v) for v in rho0]
     act = []
@@ -537,7 +535,7 @@ def pbicgstab_fused(As, xs, bs, c):
     tr.jumpif((live() < 0.5).c[()], END)
     tr.trips[LOOP] = UFUSE_TRIPS
     tr.label(LOOP)
-    y = []
+    y, v, rv = [], [], []
     for k in K:
         rho = RHO[k].t
         beta = (rho / RHO_OLD[k].t) * (ALPHA[k].t / OMEGA[k].t)
@@ -545,25 +543,23 @@ def pbicgstab_fused(As, xs, bs, c):
         p = R[k].t + beta * (P[k].t - OMEGA[k].t * V[k].t)
         P[k].set(p)
         y.append(rD[k] * p)
-    v = [As[k](y[k]) for k in K]
-    for k in K:
+        v.append(As[k](y[k]))
         V[k].set(v[k])
-    g = [r0[k] * v[k] for k in K]
-    rv = [w.sum() for w in g]
+        rv.append(r0[k] @ v[k])
     _round(tr, rv)
-    alpha, s, it, z = [], [], [], []
+    alpha, s, it, z, t, e = [], [], [], [], [], []
     for k in K:
         alpha.append(RHO[k].t / rv[k])
         ALPHA[k].set(alpha[k])
         s.append(R[k].t - alpha[k] * v[k])
         it.append(IT[k].t + 1.0)
         z.append(rD[k] * s[k])
-    t = [As[k](z[k]) for k in K]
-    e = [(np.abs(s[k]), t[k] * t[k], t[k] * s[k]) for k in K]
-    e = [tuple(w.sum() for w in e[k]) for k in K]
+        t.append(As[k](z[k]))
+        a, q, w = np.abs(s[k]), t[k] * t[k], t[k] * s[k]
+        e.append((a.sum(), q.sum(), w.sum()))
     _round(tr, e)
     gate = [(it[k] >= float(c.minIter)) if c.minIter > 0 else None for k in K]
-    res_s, sdone, omega = [], [], []
+    res_s, sdone, omega, ec = [], [], [], []
     for k in K:
         sa, tt, ts = e[k]
         res_s.append(sa / nf[k])
@@ -576,8 +572,10 @@ def pbicgstab_fused(As, xs, bs, c):
         xn = X[k].t + np.where(sdone[k], ay, ay + omega[k] * z[k])
         X[k].set(xn if UFUSE_NOFREEZE else np.where(ACT[k].t, xn, X[k].t))
         R[k].set(s[k] - omega[k] * t[k])
-    e = [(np.abs(R[k].t), r0[k] * R[k].t) for k in K]
-    e = [tuple(w.sum() for w in e[k]) for k in K]
+        rn = R[k].t
+        a, g = np.abs(rn), r0[k] * rn
+        ec.append((a.sum(), g.sum()))
+    e = ec
     _round(tr, e)
     for k in K:
         sa, rho_n = e[k]

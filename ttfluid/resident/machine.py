@@ -991,10 +991,19 @@ class Machine:
             self.ext[self.ren(r)] = max(self.ext.get(self.ren(r), 0), t)
         code = dce(code)
         log(f"IR: {len(code)} instructions, copies {n0} -> {sum(1 for i in code if i[0] == 'copy')}")
+        rounds = [tuple(self.ren(r) for r in g) for g in getattr(prog, "rounds", ())]
+        fixed = {r for g in rounds for r in g}
         if lsched:
-            code = _lsched(code, prog.space, log, {self.ren(r) for r in getattr(prog, "rounds", ())})
+            code = _lsched(code, prog.space, log, fixed)
         if self.redm:
-            code = _adjacent_reduces(code)
+            code = _adjacent_reduces(code, fixed=fixed)
+        # a marked round (krylov._round): each member's partial where its sum stands, one message (three sums at most
+        # each) with the round's last member. Members that did not survive to here (dce, cse) drop out of the round.
+        have = {ins[1] for ins in code if ins[0] == "reduce"}
+        rounds = [tuple(r for r in g if r in have) for g in rounds]
+        self.round_of = {r: i for i, g in enumerate(rounds) for r in g if len(g) > 1}
+        self.round_last = {i: g[-1] for i, g in enumerate(rounds) if len(g) > 1}
+        self.rpend = {}
         self.code = code
         self.space = list(prog.space)
         self.imm = {ins[1]: self.F(ins[2]) for ins in code if ins[0] == "imm"}
@@ -1234,16 +1243,13 @@ class Machine:
             elif op == "reduce":
                 # joint_red: up to three adjacent independent sums leave in one cross-core reduction ('red2')
                 group = [ins]
-                while self.joint_red and len(group) < 3 and idx + len(group) < len(code):
+                rid = self.round_of.get(ins[1]) if self.joint_red else None
+                while self.joint_red and rid is None and len(group) < 3 and idx + len(group) < len(code):
                     nxt = code[idx + len(group)]
-                    if nxt[0] != "reduce" or any(nxt[3] == g[1] for g in group):
+                    if nxt[0] != "reduce" or nxt[1] in self.round_of or any(nxt[3] == g[1] for g in group):
                         break
                     group.append(nxt)
-                pair = len(group) > 1
                 skip.update(range(idx + 1, idx + len(group)))
-                k = self.nred % 2
-                self.nred += 1
-                folds = self.fold[3 * k:3 * k + 3] if self.joint_red else [self.fold[k]]
                 parts, tmps = [], []
                 for g in group:
                     assert g[2] == "sum", g
@@ -1268,24 +1274,37 @@ class Machine:
                     mir.append(("blk", partial, [(0, part)]))
                     parts.append(part)
                     tmps.append(self._tmp(SCALAR))
-                if pair:
-                    mir.append(("red2",) + tuple(x for f, p in zip(folds, parts) for x in (f, p)))
-                elif self.red2:   # scope 1: this chip's partials; scope 2: the K chip sums
-                    mir.append(("red", folds[0], parts[0], 1))
-                    mir.append(("blk", [("ld", 0, folds[0]), ("fold", 0)], [(0, tmps[0])]))
-                    folds = [self.fold[2 + k]]
-                    mir.append(("red", folds[0], tmps[0], 2))
-                    tmps = [self._tmp(SCALAR)]
-                else:
-                    mir.append(("red", folds[0], parts[0]))
-                mir.append(("blk", [u for i in range(len(group)) for u in (("ld", i, folds[i]), ("fold", i))],
-                            [(i, tmps[i]) for i in range(len(group))]))
-                for g, tmp in zip(group, tmps):
-                    if self.bcast_run:   # the broadcast opens the next fused run: its consumers share the block
-                        run.append(("bcast", g[1], tmp))
-                        run_end = idx + len(group) - 1
+                sends = [(group, parts, tmps)]
+                if rid is not None:   # the partial is made here; the message leaves with the round's last member
+                    pend = self.rpend.setdefault(rid, [])
+                    pend.append((ins, parts[0], tmps[0]))
+                    sends = []
+                    if ins[1] == self.round_last[rid]:
+                        sends = [tuple(zip(*pend[c:c + 3])) for c in range(0, len(pend), 3)]
+                        del self.rpend[rid]
+                for group, parts, tmps in sends:
+                    tmps = list(tmps)
+                    k = self.nred % 2
+                    self.nred += 1
+                    folds = self.fold[3 * k:3 * k + 3] if self.joint_red else [self.fold[k]]
+                    if len(group) > 1:
+                        mir.append(("red2",) + tuple(x for f, p in zip(folds, parts) for x in (f, p)))
+                    elif self.red2:   # scope 1: this chip's partials; scope 2: the K chip sums
+                        mir.append(("red", folds[0], parts[0], 1))
+                        mir.append(("blk", [("ld", 0, folds[0]), ("fold", 0)], [(0, tmps[0])]))
+                        folds = [self.fold[2 + k]]
+                        mir.append(("red", folds[0], tmps[0], 2))
+                        tmps = [self._tmp(SCALAR)]
                     else:
-                        mir.append(("blk", [("rvf", 0, tmp)], [(0, g[1])]))
+                        mir.append(("red", folds[0], parts[0]))
+                    mir.append(("blk", [u for i in range(len(group)) for u in (("ld", i, folds[i]), ("fold", i))],
+                                [(i, tmps[i]) for i in range(len(group))]))
+                    for g, tmp in zip(group, tmps):
+                        if self.bcast_run:   # the broadcast opens the next fused run: its consumers share the block
+                            run.append(("bcast", g[1], tmp))
+                            run_end = idx
+                        else:
+                            mir.append(("blk", [("rvf", 0, tmp)], [(0, g[1])]))
             elif op == "out":
                 r = ins[2]
                 if r in self.imm:
@@ -2753,14 +2772,14 @@ def _rename_uses(ins, ren):
     return ins
 
 
-def _adjacent_reduces(code, window=64):
+def _adjacent_reduces(code, window=64, fixed=()):
     """Trace-level half of the pairing: reduce A ... reduce B with only ew/copy between and B not depending on A
     becomes (the between that does not need A) A B (the between that does). Lowering then puts nothing but B's partial
     between the two reds, so fusion cannot glue A's scalar consumers to B's operand, and joint_red groups them."""
     out, i = [], 0
     while i < len(code):
         a = code[i]
-        if a[0] != "reduce":
+        if a[0] != "reduce" or a[1] in fixed:   # fixed: a member of a marked round stays with its producer
             out.append(a)
             i += 1
             continue
@@ -2771,7 +2790,7 @@ def _adjacent_reduces(code, window=64):
             u, d = _uses_defs(b)
             u, d = set(u), set(d)
             if b[0] == "reduce":
-                if not u & dep and not d & (rd | wr | dep):
+                if not u & dep and not d & (rd | wr | dep) and b[1] not in fixed:
                     hit = b
                 break
             if b[0] not in ("ew", "copy", "imm"):
