@@ -939,10 +939,14 @@ void kernel_main() {
                     while (k < km && i + k < ns && cb_pages_available_at_front(cb_out, k + 1)) ++k;
                     cb_wait_front(cb_out, k);
                     for (uint32_t j = 0; j < k; ++j, ++i) {
+#ifdef CFD_KNOCK_C   // timing only (run_mesh --knock c): compute's store pages are popped and not written to DRAM
+                        (void)dsc;
+#else
                         // bit 27 (encode.NARROW): compute packed a bf16 page (C_STWH), its first 2048 B are the page
                         const uint32_t dd = dsc[i % n];
                         noc_async_write(rp, t_home.get_noc_addr(core * HP + (dd & 0x7ffffff) + i / n, 0),
                                         (dd >> 27) & 1 ? 2048 : 4096);
+#endif
                         rp += 4096;
                     }
                     noc_async_writes_flushed();

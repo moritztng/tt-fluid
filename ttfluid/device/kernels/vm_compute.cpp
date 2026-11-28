@@ -108,6 +108,11 @@ void kernel_main() {
     for (uint32_t i = 0; i < 40; ++i) cyc[i] = cnt[i] = 0;
     uint32_t tprev = static_cast<uint32_t>(ckernel::read_wall_clock());
 #endif
+#ifdef CFD_KNOCK_D
+    // timing only (run_mesh --knock d): the elementwise SFPU op words do nothing while the phase id (C_PH) is in the
+    // mask CFD_KNOCK_D; loads, stores, fills and the reduce stay
+    uint32_t kph = 15;
+#endif
 #ifdef CFD_PHASE
     // run_mesh --phase: wall-clock cycles of this thread per SIMPLE phase (C_PH opens phase id = w >> 16; id 15 = before
     // the first marker), 64-bit, kept by MATH only and written to hdr 512 + 2 id (low word) / 513 + 2 id (high word)
@@ -190,6 +195,9 @@ void kernel_main() {
             TR_REC(pc - 1, op, t_);
         }
 #endif
+#ifdef CFD_KNOCK_D
+        if (((CFD_KNOCK_D >> kph) & 1) && ((op >= C_ADD && op < C_FOLD) || op == C_MAD || op == C_MSB)) continue;
+#endif
         switch (op) {
             case C_END: run = false; break;
             case C_ACQ: tile_regs_acquire(); break;
@@ -243,6 +251,9 @@ void kernel_main() {
                 cb_push_back(cb_out, 1);
                 break;
             case C_PH:
+#ifdef CFD_KNOCK_D
+                kph = (w >> 16) & 15;
+#endif
 #ifdef CFD_PHASE
                 MATH(({
                     const uint64_t t_ = ckernel::read_wall_clock();

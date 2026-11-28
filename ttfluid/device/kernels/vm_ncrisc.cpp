@@ -297,6 +297,8 @@ void kernel_main() {
                 while ((gpin[gcn >> 5] >> (gcn & 31)) & 1) gcn = gcn + 1 == NGC ? 0 : gcn + 1;   // patch()'s live tile pointers
                 j = gcn;
                 gcn = gcn + 1 == NGC ? 0 : gcn + 1;
+#ifndef CFD_KNOCK_B   // timing only (run_mesh --knock b): a gather-cache miss keeps its bookkeeping and skips the DRAM
+                      // read, so the values patched in are the slot's old bytes
 #ifdef CFD_TRID
                 noc_async_read_set_trid(TID_GC);
                 noc_async_read(dpage(d, t), get_write_ptr(cb_gc) + j * 4096, 4096);
@@ -305,6 +307,7 @@ void kernel_main() {
 #else
                 noc_async_read(dpage(d, t), get_write_ptr(cb_gc) + j * 4096, 4096);
                 noc_async_read_barrier();
+#endif
 #endif
                 gcd[j] = d;
                 gct[j] = t;
@@ -482,7 +485,11 @@ void kernel_main() {
         }
         const int32_t o = static_cast<int32_t>(t * 4096) + 4 * sh;
         dst += (4 * sh) & (DA - 1);
+#ifdef CFD_KNOCK_A   // timing only (run_mesh --knock a): an fp32 constant page comes from the zero tile, no DRAM read
+        if (k == 3 || k == 2) {
+#else
         if (k == 3) {
+#endif
             noc_async_read(get_noc_addr(zero), dst, 4096);
         } else if (k == 0) {
             noc_async_read(get_noc_addr(arena + d * 4096 + o), dst, 4096);
