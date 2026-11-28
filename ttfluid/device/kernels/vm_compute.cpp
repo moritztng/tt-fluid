@@ -23,6 +23,61 @@
 #include "api/compute/eltwise_unary/where.h"
 #include "api/compute/eltwise_unary/fill.h"
 #include "api/compute/eltwise_unary/addcmul.h"
+#if defined(CFD_TGTS) || defined(CFD_DU) || defined(CFD_PU)
+#define CFD_TMBOX 1
+#endif
+#if defined(CFD_DENSE) && ((defined(CFD_TMBOX) && defined(TRISC_UNPACK)) || \
+    (defined(CFD_DMP_M) && defined(TRISC_MATH)) || (defined(CFD_DMP_P) && defined(TRISC_PACK)))
+#include "vm_gather.h"
+#endif
+
+#if defined(CFD_TMBOX) && defined(TRISC_UNPACK)
+// Out-of-line UNPACK gather helper at -O3: TWAIT only checks the sequence word inline.
+static __attribute__((noinline, optimize("O3"))) void cfd_tsvc_run(volatile uint32_t* mb, uint32_t q) {
+    for (uint32_t j = 0, nj = mb[8]; j < nj; ++j) {
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(mb[12 + 4 * j]);
+        const uint32_t* xs = reinterpret_cast<const uint32_t*>(mb[12 + 4 * j + 1]);
+        const uint32_t n = mb[12 + 4 * j + 2];
+        uint32_t* out = reinterpret_cast<uint32_t*>(mb[12 + 4 * j + 3]);
+#ifdef CFD_DENSE
+        if (n >> 31) {   // lanes of a dense gather tile (vm_ncrisc.cpp): out[e] = src[ix[e]]
+            cfd_gather16(src, reinterpret_cast<const uint16_t*>(xs), n & 0x7fffffffu, out);
+            continue;
+        }
+#endif
+        uint32_t e = 0;
+        for (; e + 4 <= n; e += 4) {
+            const uint32_t x0 = xs[e], x1 = xs[e + 1], x2 = xs[e + 2], x3 = xs[e + 3];
+            const uint32_t v0 = src[x0 & 0xffff], v1 = src[x1 & 0xffff], v2 = src[x2 & 0xffff], v3 = src[x3 & 0xffff];
+            out[x0 >> 16] = v0;
+            out[x1 >> 16] = v1;
+            out[x2 >> 16] = v2;
+            out[x3 >> 16] = v3;
+        }
+        for (; e < n; ++e) out[xs[e] >> 16] = src[xs[e] & 0xffff];
+    }
+    asm volatile("" ::: "memory");
+    mb[4] = q;
+}
+#endif
+
+#if defined(CFD_DENSE) && ((defined(CFD_DMP_M) && defined(TRISC_MATH)) || (defined(CFD_DMP_P) && defined(TRISC_PACK)))
+// Dense-only helper for MATH (trisc1) and PACK (trisc2) on the 64-B DMB mailbox below TMB.
+static __attribute__((noinline, optimize("O3"))) void cfd_dsvc_run(
+    volatile uint32_t* dmb, uint32_t off_idx, uint32_t done_idx, uint32_t q) {
+    const uint32_t spec = dmb[off_idx];
+    const uint32_t len = spec >> 16;
+    if (len) {
+        const uint32_t off = spec & 0xffffu;
+        cfd_gather16(reinterpret_cast<const uint32_t*>(dmb[0]),
+                     reinterpret_cast<const uint16_t*>(dmb[1]) + off,
+                     len,
+                     reinterpret_cast<uint32_t*>(dmb[2]) + off);
+    }
+    asm volatile("" ::: "memory");
+    dmb[done_idx] = q;
+}
+#endif
 
 enum : uint32_t {
     C_END = 0, C_ACQ, C_COMMIT, C_REL, C_LD, C_ST, C_FILL, C_RVF,
@@ -64,57 +119,58 @@ void kernel_main() {
     uint32_t hi = 0, rel = 0;   // paged: pages acquired (virtual pc below hi * PW is readable), pages released
     volatile uint32_t* hw = reinterpret_cast<volatile uint32_t*>(get_tile_address(cb_hdr, 0));
     uint32_t pc = 0, nops = 0, taken = 0;
-#ifdef CFD_TGTS
-    // T-gather mailbox (vm_ncrisc.cpp, the 256 B of cb_sync before the B-patch one): NCRISC posts the top CFD_TGTS / 8
-    // of each L1-source and halo section of a GATHER tile (src, entries, n, page) and bumps SEQ; UNPACK copies them from
+#ifdef CFD_TMBOX
+    // T-gather mailbox (vm_ncrisc.cpp, the 256 B of cb_sync before the B-patch one): NCRISC posts UNPACK's
+    // share of each GATHER/STREAM tile (src, entries, n, page) and bumps SEQ; UNPACK copies them from
     // inside every wait on a data mover or PACK and answers DONE = SEQ. Disjoint lanes: the same values, bit-exact
-    constexpr uint32_t TMB = CFD_SYNCB / 4 - 128, T_SEQ = TMB, T_DONE = TMB + 4, T_N = TMB + 8, T_JOB = TMB + 12;
-    uint32_t tseen = 0;
-    auto tsvc = [&]() {
-        const uint32_t q = sw[T_SEQ];
-        if (q == tseen) return;
-        for (uint32_t j = 0, nj = sw[T_N]; j < nj; ++j) {
-            const uint32_t* src = reinterpret_cast<const uint32_t*>(sw[T_JOB + 4 * j]);
-            const uint32_t* xs = reinterpret_cast<const uint32_t*>(sw[T_JOB + 4 * j + 1]);
-            const uint32_t n = sw[T_JOB + 4 * j + 2];
-            uint32_t* out = reinterpret_cast<uint32_t*>(sw[T_JOB + 4 * j + 3]);
-#ifdef CFD_DENSE
-            if (n >> 31) {   // lanes of a dense gather tile (vm_ncrisc.cpp N_GATHER): out[e] = src[ix[e]]
-                const uint16_t* ix = reinterpret_cast<const uint16_t*>(xs);
-                const uint32_t nd = n & 0x7fffffffu;
-                uint32_t e = 0;
-                for (; e + 8 <= nd; e += 8) {
-                    const uint32_t i0 = ix[e], i1 = ix[e + 1], i2 = ix[e + 2], i3 = ix[e + 3];
-                    const uint32_t i4 = ix[e + 4], i5 = ix[e + 5], i6 = ix[e + 6], i7 = ix[e + 7];
-                    const uint32_t v0 = src[i0], v1 = src[i1], v2 = src[i2], v3 = src[i3];
-                    const uint32_t v4 = src[i4], v5 = src[i5], v6 = src[i6], v7 = src[i7];
-                    out[e] = v0, out[e + 1] = v1, out[e + 2] = v2, out[e + 3] = v3;
-                    out[e + 4] = v4, out[e + 5] = v5, out[e + 6] = v6, out[e + 7] = v7;
-                }
-                for (; e < nd; ++e) out[e] = src[ix[e]];
-                continue;
-            }
-#endif
-            uint32_t e = 0;
-            for (; e + 4 <= n; e += 4) {
-                const uint32_t x0 = xs[e], x1 = xs[e + 1], x2 = xs[e + 2], x3 = xs[e + 3];
-                const uint32_t v0 = src[x0 & 0xffff], v1 = src[x1 & 0xffff], v2 = src[x2 & 0xffff], v3 = src[x3 & 0xffff];
-                out[x0 >> 16] = v0;
-                out[x1 >> 16] = v1;
-                out[x2 >> 16] = v2;
-                out[x3 >> 16] = v3;
-            }
-            for (; e < n; ++e) out[xs[e] >> 16] = src[xs[e] & 0xffff];
-        }
-        asm volatile("" ::: "memory");
-        sw[T_DONE] = q;
-        tseen = q;
-    };
-    // UNPACK spins on tsvc until cb has a page; the cb_wait_front after it then returns at once. Every CB wait of UNPACK
+    constexpr uint32_t TMB = CFD_SYNCB / 4 - 128, T_SEQ = TMB;
+    UNPACK(uint32_t tseen = 0;)
+#define TSVC() UNPACK(({ const uint32_t q_ = sw[T_SEQ]; if (q_ != tseen) { cfd_tsvc_run(sw + TMB, q_); tseen = q_; } }))
+    // UNPACK spins on TSVC until cb has a page; the cb_wait_front after it then returns at once. Every CB wait of UNPACK
     // is one of these; a TRISC stuck behind a PACK that waits on a full cb_cn would not be, and NCRISC then aborts (22)
-#define TWAIT(cb) UNPACK(({ while (static_cast<uint16_t>(reg_read(reinterpret_cast<uint32_t>(get_cb_tiles_received_ptr(cb))) - get_local_cb_interface(cb).tiles_acked) == 0) tsvc(); }))
+#define TWAIT(cb) UNPACK(({ while (static_cast<uint16_t>(reg_read(reinterpret_cast<uint32_t>(get_cb_tiles_received_ptr(cb))) - get_local_cb_interface(cb).tiles_acked) == 0) TSVC(); }))
 #else
 #define TWAIT(cb)
+#endif
+#ifdef CFD_DMP
+    // 64-B dense mailbox below TMB: NCRISC posts (src, ix, out) and bumps D_MSEQ/D_PSEQ; MATH and PACK spin on
+    // D_USYNC at every UNPACK external wait (C_WAITB, C_WAITN, C_LDR, C_LDRH) and during paged-code/CB-free waits
+    // so they service dense gathers in parallel without advancing into hardware stalls.
+    constexpr uint32_t DMB = CFD_SYNCB / 4 - 144;
+    enum : uint32_t { D_MSEQ = DMB + 4, D_PSEQ = DMB + 8, D_USYNC = DMB + 12 };
+    UNPACK(uint32_t usync = 0;)
+#define USYNC() UNPACK(({ asm volatile("" ::: "memory"); sw[D_USYNC] = ++usync; }))
+#ifdef CFD_DMP_M
+    MATH(uint32_t usync = 0;)
+    MATH(uint32_t mseen = 0;)
+#define MSVC() MATH(({ const uint32_t q_ = sw[D_MSEQ]; if (q_ != mseen) { cfd_dsvc_run(sw + DMB, 5, 6, q_); mseen = q_; } }))
+#define MWAIT_U() MATH(({ ++usync; while (static_cast<int32_t>(sw[D_USYNC] - usync) < 0) MSVC(); }))
+#else
+#define MSVC()
+#define MWAIT_U()
+#endif
+#ifdef CFD_DMP_P
+    PACK(uint32_t usync = 0;)
+    PACK(uint32_t pseen = 0;)
+#define PSVC() PACK(({ const uint32_t q_ = sw[D_PSEQ]; if (q_ != pseen) { cfd_dsvc_run(sw + DMB, 9, 10, q_); pseen = q_; } }))
+#define PWAIT_U() PACK(({ ++usync; while (static_cast<int32_t>(sw[D_USYNC] - usync) < 0) PSVC(); }))
+#define PWAIT(cb) PACK(({ \
+    const uint16_t rec_ = get_local_cb_interface(cb).tiles_received; \
+    const uint16_t cap_ = get_local_cb_interface(cb).fifo_num_pages; \
+    while (static_cast<uint16_t>(cap_ - (rec_ - static_cast<uint16_t>(reg_read(reinterpret_cast<uint32_t>(get_cb_tiles_acked_ptr(cb)))))) == 0) PSVC(); \
+}))
+#else
+#define PSVC()
+#define PWAIT_U()
+#define PWAIT(cb)
+#endif
+#else
+#define USYNC()
+#define MSVC()
+#define MWAIT_U()
+#define PSVC()
+#define PWAIT_U()
+#define PWAIT(cb)
 #endif
     uint32_t tl = 0, tn = 0, tpc = 0;   // tile loop: counter, count, first op of the body
     bool run = true;
@@ -178,11 +234,13 @@ void kernel_main() {
                 }));
                 MATH(({
                     while (sw[W_CUNP] <= hi) {
+                        MSVC();
                     }
                     sw[W_CMATH] = hi + 1;
                 }));
                 PACK(({
                     while (sw[W_CUNP] <= hi) {
+                        PSVC();
                     }
                 }));
                 ++hi;
@@ -191,6 +249,7 @@ void kernel_main() {
                     rel = r;
                     PACK(({
                         while (sw[W_CMATH] < hi) {   // MATH has entered this page, so it left the released ones
+                            PSVC();
                         }
                         sw[W_CREL] = r;
                     }));
@@ -226,6 +285,9 @@ void kernel_main() {
             case C_LDR:   // next reader page; the tile starts b 16-B units in (the DRAM source's 32-B phase)
                 TWAIT(cb_in);
                 cb_wait_front(cb_in, 1);
+                USYNC();
+                MWAIT_U();
+                PWAIT_U();
                 LDI(cb_in);
                 UNPACK((get_local_cb_interface(cb_in).fifo_rd_ptr += b));
                 copy_tile(cb_in, 0, a);
@@ -236,6 +298,9 @@ void kernel_main() {
             case C_LDRH:   // C_LDR of a bf16 page: CB CFD_NARROW (bfloat16) views cb_in's front page, srcA widens it to fp32
                 TWAIT(cb_in);
                 cb_wait_front(cb_in, 1);
+                USYNC();
+                MWAIT_U();
+                PWAIT_U();
                 copy_tile_to_dst_init_short_with_dt(cb_in, CFD_NARROW);
                 UNPACK((get_local_cb_interface(CFD_NARROW).fifo_rd_ptr = get_local_cb_interface(cb_in).fifo_rd_ptr + b));
                 copy_tile(CFD_NARROW, 0, a);
@@ -246,6 +311,7 @@ void kernel_main() {
 #endif
 #ifdef CFD_NARROW_OUT
             case C_STWH:   // C_STW packed to bf16: CB CFD_NARROW_OUT (bfloat16) views cb_out's back page
+                PWAIT(cb_out);
                 cb_reserve_back(cb_out, 1);
                 PACK((get_local_cb_interface(CFD_NARROW_OUT).fifo_wr_ptr = get_local_cb_interface(cb_out).fifo_wr_ptr));
                 pack_reconfig_data_format(cb_out, CFD_NARROW_OUT);
@@ -255,6 +321,7 @@ void kernel_main() {
                 break;
 #endif
             case C_STW:
+                PWAIT(cb_out);
                 cb_reserve_back(cb_out, 1);
                 pack_tile(a, cb_out);
                 cb_push_back(cb_out, 1);
@@ -309,16 +376,17 @@ void kernel_main() {
                 sfpu_reduce<PoolType::SUM, DataFormat::Float32, ReduceDim::REDUCE_ROW>(a);
                 break;
             case C_TOK:
+                PWAIT(cb_tok);
                 cb_reserve_back(cb_tok, 1);   // PACK
                 cb_push_back(cb_tok, 1);
                 TWAIT(cb_tok);
                 cb_wait_front(cb_tok, 1);     // UNPACK
                 cb_pop_front(cb_tok, 1);
                 break;
-            case C_SIGB: cb_reserve_back(cb_cb, 1); cb_push_back(cb_cb, 1); break;
-            case C_SIGN: cb_reserve_back(cb_cn, 1); cb_push_back(cb_cn, 1); break;
-            case C_WAITB: TWAIT(cb_bc); cb_wait_front(cb_bc, 1); cb_pop_front(cb_bc, 1); break;
-            case C_WAITN: TWAIT(cb_nc); cb_wait_front(cb_nc, 1); cb_pop_front(cb_nc, 1); break;
+            case C_SIGB: PWAIT(cb_cb); cb_reserve_back(cb_cb, 1); cb_push_back(cb_cb, 1); break;
+            case C_SIGN: PWAIT(cb_cn); cb_reserve_back(cb_cn, 1); cb_push_back(cb_cn, 1); break;
+            case C_WAITB: TWAIT(cb_bc); cb_wait_front(cb_bc, 1); USYNC(); MWAIT_U(); PWAIT_U(); cb_pop_front(cb_bc, 1); break;
+            case C_WAITN: TWAIT(cb_nc); cb_wait_front(cb_nc, 1); USYNC(); MWAIT_U(); PWAIT_U(); cb_pop_front(cb_nc, 1); break;
             case C_JMP: pc = CR ? (pc + PW - 1) / PW * PW : CW(pc); break;
             case C_BRT: {
                 const uint32_t v = read_tile_value(cb_v, CW(pc), 0);
