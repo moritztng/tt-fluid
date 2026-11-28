@@ -811,10 +811,11 @@ def _dfs_order(blks, rev=False):
 _MOVABLE = ("ew", "gather", "reduce", "copy", "bsum")
 
 
-def _lsched(code, space, log=print, fixed=()):
+def _lsched(code, space, log=print, rounds=()):
     """Reorder each straight-line run of ew/gather/reduce/copy/bsum to cut the peak number of live vector registers.
-    A reduce whose result is in `fixed` (a reduction round of a lockstep solve, Program.rounds) ends a run and stays
-    where it is: the walk would finish one component's sums before the next component's SpMV and split the round.
+    The sums of a marked reduction round (`rounds`, Program.rounds) arrive together, with the round's last member, so
+    whatever reads one of them is kept behind every member of its round. The members themselves move like any other
+    sum: pinning them cut the runs in pieces (71 against 51 at Small k2) and that cost the BiCGStab loops L1 homes.
     The trace emits numpy's whole-array order (all S gathers of an ELL product, then all S products, then the sums),
     so every slot's term is live at once; a post-order walk from the run's sinks finishes one term into the
     accumulator before making the next. Same instructions on the same registers, only reordered under RAW/WAR/WAW,
@@ -822,7 +823,8 @@ def _lsched(code, space, log=print, fixed=()):
     n = len(code)
     vec = lambda r: space[r] is not SCALAR
     live_end = {}
-    mov = [ins[0] in _MOVABLE and not (ins[0] == "reduce" and ins[1] in fixed) for ins in code]
+    mov = [ins[0] in _MOVABLE for ins in code]
+    rof = {r: g for g in rounds for r in g}
     ends = [i for i in range(n) if mov[i] and (i + 1 == n or not mov[i + 1])]
     lo = liveness(code, at=set(ends))
     out, i, nrun, p0, p1 = [], 0, 0, 0, 0
@@ -853,6 +855,7 @@ def _lsched(code, space, log=print, fixed=()):
                 for r in u:
                     if r in lastw:
                         pred[k].add(lastw[r])
+                    pred[k].update(lastw[m] for m in rof.get(r, ()) if m in lastw)
                 for r in d:
                     if r in lastw:
                         pred[k].add(lastw[r])
@@ -994,7 +997,7 @@ class Machine:
         rounds = [tuple(self.ren(r) for r in g) for g in getattr(prog, "rounds", ())]
         fixed = {r for g in rounds for r in g}
         if lsched:
-            code = _lsched(code, prog.space, log, fixed)
+            code = _lsched(code, prog.space, log, rounds)
         if self.redm:
             code = _adjacent_reduces(code, fixed=fixed)
         # a marked round (krylov._round): each member's partial where its sum stands, one message (three sums at most
@@ -1002,7 +1005,8 @@ class Machine:
         have = {ins[1] for ins in code if ins[0] == "reduce"}
         rounds = [tuple(r for r in g if r in have) for g in rounds]
         self.round_of = {r: i for i, g in enumerate(rounds) for r in g if len(g) > 1}
-        self.round_last = {i: g[-1] for i, g in enumerate(rounds) if len(g) > 1}
+        at = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "reduce"}
+        self.round_last = {i: max(g, key=at.__getitem__) for i, g in enumerate(rounds) if len(g) > 1}
         self.rpend = {}
         self.code = code
         self.space = list(prog.space)
