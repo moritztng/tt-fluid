@@ -158,34 +158,31 @@ class Image:
     # ---- results, chip by chip ------------------------------------------------------------------------------------
     def state(self, out_rows, home_rows):
         """out_rows(k) -> chip k's arena (P, ntiles, LANES) fp32; home_rows(k) -> its DRAM homes (P, hpages, LANES).
-        Returns name -> global array, as Encoded.state_from_arena."""
-        P, K = self.s["P"], self.s["K"]
-        sp_n = self.shared["spaces"]
+        Returns name -> global array, as Encoded.state_from_arena. Each register is read front to back on its own
+        thread, as put_state writes it."""
+        from ttfluid.resident.machine import DBASE
         out = {}
-        regs_all = [(name, shape, regs) for name, shape, regs in self.shared["state"]]
-        glob = {}
-        for name, shape, regs in regs_all:
+        for name, shape, regs in self.shared["state"]:
+            out[name] = np.zeros((self.shared["spaces"][regs[0][0]], len(regs)), np.float32)
             for i, (spn, t, n) in enumerate(regs):
                 if t is None:
-                    glob[(name, i)] = np.asarray(self.shared["const_state"][f"{name}/{i}"], np.float32)
-                else:
-                    glob[(name, i)] = np.zeros(sp_n[spn], np.float32)
-        for k in range(K):
-            ch = self.chip(k)
+                    out[name][:, i] = self.shared["const_state"][f"{name}/{i}"]
+
+        def get(col, ids, X, idx):
+            col[ids] = X[idx]
+        for k in range(self.s["K"]):
             A, H = out_rows(k), home_rows(k)
-            for name, shape, regs in regs_all:
+            jobs = []
+            for name, shape, regs in self.shared["state"]:
                 for i, (spn, t, n) in enumerate(regs):
-                    if t is None:
-                        continue
-                    from ttfluid.resident.machine import DBASE
-                    X, tt = (H, t - DBASE) if t >= DBASE else (A, t)
-                    flat = X[:, tt:tt + n].reshape(P, -1)
-                    ids = ch["ids/" + spn]
-                    glob[(name, i)][ids] = flat[ch["core/" + spn], ch["lane/" + spn]]
-        for name, shape, regs in regs_all:
-            arrs = [glob[(name, i)] for i in range(len(regs))]
-            out[name] = np.stack(arrs, -1).reshape(arrs[0].shape + tuple(shape)) if shape else arrs[0]
-        return out
+                    if t is not None:
+                        X, tt = (H, t - DBASE) if t >= DBASE else (A, t)
+                        core, tile, lane, ids = self.members(k, spn)
+                        jobs.append(_READERS.submit(get, out[name][:, i], ids, X, (core, tt + tile, lane)))
+            for j in jobs:
+                j.result()
+        return {name: out[name].reshape((-1,) + tuple(shape)) if shape else out[name][:, 0]
+                for name, shape, regs in self.shared["state"]}
 
     def members(self, k, spn):
         """Chip k's elements of space spn in the order they lie on the chip: (core, tile, lane in the tile, global id),
