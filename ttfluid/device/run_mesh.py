@@ -265,19 +265,23 @@ else:
         assert saved == low, ("--mcache: lowering flags differ", {k: (saved.get(k), low[k]) for k in low if saved.get(k) != low[k]})
         print("machine from %s in %.1f s" % (a.mcache, time.time() - t0), flush=True)
     else:
-        def trace():   # case read, chip placement check, one SIMPLE iteration traced: all the solver's work, none of the machine's
+        def placed(mesh, core=[]):   # the cores' partition, once; on a mesh of chips it must place (chip blocks one hop apart)
+            if not core:
+                with ST("partition"):
+                    core.append(ttfluid.resident.machine.rcb(mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None, faces=ttfluid.resident.machine.mesh_faces(mesh)))
+                if K > 1:
+                    from ttfluid.resident import chipplan
+                    nI = mesh.nInternalFaces
+                    chipplan.place_blocks(chipplan.chip_adjacency(core[0] // P, mesh.owner[:nI], mesh.neighbour, K), K, R, C)
+                    print("placement ok: %d chip blocks one-hop on %dx%d" % (K, R, C), flush=True)
+            return core[0]
+
+        def trace():   # case read, one SIMPLE iteration traced: all the solver's work, none of the machine's
             with ST("case"):
                 s = SimpleFoam(a.case, backend="ell", dtype=np.float32, log=lambda *x: None,
                                ell_order="dir" if a.layout == "lattice" else "face")
-            rcb = lambda: ttfluid.resident.machine.rcb(s.mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None, faces=ttfluid.resident.machine.mesh_faces(s.mesh))
-            core = None
-            if a.layout == "rcb" and K > 1:   # chip placement first (seconds): an unplaceable partition used to surface at plan(), an hour in
-                from ttfluid.resident import chipplan
-                with ST("partition"):
-                    core = rcb()
-                nI = s.mesh.nInternalFaces
-                chipplan.place_blocks(chipplan.chip_adjacency(core // P, s.mesh.owner[:nI], s.mesh.neighbour, K), K, R, C)
-                print("placement ok: %d chip blocks one-hop on %dx%d" % (K, R, C), flush=True)
+            if a.layout == "rcb" and K > 1:
+                placed(s.mesh)   # before the trace: an unplaceable partition used to surface at plan(), an hour in
             if a.forces:
                 from ttfluid.solver.forces import coeff_hook
                 s.force_hook = coeff_hook(s, a.forces)
@@ -287,7 +291,7 @@ else:
                     prog = synth(s, a.n)
                 elif a.amg:
                     assert a.layout == "rcb", "--amg: rcb (the owner below is Machine's rcb)"
-                    prog = build(s, a.n, phase=a.phase, amg_owner=core if core is not None else rcb(), amg_kind=a.amg_kind, amg_smoothed=a.amg_smoothed,
+                    prog = build(s, a.n, phase=a.phase, amg_owner=placed(s.mesh), amg_kind=a.amg_kind, amg_smoothed=a.amg_smoothed,
                                  amg_stack=a.amg_stack, amg_lag=a.amg_lag, amg_lag_warm=a.amg_lag_warm, amg_chip_cores=None if a.amg_global else P,
                                  amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, amg_vshape=VSHAPE)
                 else:
@@ -304,12 +308,14 @@ else:
                            forces=a.forces and [a.forces.rsplit(":", 1)[-1], ":" in a.forces and lcache.tree_digest(a.forces.rsplit(":", 1)[0])],
                            owner=a.owner and lcache.tree_digest(a.owner), env={k: v for k, v in os.environ.items() if k.startswith(("CFD_AMG", "WM_PROJECT"))},
                            source=lcache.source_digest(["ttfluid.solver", "ttfluid.resident.trace", "ttfluid.resident.program", "ttfluid.resident.krylov",
-                                                        "ttfluid.resident.sa", "ttfluid.resident.amg", "ttfluid.resident.synth", "ttfluid.resident.chipplan"]),
-                           rcb=lcache.source_digest(["ttfluid.resident.machine"]) if a.amg or (a.layout == "rcb" and K > 1) else None)
+                                                        "ttfluid.resident.sa", "ttfluid.resident.amg", "ttfluid.resident.synth"]),
+                           rcb=a.amg and lcache.source_digest(["ttfluid.resident.machine"]))   # --amg aggregates on the cores' partition
             with ST("trace stage"):
                 mesh, prog = lcache.Cache(a.cache, omit=a.cache_omit.split(",")).get("trace", key, trace)
         else:
             mesh, prog = trace()
+        if a.layout == "rcb" and K > 1:
+            placed(mesh)   # a cached trace does not vouch for today's partition
         ST.methods(Machine, ["_sliced", "_lower", "_fetches", "_split_gathers", "_halos", "_segments", "_scratch", "_allocate", "place"])
         ST.methods(ttfluid.resident.machine.Maps, ["finish"])
         ST.methods(ttfluid.resident.machine.Layout, ["__init__"])

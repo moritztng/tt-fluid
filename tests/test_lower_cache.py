@@ -49,3 +49,17 @@ def test_key_missing_an_input_is_caught(tmp_path):
     assert stale != lower(tmp_path / "plain_n60", n=60)[0]
     good, out = lower(tmp_path / "n60_good", "--cache", cache, n=60)
     assert "cache: trace built" in out and good == lower(tmp_path / "plain_n60b", n=60)[0]
+
+
+def test_sparse_write_is_np_save(tmp_path):
+    """Image files are written with their zero blocks as holes; their bytes are np.save's."""
+    from ttfluid.lower.image import _save_sparse
+    rng = np.random.default_rng(0)
+    arrays = [np.zeros(0, np.float32), np.arange(5, dtype=np.int64), np.zeros((3, 5000), np.uint32), np.ones((2, 3, 1024), np.float32),
+              rng.integers(0, 2, (7, 4099)).astype(np.uint8) * (rng.random((7, 1)) > .5),
+              np.where(rng.random((64, 4096)) > .9, 1, 0).astype(np.float32) * (np.arange(64) % 5 == 0)[:, None]]
+    for a in arrays:
+        np.save(tmp_path / "a.npy", a)
+        _save_sparse(tmp_path / "b.npy", a)
+        assert (tmp_path / "a.npy").read_bytes() == (tmp_path / "b.npy").read_bytes()
+    assert (tmp_path / "b.npy").stat().st_blocks * 512 < arrays[-1].nbytes / 2   # four rows in five are holes

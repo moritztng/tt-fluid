@@ -15,14 +15,16 @@ residue/halo tables (padded to the global width L0), table blob pages, the halo 
 space the global ids of the elements it owns with their (core, lane), so results are collected chip by chip.
 """
 import hashlib
+import io
 import json
 import shutil
-import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
 LANES = 1024
+PAGE = 4096
 SCALARS = ("K", "P", "T", "ndram", "hpages", "cpages", "ntiles", "nhalo", "hmax", "red2", "redm", "L0", "TBP", "tab_stream", "nmaxop",
            "loop_pages")
 
@@ -107,21 +109,23 @@ class Image:
         meta = {k: v for k, v in self.shared.items() if not isinstance(v, np.ndarray) and k != "const_state"}
         np.savez(d / "shared.npz", meta=np.frombuffer(json.dumps(meta).encode(), np.uint8), **arrays)
 
-    def write_chip(self, d, k):
+    def write_chip(self, d, k, used=None):
         (Path(d) / f"chip{k}").mkdir(parents=True, exist_ok=True)
         for name, arr in self.chip(k).items():
             f = Path(d) / f"chip{k}" / (name.replace("/", "@") + ".npy")
             f.unlink(missing_ok=True)   # never truncate in place: identical arrays are hardlinked across images
-            np.save(f, arr)
-            subprocess.run(["fallocate", "--dig-holes", str(f)], check=False)   # zero pages as holes: home 97 %, consts 58 % on Small k4
+            _save_sparse(f, arr, used and used[k, name])
 
     # ---- files ---------------------------------------------------------------------------------------------------
     def write(self, d, floor_gb=0):
-        need = sum(_disk_bytes(v) for k in range(self.s["K"]) for v in self.chip(k).values())
-        check_free(d, need, floor_gb)
-        self.write_shared(d)
-        for k in range(self.s["K"]):
-            self.write_chip(d, k)
+        """One pass finds every array's non-zero pages (the disk check needs their count), the write stores only those:
+        the files are np.save's byte for byte, with the zero pages as holes (home 97 %, consts 58 % on Small k4)."""
+        K = self.s["K"]
+        with ThreadPoolExecutor(min(K, 8)) as ex:
+            used = dict(kv for kvs in ex.map(lambda k: [((k, n), _used_pages(v)) for n, v in self.chip(k).items()], range(K)) for kv in kvs)
+            check_free(d, sum(1 + int(u.sum()) for u in used.values()) * PAGE, floor_gb)
+            self.write_shared(d)
+            list(ex.map(lambda k: self.write_chip(d, k, used), range(K)))
 
     @classmethod
     def load(cls, d):
@@ -149,7 +153,8 @@ class Image:
         ch = self.chip(k)
         for name in sorted(ch):
             a = np.ascontiguousarray(ch[name])
-            h.update(name.encode() + str(a.dtype).encode() + str(a.shape).encode() + a.tobytes())
+            h.update(name.encode() + str(a.dtype).encode() + str(a.shape).encode())
+            h.update(a.reshape(-1).view(np.uint8))   # the array's bytes without the copy tobytes() makes (home is 8 GB a chip on Small)
         return h.hexdigest()
 
     # ---- results, chip by chip ------------------------------------------------------------------------------------
@@ -228,11 +233,34 @@ class _ChipFiles(dict):
         return [(n, self[n]) for n in self]
 
 
-def _disk_bytes(arr, page=4096):
-    """Bytes an array takes on disk once its zero pages are holes (write_chip writes sparse)."""
-    b = np.ascontiguousarray(arr).reshape(-1).view(np.uint8)
-    n = len(b) // page
-    return page * (int(b[:n * page].reshape(n, page).any(1).sum()) + bool(b[n * page:].any()))
+def _npy_head(arr):
+    f = io.BytesIO()
+    np.lib.format.write_array_header_1_0(f, np.lib.format.header_data_from_array_1_0(arr))
+    assert f.tell() <= PAGE
+    return f.getvalue()
+
+
+def _used_pages(arr):
+    """Which 4-KB blocks of np.save's file of arr hold a non-zero byte, the first (it has the header) left out."""
+    b = np.ascontiguousarray(arr).reshape(-1).view(np.uint8)[PAGE - len(_npy_head(arr)):]
+    n = len(b) // PAGE
+    return np.r_[b[:n * PAGE].reshape(n, PAGE).any(1), b[n * PAGE:].any() if len(b) > n * PAGE else np.zeros(0, bool)]
+
+
+def _save_sparse(f, arr, used=None):
+    """np.save(f, arr) with the file's zero blocks left as holes."""
+    arr = np.ascontiguousarray(arr)
+    b = arr.reshape(-1).view(np.uint8)
+    used = _used_pages(arr) if used is None else used
+    edge = np.flatnonzero(np.diff(np.r_[False, used, False]))   # runs of used blocks: [start, end) pairs
+    head = _npy_head(arr)
+    with open(f, "wb") as fp:
+        fp.write(head)
+        fp.write(b[:PAGE - len(head)])
+        for lo, hi in zip(edge[::2].tolist(), edge[1::2].tolist()):
+            fp.seek((1 + lo) * PAGE)
+            fp.write(b[lo * PAGE + PAGE - len(head):hi * PAGE + PAGE - len(head)])
+        fp.truncate(len(head) + len(b))
 
 
 def check_free(d, need, floor_gb):
