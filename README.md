@@ -56,21 +56,16 @@ QuietBox 2 is 1.03x cheaper per case, with eight it is 1.2x more expensive (stat
 charged its full 1.3 kW system rating (not a measurement). NVIDIA gets its cheapest documented price and its
 fastest measured precision mode (SPDP: fp32 fields with fp64 solver sums).
 
-**Accuracy.** On this case Cd keeps moving under SIMPLE (standard deviation 42 drag counts over iterations 101-800 in
-OpenFOAM's own run; 1 count = 0.0001), so single iterations say little. We compare window means over iterations 101-800 against OpenFOAM v2412 in fp64 on a CPU,
-from the same start ([method](docs/accuracy.md)):
+**Accuracy.** On this case Cd keeps moving under SIMPLE (standard deviation 42 drag counts from iteration to
+iteration in OpenFOAM's own run; 1 count = 0.0001), so runs are compared on window means. `bench/cdgrade.py` grades the
+mean from iteration 201 on against the long-run mean of OpenFOAM v2412 in fp64 on a CPU (Cd 0.42226), from the same
+start. One run is a screen with a band of 17.8 counts. The bar is 12.5 counts on four or more runs pooled
+([method](docs/accuracy.md#3-drag-and-lift-against-openfoam-fp64-hpc_motorbike-small)):
 
-| run | Cd mean, its 101-800 | vs OpenFOAM fp64 | script |
-|---|---|---|---|
-| OpenFOAM v2412 fp64 (CPU) | 0.42116 (+-22 counts, 2 sigma) | reference | |
-| tt-fluid, QuietBox 2 board A (fp32) | 0.42013 | -10.3 counts | `bench/nvidia/cdwindow.py` |
-| SPUMA SPDP, 8x H100, 8 runs | 0.42079 - 0.42419 | -3.7 to +30.3 counts | `bench/nvidia/grade.py` |
-| SPUMA SPDP, B200 | 0.42268 | +15.2 counts | `bench/nvidia/grade.py` |
-
-Over a longer window (iterations 101-1900) the Tenstorrent run's Cd is 0.42060, 12.8 counts below OpenFOAM over the same
-iterations. Lift agrees to within 3 counts. Against OpenFOAM's long-run mean (iterations 501-3372) instead, every
-window above is still partly transient and the Tenstorrent run is the furthest off, at -21 counts;
-[docs/accuracy.md](docs/accuracy.md) has all of it.
+| runs | Cd vs OpenFOAM fp64, counts | grade |
+|---|---|---|
+| tt-fluid fp32, 3 runs (QuietBox 2, Blackhole Galaxy on 2 and on 4 chips) | -17.0, +3.8, -4.3; pooled -6.0 +- 8.4 | pass, band 16.9 (three runs: a screen) |
+| SPUMA SPDP, 9 runs (8 on H100, 1 on B200) | -12.6 to +27.0; pooled +8.4 +- 5.0 | pass, band 12.5 |
 
 **occDrivAer.** The coarse occDrivAer car (1.6 M cells, [cases/occDrivAer](cases/occDrivAer)) ran iterations 1-3999 on
 one Blackhole chip. Its mean Cd over iterations 1001-3999 is 0.2738, 15.0 counts above a serial OpenFOAM v2412 fp64

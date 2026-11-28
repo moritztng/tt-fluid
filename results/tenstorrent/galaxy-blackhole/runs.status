@@ -1,0 +1,8 @@
+# HPC_motorbike Small on one Blackhole Galaxy, histories for bench/cdgrade.py (docs/accuracy.md section 3).
+# The box was shared with other jobs, so these legs are accuracy runs and carry no timing claim.
+# aiclk: MHz read from sysfs every 10 s during the leg (hC_<i>.aiclk; the first sample precedes the device open).
+2026-11-28T00:23:02Z hC_1 chips=12,13 (2 chips, fewest-faces cut) sha=c22145e its=500 from the potentialFoam start aiclk=1343..1350 n=166 state=8e9b3c23cc7532c0
+2026-11-28T00:36:31Z hC_2 chips=12,13 (2 chips, fewest-faces cut) sha=c22145e its=500 from hC_1 aiclk=1343..1350 n=160 state=6c561046e7922e5d
+2026-11-28T00:50:04Z hC_3 chips=12,13 (2 chips, fewest-faces cut) sha=c22145e its=500 from hC_2 aiclk=800..1350 n=162 state=5b1bfb95eb167f5f
+2026-11-28T01:03:50Z hC_4 chips=12,13 (2 chips, fewest-faces cut) sha=c22145e its=500 from hC_3 aiclk=1343..1350 n=164 state=95c6b1a3850879d3
+2026-11-28T00:22:50Z d_l0_b0 chips=0,1,4,5 (4 chips, fewest-faces cut) sha=c22145e its=800 from the potentialFoam start aiclk=1350..1350 n=4 (in-process, start and end) state=9899bf698dd54f5a

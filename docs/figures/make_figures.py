@@ -1,25 +1,21 @@
 """Draw docs/figures/headline.svg from the raw data: cost per case (bench/per_dollar.py) and the drag coefficient of
-every run against OpenFOAM fp64 over iterations 101-800 (the window of docs/accuracy.md).
+every run against OpenFOAM fp64 over iterations 201-800 (bench/cdgrade.py, docs/accuracy.md section 3).
 
     python3 docs/figures/make_figures.py
 """
-import json
 import sys
 from pathlib import Path
 
-import numpy as np
-
 ROOT = Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT / "bench"), str(ROOT / "bench" / "nvidia")]
+sys.path.insert(0, str(ROOT / "bench"))
+import cdgrade  # noqa: E402
 import per_dollar  # noqa: E402
-from cdwindow import batch, of_series  # noqa: E402
 
 R = ROOT / "results"
-LO, HI = 101, 800
-
-
-def cd_mean(series):
-    return float(np.mean([series[i][0] for i in range(LO, HI + 1)]))
+HI = 800
+TT = [["quietbox2-p300x4/qb2k2_D1A.hist.json:0", "quietbox2-p300x4/qb2k2_D2A.hist.json:800"],
+      ["galaxy-blackhole/hC_1.hist.json:0", "galaxy-blackhole/hC_2.hist.json:500"],
+      ["galaxy-blackhole/d_l0_b0.hist.json:0"]]
 
 
 def data():
@@ -27,15 +23,15 @@ def data():
     for s in rows:
         s["usd_h"] = per_dollar.tco_h(s["capex"], s["kw"])
         s["usd_case"] = s["s_batch"] / 3600 * s["usd_h"] / s["cases"]
-    of = of_series([R / "openfoam/of1k.dat", R / "openfoam/of4k.dat"])
-    of_cd = cd_mean(of)
-    _, of_se, _ = batch([of[i][0] for i in range(LO, HI + 1)], 100)
-    hist = json.load(open(R / "tenstorrent/quietbox2-p300x4/qb2k2_D1A.hist.json"))
-    tt = {1 + k: (r["Cd_in"], r["Cl_in"]) for k, r in enumerate(hist)}
-    h100 = [cd_mean(of_series([R / f"nvidia/dgx-h100/A_SPDP_g{g}/coefficient.dat"])) for g in range(8)]
-    b200 = cd_mean(of_series([R / "nvidia/b200/A_SPDP_g0/coefficient.dat"]))
-    cnt = lambda x: (x - of_cd) * 1e4
-    return rows, dict(band=2e4 * of_se, tt=cnt(cd_mean(tt)), h100=[cnt(x) for x in h100], b200=cnt(b200))
+    ref = cdgrade.series(cdgrade.REF)
+
+    def cd(*legs):
+        run = cdgrade.series([str(R / leg) for leg in legs])
+        return cdgrade.grade(run, ref, hi=min(HI, max(run)))["Cd"]
+
+    h100 = [cd(f"nvidia/dgx-h100/A_SPDP_g{g}/coefficient.dat") for g in range(8)]
+    return rows, dict(band=h100[0]["band"], tt=[cd(*(f"tenstorrent/{leg}" for leg in run))["diff"] for run in TT],
+                      h100=[c["diff"] for c in h100], b200=cd("nvidia/b200/A_SPDP_g0/coefficient.dat")["diff"])
 
 
 STYLE = """<style>
@@ -84,7 +80,7 @@ def svg(rows, cd):
     X0, X1, lo, hi = 700, 900, -40, 40
     sx = lambda v: X0 + (X1 - X0) * (v - lo) / (hi - lo)
     o.append(f'<text class="h" x="{X0 - 160}" y="34">Drag coefficient vs OpenFOAM fp64</text>')
-    o.append(f'<text class="sub" x="{X0 - 160}" y="54">mean over iterations {LO}-{HI}, drag counts (0.0001)</text>')
+    o.append(f'<text class="sub" x="{X0 - 160}" y="54">mean over iterations {cdgrade.START}-{HI}, drag counts (0.0001)</text>')
     yb, ye = 80, 240
     o.append(f'<rect x="{sx(-cd["band"]):.1f}" y="{yb}" width="{sx(cd["band"]) - sx(-cd["band"]):.1f}" '
              f'height="{ye - yb}" fill="var(--band)"/>')
@@ -93,7 +89,7 @@ def svg(rows, cd):
         o.append(f'<text class="ax" x="{sx(t):.1f}" y="{ye + 16}" text-anchor="middle">{t:+d}</text>'.replace("+0", "0"))
     o.append(f'<line x1="{sx(0):.1f}" y1="{yb}" x2="{sx(0):.1f}" y2="{ye}" stroke="var(--t3)" stroke-width="1.5"/>')
     o.append(f'<text class="ax" x="{sx(0) + 4:.1f}" y="{yb + 12}">OpenFOAM</text>')
-    for j, (lab, vals, c) in enumerate((("tt-fluid, QuietBox 2", [cd["tt"]], "c1"),
+    for j, (lab, vals, c) in enumerate(((f"tt-fluid, {len(cd['tt'])} runs", cd["tt"], "c1"),
                                         ("8x H100, 8 runs", cd["h100"], "c2"), ("B200", [cd["b200"]], "c2"))):
         y = yb + 34 + j * 46
         o.append(f'<text class="l" x="{X0 - 10}" y="{y + 4}" text-anchor="end">{lab}</text>')
@@ -101,10 +97,10 @@ def svg(rows, cd):
             o.append(f'<circle cx="{sx(v):.1f}" cy="{y}" r="5" fill="var(--{c})" stroke="var(--bg)" stroke-width="2"/>')
         txt = f"{vals[0]:+.1f}" if len(vals) == 1 else f"{min(vals):+.1f} to {max(vals):+.1f}"
         o.append(f'<text class="v" x="{X1 + 12}" y="{y + 4}">{txt}</text>')
-    o.append(f'<text class="ax" x="{X0 - 160}" y="{H - 40}">bench/nvidia/cdwindow.py and grade.py on results/; same '
-             'potentialFoam start.</text>')
-    o.append(f'<text class="ax" x="{X0 - 160}" y="{H - 24}">Shaded: +-{cd["band"]:.0f} counts, the 2-sigma error of '
-             "OpenFOAM's own window mean.</text>")
+    o.append(f'<text class="ax" x="{X0 - 160}" y="{H - 40}">bench/cdgrade.py on results/; 0 is OpenFOAM\'s '
+             'long-run mean, same start.</text>')
+    o.append(f'<text class="ax" x="{X0 - 160}" y="{H - 24}">Shaded: +-{cd["band"]:.1f} counts, the band for '
+             f"one run ({cdgrade.BAND} for four or more pooled).</text>")
     o.append("</g></svg>")
     return "\n".join(o) + "\n"
 

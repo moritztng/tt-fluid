@@ -66,54 +66,13 @@ are what the convergence criterion leaves open, not what the arithmetic adds.
 
 ## 3. Drag and lift against OpenFOAM fp64 (HPC_motorbike Small)
 
-HPC_motorbike Small (8.66 M cells, k-omega SST) does not settle to a steady state under SIMPLE: over iterations 101-800
-OpenFOAM's own drag coefficient has a standard deviation of 42 drag counts (1 count = 0.0001 in Cd). A comparison of
-single iterations would mean nothing. Both sides are therefore averaged over a window of iterations, and the error of each mean
-comes from batch means (blocks of 100 iterations). The OpenFOAM reference is v2412 in fp64 on a CPU from the same
-potentialFoam start (`results/openfoam/of1k.dat`, `of4k.dat`).
+HPC_motorbike Small (8.66 M cells, k-omega SST) does not settle to a steady state under SIMPLE: OpenFOAM's own drag
+coefficient has a standard deviation of 42 drag counts from iteration to iteration (1 count = 0.0001 in Cd), and two
+runs from the same start are unrelated after about 300 iterations. Single iterations cannot be compared. A run is
+graded on its mean Cd over a window of iterations against OpenFOAM v2412 in fp64 on a CPU, from the same potentialFoam
+start (`results/openfoam/of1k.dat`, `of4k.dat`).
 
-Iterations 101-800, all runs from the same start:
-
-| run | Cd | vs OpenFOAM, counts | 2 sigma of the difference |
-|---|---|---|---|
-| OpenFOAM v2412 fp64 | 0.42116 | | 22.0 (OpenFOAM's own mean) |
-| tt-fluid, QuietBox 2 board A, fp32 | 0.42013 | -10.3 | 23.8 |
-| SPUMA SPDP on H100, 8 runs of the same case | 0.42079 to 0.42419 | -3.7 to +30.3 | 24.2 to 29.6 |
-| SPUMA SPDP on B200 | 0.42268 | +15.2 | 26.7 |
-
-Over iterations 101-1900 the Tenstorrent run gives Cd 0.42060, 12.8 counts below OpenFOAM over the same iterations.
-Lift (Cl) agrees within 3 counts in both windows.
-
-Against OpenFOAM's long-run mean instead (its iterations 501-3372, Cd 0.42226), iterations 101-800 are still partly
-transient for every run: tt-fluid is -21.4 counts (2 sigma 11.9), the eight H100 runs -14.7 to +19.3, the B200 +4.2.
-On that comparison the Tenstorrent run is the furthest from OpenFOAM. The last line `cdwindow.py` prints applies a
-3-count target to it, which this run does not meet.
-
-The eight H100 runs are the same case on identical GPUs, and their window means still spread over 34 counts: that is
-how much a window mean moves with nothing but the order of floating-point sums. The Tenstorrent result (-10.3) lies
-just outside that spread on the low side and inside OpenFOAM's own +-22.
-
-Reproduce:
-
-```bash
-Q=results/tenstorrent/quietbox2-p300x4; O=results/openfoam
-python3 bench/nvidia/cdwindow.py --dev $Q/qb2k2_D1A.hist.json:0 --of $O/of1k.dat $O/of4k.dat --from 101 --to 799
-python3 bench/nvidia/cdwindow.py --dev $Q/qb2k2_D1A.hist.json:0 $Q/qb2k2_D2A.hist.json:800 --of $O/of1k.dat $O/of4k.dat --from 101 --to 1899
-for g in 0 1 2 3 4 5 6 7; do python3 bench/nvidia/grade.py --of $O/of1k.dat $O/of4k.dat --to 800 \
-    --run results/nvidia/dgx-h100/A_SPDP_g$g/coefficient.dat; done
-```
-
-`cdwindow.py` prints one-sigma errors; `grade.py` prints two-sigma errors. The Tenstorrent history files hold Cd and Cl
-of the state each iteration starts from (`Cd_in`), which is OpenFOAM's row for the same iteration number.
-
-The QuietBox 2 runs behind the cost table (`vq3_A`, `vq3_B`) ran a later build with three performance changes (gather order, a
-gather tile cache and fused SpMV row products). Each change was accepted only if the final state after 800 iterations
-stayed bitwise equal, so the cost runs inherit this grade; `vq3.status` records the bitwise comparison of both boards'
-final states against two earlier builds.
-
-## 3a. Grading a new run
-
-`bench/cdgrade.py` turns the comparison above into a pass or fail for any new run of this case, on a device or on a GPU:
+`bench/cdgrade.py` does this for any run of the case, on a device or on a GPU, and exits 0 on a pass:
 
 ```bash
 python3 bench/cdgrade.py --run results/tenstorrent/quietbox2-p300x4/qb2k2_D1A.hist.json:0 \
@@ -123,7 +82,8 @@ python3 bench/cdgrade.py --run new_case_1x2_state.npz:0 --base old.hist.json:0  
 ```
 
 A device run is given as the state file `run_mesh --forces` writes (it holds the history) or as a history exported from
-it, followed by the iteration the leg started from.
+it, followed by the iteration the leg started from. The history holds Cd and Cl of the state each iteration starts
+from (`Cd_in`), which is OpenFOAM's row for the same iteration number.
 
 It compares the mean Cd of a window with OpenFOAM's long-run mean (iterations 501-3372, Cd 0.42226 +- 3.5 counts) and
 passes the run if the difference is inside a band. The band is 12.5 counts, or two standard deviations of the
@@ -191,15 +151,32 @@ python3 bench/cdgrade.py --run $H/A_SPDP_g0/coefficient.dat --pool results/nvidi
 
 What the runs in `results/` grade as:
 
-| run | window | Cd against OpenFOAM, counts | band | grade |
+| runs | window | Cd against OpenFOAM, counts | band | grade |
 |---|---|---|---|---|
-| 16 SPUMA runs on H100, 2 on B200 | 201-800 | -12.6 to +27.0, mean +5.3 | 17.8 | 17 pass, 1 fails (+27.0) |
-| tt-fluid, QuietBox 2 board A | 201-800 | -22.8 | 17.8 | fail |
-| tt-fluid, QuietBox 2 board A | 201-1899 | -17.0 | 17.8 | pass, by 0.8 |
+| SPUMA SPDP, 8 runs on H100 and 1 on B200, pooled | 201-800 | +8.4 +- 5.0 | 12.5 | pass |
+| 16 SPUMA runs on H100 and 2 on B200 (SPDP and fp64), one by one | 201-800 | -12.6 to +27.0, mean +5.3 | 17.8 | 17 pass, 1 fails (+27.0) |
+| tt-fluid, QuietBox 2 board A, 2 chips | 201-1899 | -17.0 | 17.8 | pass, by 0.8 |
+| tt-fluid, Blackhole Galaxy, 2 chips | 201-1999 | +3.8 | 17.8 | pass |
+| tt-fluid, Blackhole Galaxy, 4 chips | 201-799 | -4.3 | 17.8 | pass |
+| the three tt-fluid runs pooled | as above | -6.0 +- 8.4 | 16.9 | pass (three runs: a screen) |
 
-One failure in 18 correct runs is what a two-sigma band gives. The QuietBox 2 run is one run, so both lines are
-screens. It sits low, like the Galaxy run's later windows and unlike its earlier ones. Whether tt-fluid as a whole
-sits low is a question for a pooled grade of four or more device runs, which `results/` does not hold yet.
+One failure in 18 correct runs is what a two-sigma band gives. The three tt-fluid runs are one fp32 program on three
+partitions of the mesh (`results/tenstorrent/galaxy-blackhole/runs.status` has chips, commit, clock and final state of
+the Galaxy legs). They track each other to 0.5 counts through iteration 10 and then separate like any two runs. Taken
+alone, the first 600 iterations of the QuietBox 2 run read -22.8, outside the band; the pool reads -6.0 +- 8.4. The run
+means spread 7.7 counts where the rule gives 5.0, so the pool carries its own wider band, and with three runs it is a
+screen. A grade of record at 12.5 needs a fourth run.
+
+```bash
+G=results/tenstorrent/galaxy-blackhole; Q=results/tenstorrent/quietbox2-p300x4
+python3 bench/cdgrade.py --run $G/hC_1.hist.json:0 $G/hC_2.hist.json:500 $G/hC_3.hist.json:1000 $G/hC_4.hist.json:1500 \
+    --pool $Q/qb2k2_D1A.hist.json:0 $Q/qb2k2_D2A.hist.json:800 --pool $G/d_l0_b0.hist.json:0
+```
+
+The QuietBox 2 runs behind the cost table (`vq3_A`, `vq3_B`) ran a later build with three performance changes (gather
+order, a gather tile cache and fused SpMV row products). Each change was accepted only if the final state after 800
+iterations stayed bitwise equal, so the cost runs follow the board A history above; `vq3.status` records the bitwise
+comparison of both boards' final states against two earlier builds.
 
 ### A known behaviour of the case
 
@@ -239,18 +216,20 @@ One-sigma errors are 4 to 11 counts per 1000-iteration window and about 5 counts
 OpenFOAM against itself moves as much as the device does, with the same onset after iteration 2000: restarting on 8
 ranks is enough to put the flow on a different trajectory. Against the 8-rank OpenFOAM run with the case's solvers the
 device is within 1 count in every window (-0.3, +0.9, +1.0; +0.5 over 1001-3999), and within 2.0 counts of the run with
-device-like solvers over 1001-3999. So on this case the 3-count target of section 3 is below what OpenFOAM reproduces
-between two of its own runs; the device's Cd sits inside that spread. Lift agrees within its noise (+5.5 +- 14.9
-counts against serial).
+device-like solvers over 1001-3999. Two OpenFOAM runs of this case differ by 15 counts, so nothing below that can be
+asked of the device; its Cd sits inside that spread. Lift agrees within its noise (+5.5 +- 15.8 counts against serial).
 
 Reproduce:
 
 ```bash
 T=results/tenstorrent/occdrivaer-coarse; O=results/openfoam/occdrivaer-coarse
 for ref in serial p8 p8dev; do
-  python3 bench/nvidia/cdwindow.py --dev $T/dev.hist.json:0 --of $O/$ref.dat --from 1001 --to 3999
+  python3 bench/cdgrade.py --means --run $T/dev.hist.json:0 --ref $O/$ref.dat --from 1001 --to 3999
 done
 ```
+
+`--means` prints the window means of both runs with their batch errors and no grade: the band of section 3 is measured
+on the motorbike and does not carry over to another case.
 
 The device run was split into checkpointed segments on two chips; a second chip run with different segment lengths
 is bitwise identical to it through iteration 3199, so restarts are exact.

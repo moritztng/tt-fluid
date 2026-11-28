@@ -2,7 +2,7 @@
 OpenFOAM/SPUMA coefficient files.
 
     python3 bench/cdgrade.py --run RUN [RUN ...] [--base RUN ...] [--pool RUN ...]... [--ref coefficient.dat ...]
-        [--from 201] [--to N]
+        [--from 201] [--to N] [--means]
 
 RUN is `X_state.npz:IT0` or `X.hist.json:IT0` (the history run_mesh --forces saves with the final state; row k holds
 Cd_in/Cl_in of the state iteration IT0 + k starts from, which is OpenFOAM's row for that iteration) or an OpenFOAM
@@ -10,7 +10,7 @@ coefficient.dat. Several RUNs chain legs of one run.
 
 The case never settles under SIMPLE: Cd swings about 40 counts from iteration to iteration (1 count = 1e-4), and two
 runs from the same start are unrelated after about 300 iterations. So a run is graded on the mean over a window, and
-the noise of that mean is known in advance from measured runs (docs/accuracy.md, section 3a): the mean of 100 iterations
+the noise of that mean is known in advance from measured runs (docs/accuracy.md, section 3): the mean of 100 iterations
 has a standard deviation of S100 counts and blocks of 100 are close to independent, so a window of n blocks has
 S100 / sqrt(n). That holds up to about 600 iterations. Beyond it the mean of one device run wanders: windows of
 1,100 to 1,900 iterations spread 10 counts between and within runs, twice what independent blocks give. So one run
@@ -33,6 +33,9 @@ Runs that track each other are draws of one arithmetic, so their windows can be 
 adds such a run (the tool refuses one that does not track --run), and the pooled window counts every run's blocks
 except the first block of each added run, which still follows the first run. The pooled sigma is the larger of that
 model and the spread of the run means themselves. RECORD_RUNS runs or more make a grade of record; fewer are a screen.
+
+The band and the noise model are measured on this one case. For any other case --means prints the window means of the
+run and of --ref over the same iterations with their batch errors, and no grade.
 """
 import argparse
 import json
@@ -140,9 +143,17 @@ def main():
     ap.add_argument("--ref", nargs="+", default=REF)
     ap.add_argument("--from", dest="lo", type=int, default=START)
     ap.add_argument("--to", dest="hi", type=int)
+    ap.add_argument("--means", action="store_true", help="another case: window means against --ref, no grade")
     ap.add_argument("--json")
     a = ap.parse_args()
     run, base = series(a.run), series(a.base) if a.base else None
+    if a.means:
+        ref, lo, hi = series(a.ref), a.lo, max(run) if a.hi is None else a.hi
+        for q, name in enumerate(("Cd", "Cl")):
+            (m, se, _), (rm, rse, _) = window(run, lo, hi, q), window(ref, lo, hi, q)
+            print(f"{name} its {lo}-{hi}: run {m:.5f} +- {se * 1e4:.1f} counts | reference {rm:.5f} +- {rse * 1e4:.1f} | "
+                  f"diff {(m - rm) * 1e4:+.1f} +- {math.hypot(se, rse) * 1e4:.1f} counts (1 sigma, batch means)")
+        return
 
     def track(t):
         print(f"its 1-{TRACK_ITS} vs base: Cd within {t:.2f} counts | the same arithmetic in another order stays within "

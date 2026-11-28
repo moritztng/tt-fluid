@@ -34,8 +34,8 @@
 <text class="ax" x="24" y="290">bench/per_dollar.py on results/: batch wall x $/h / cases per batch.</text>
 <text class="ax" x="24" y="306">Blue: Tenstorrent, fp32. Orange: NVIDIA, SPUMA mixed precision.</text>
 <text class="h" x="540" y="34">Drag coefficient vs OpenFOAM fp64</text>
-<text class="sub" x="540" y="54">mean over iterations 101-800, drag counts (0.0001)</text>
-<rect x="744.9" y="80" width="110.2" height="160" fill="var(--band)"/>
+<text class="sub" x="540" y="54">mean over iterations 201-800, drag counts (0.0001)</text>
+<rect x="755.5" y="80" width="88.9" height="160" fill="var(--band)"/>
 <line x1="700.0" y1="80" x2="700.0" y2="240" stroke="var(--grid)"/>
 <text class="ax" x="700.0" y="256" text-anchor="middle">-40</text>
 <line x1="750.0" y1="80" x2="750.0" y2="240" stroke="var(--grid)"/>
@@ -48,22 +48,24 @@
 <text class="ax" x="900.0" y="256" text-anchor="middle">+40</text>
 <line x1="800.0" y1="80" x2="800.0" y2="240" stroke="var(--t3)" stroke-width="1.5"/>
 <text class="ax" x="804.0" y="92">OpenFOAM</text>
-<text class="l" x="690" y="118" text-anchor="end">tt-fluid, QuietBox 2</text>
-<circle cx="774.3" cy="114" r="5" fill="var(--c1)" stroke="var(--bg)" stroke-width="2"/>
-<text class="v" x="912" y="118">-10.3</text>
+<text class="l" x="690" y="118" text-anchor="end">tt-fluid, 3 runs</text>
+<circle cx="743.0" cy="114" r="5" fill="var(--c1)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="824.1" cy="114" r="5" fill="var(--c1)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="789.1" cy="114" r="5" fill="var(--c1)" stroke="var(--bg)" stroke-width="2"/>
+<text class="v" x="912" y="118">-22.8 to +9.7</text>
 <text class="l" x="690" y="164" text-anchor="end">8x H100, 8 runs</text>
-<circle cx="875.7" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
-<circle cx="825.1" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
-<circle cx="843.6" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
-<circle cx="826.0" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
-<circle cx="790.8" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
-<circle cx="826.0" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
-<circle cx="839.3" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
-<circle cx="849.0" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
-<text class="v" x="912" y="164">-3.7 to +30.3</text>
+<circle cx="867.6" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="809.4" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="831.9" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="811.2" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="768.6" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="810.2" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="826.8" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<circle cx="837.8" cy="160" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<text class="v" x="912" y="164">-12.6 to +27.0</text>
 <text class="l" x="690" y="210" text-anchor="end">B200</text>
-<circle cx="838.0" cy="206" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
-<text class="v" x="912" y="210">+15.2</text>
-<text class="ax" x="540" y="290">bench/nvidia/cdwindow.py and grade.py on results/; same potentialFoam start.</text>
-<text class="ax" x="540" y="306">Shaded: +-22 counts, the 2-sigma error of OpenFOAM's own window mean.</text>
+<circle cx="825.1" cy="206" r="5" fill="var(--c2)" stroke="var(--bg)" stroke-width="2"/>
+<text class="v" x="912" y="210">+10.0</text>
+<text class="ax" x="540" y="290">bench/cdgrade.py on results/; 0 is OpenFOAM's long-run mean, same start.</text>
+<text class="ax" x="540" y="306">Shaded: +-17.8 counts, the band for one run (12.5 for four or more pooled).</text>
 </g></svg>

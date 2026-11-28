@@ -90,3 +90,13 @@ def test_runs_of_one_arithmetic_pool_into_one_grade(monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:   # fp64 is another arithmetic: it does not track, so it is not pooled
         cdgrade.main()
     assert "not pooled" in str(e.value.code)
+
+
+def test_another_case_gets_means_and_no_grade(monkeypatch, capsys):
+    """--means on the occDrivAer run: the window means against a chosen reference over the same iterations, no verdict."""
+    occ = "occdrivaer-coarse"
+    monkeypatch.setattr(sys, "argv", ["cdgrade.py", "--means", "--run", f"{ROOT}/results/tenstorrent/{occ}/dev.hist.json:0",
+                                      "--ref", f"{ROOT}/results/openfoam/{occ}/serial.dat", "--from", "1001", "--to", "3999"])
+    cdgrade.main()
+    out = capsys.readouterr().out
+    assert "diff +15.0 +- 4.6 counts" in out and "GRADE" not in out
