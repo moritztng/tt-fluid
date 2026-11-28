@@ -163,15 +163,28 @@ def chip_pages(img, k, P, name, state=None):
 
 class Staged:
     """An array of 4 KB pages as upload_placed sends it: only the pages that hold a value, in page order.
-    on(k): chip k's page marks; shape, fill: the staging buffer, as upload takes them (every chip's padded to the
-    longest); sparse: staging pays, the host writes less than half of the array."""
+    mark() reads the page marks of every chip (on[k], pages(k) on a thread per chip) and decides: sparse when the
+    host would write less than half of the array. src(): (shape, fill) as upload takes them, the staging buffer
+    (every chip's padded to the longest) when sparse, else the array itself."""
 
     def __init__(self, DEVBLK, shape, fill, pages):
-        self.full, self.fill_full = shape, fill
-        self.on = {k: pages(k) for k in DEVBLK}
-        self.shape = (max(1, max(int(o.sum()) for o in self.on.values())), shape[1])
-        self.fill = lambda k, out: fill(k, out, np.cumsum(self.on[k]) - 1)
-        self.sparse = 2 * self.shape[0] < shape[0]
+        self.DEVBLK, self.full, self.fill_full, self.pages, self.on = DEVBLK, shape, fill, pages, None
+
+    def mark(self):
+        if self.on is None:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(len(self.DEVBLK)) as ex:
+                self.on = dict(zip(self.DEVBLK, ex.map(self.pages, self.DEVBLK)))
+            self.shape = (max(1, max(int(o.sum()) for o in self.on.values())), self.full[1])
+            self.sparse = 2 * self.shape[0] < self.full[0]
+        return self
+
+    def fill(self, k, out):
+        self.fill_full(k, out, np.cumsum(self.on[k]) - 1)
+
+    def src(self):
+        self.mark()
+        return (self.shape, self.fill) if self.sparse else (self.full, self.fill_full)
 
     def work(self, k, W):
         """Chip k's array split over W workers: (map, args). Worker w lays pages first .. first + count - 1; bit j of
@@ -243,16 +256,20 @@ def verify(t, K, DEVBLK, shape, fill, name):
 
 
 def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, host=None):
-    """upload for a Staged array: the host writes the staged pages and a page map, and every core of a chip lays a
-    share of the array with both its data movement processors (kernels/place.cpp), copying the staged pages to their
-    places and writing the rest as zeros. The array ends up as upload leaves it; the PCIe write carries a fifth of
-    the bytes (zeros cost it what data costs) and the host never holds the zero pages. cells[d]: device d's mesh
-    coordinate; host: as upload, for the staging buffer."""
+    """upload for a Staged array. Sparse: the host writes the staged pages and a page map, and every core of a chip
+    lays a share of the array with both its data movement processors (kernels/place.cpp), copying the staged pages
+    to their places and writing the rest as zeros. The array ends up as upload leaves it; the PCIe write carries a
+    fifth of the bytes (zeros cost it what data costs) and the host never holds the zero pages. Not sparse: a plain
+    upload. cells[d]: device d's mesh coordinate; host: a future of host_shards(md, K, DEVBLK, *sg.src())."""
     import ttnn
     K, P, W, NB = len(DEVBLK), len(cores), 2 * len(cores), 16
     prof = name and os.environ.get("CFD_UPLOAD_PROFILE")
+    if host is not None:
+        host.result()        # it marked the pages
+    if not sg.mark().sparse:
+        return upload(md, K, DEVBLK, *sg.src(), name, host)
     t = ttnn.allocate_tensor_on_device(ttnn.Shape(list(sg.full)), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
-    t_stage = upload(md, K, DEVBLK, sg.shape, sg.fill, name and name + " staged", host)
+    t_stage = upload(md, K, DEVBLK, *sg.src(), name and name + " staged", host)
     t0 = time.time()
     work = {k: sg.work(k, W) for k in DEVBLK}
     mw = work[DEVBLK[0]][0].shape[1]
