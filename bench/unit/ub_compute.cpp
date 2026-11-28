@@ -103,6 +103,37 @@ template <typename F>
     ckernel::ckernel_template::run();
     SFPU_END();
 }
+// r = s0 + s1 written back to slot 1 at two cycles per row (SFPLOADMACRO): the load of s1 schedules the add on the MAD
+// unit for the next cycle and the store of its result, to the address it was loaded from, three cycles after the
+// load. The add's result is readable two cycles after it executes, so a store delay of 0 (UB_BREAK 2) stores s1 itself.
+// The loaded register alternates so that a row's store still finds its result after the next row has loaded.
+[[gnu::always_inline]] inline void pipe_add_init() {
+    addr_mod_t{.srca = {.incr = 0}, .srcb = {.incr = 0}, .dest = {.incr = 2}}.set(ADDR_MOD_6);
+    TTI_SFPADD(p_sfpu::LCONST_1, p_sfpu::LREG2, 0, 12, 0);                  // InstructionTemplate[0]: VD = 1 * L2 + VC
+    constexpr uint32_t mad_bits = (0 << 3) | 4, store_bits = ((UB_BREAK == 2 ? 0 : 2) << 3) | 3;
+    TTI_SFPLOADI(0, sfpi::SFPLOADI_MOD0_LOWER, (mad_bits << 8) | 0);
+    TTI_SFPLOADI(0, sfpi::SFPLOADI_MOD0_UPPER, (store_bits << 8) | 0);
+    TTI_SFPCONFIG(0, 4 + 0, 0);                                             // Sequence[0] from LREG0
+    TTI_SFPCONFIG(0x010, 8, 1);                                             // Misc: store with the load's Mod0, delays in cycles
+    load_replay_buf(0, 4, [] {
+        TTI_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::FP32, ADDR_MOD_7, 0);
+        TTI_SFPLOADMACRO((0 << 2) | 0, InstrModLoadStore::FP32, ADDR_MOD_6, 64);
+        TTI_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::FP32, ADDR_MOD_7, 0);
+        TTI_SFPLOADMACRO((0 << 2) | 1, InstrModLoadStore::FP32, ADDR_MOD_6, 64);
+    });
+    ckernel::ckernel_template tmp_(4, 4, lltt::replay_insn(0, 4));
+    tmp_.set_end_ops(TT_OP_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D),
+                     TT_OP_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D));
+    tmp_.program();
+}
+[[gnu::always_inline]] inline void pipe_tile() {
+    SFPU_BEGIN();
+    ckernel::ckernel_template::run();
+    TTI_SFPNOP;
+    TTI_SFPNOP;
+    TTI_SFPNOP;
+    SFPU_END();
+}
 #endif
 
 void kernel_main() {
@@ -212,6 +243,9 @@ void kernel_main() {
     CELL(16, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); MATH(({ for (uint32_t j = 0; j < NB; ++j) mop_tile(); })); SEC_END(); });
     MATH((mop_body(6, [] { SCHED_STEP((void)0); })));
     CELL(17, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); MATH(({ for (uint32_t j = 0; j < NB; ++j) mop_tile(); })); SEC_END(); });
+    // 18: one add per tile through the load macro, in place, two cycles per row
+    MATH((pipe_add_init()));
+    CELL(18, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); MATH(({ for (uint32_t j = 0; j < NB; ++j) pipe_tile(); })); SEC_END(); });
 
     // checks (mask bit 31). Stock load of tiles 0-3 packed to 8-11; lean load of tiles 4-7 packed to 12-15
     if (mask & 0x80000000u) {
@@ -256,6 +290,23 @@ void kernel_main() {
             pack_tile<true>(3, cb_v, 16 + v);
             tile_regs_release();
         }
+        // r = t0 + t1: the stock add -> 22, the pipelined in-place add -> 23
+        add_binary_tile_init();
+        tile_regs_acquire();
+        for (uint32_t j = 0; j < 2; ++j) copy_tile(cb_v, j, j);
+        add_binary_tile(0, 1, 2);
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile<true>(2, cb_v, 22);
+        tile_regs_release();
+        MATH((pipe_add_init()));
+        tile_regs_acquire();
+        for (uint32_t j = 0; j < 2; ++j) copy_tile(cb_v, j, j);
+        MATH((pipe_tile()));
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile<true>(1, cb_v, 23);
+        tile_regs_release();
     }
     barrier();
     UNPACK((hw[0] = 0xC0DE0000u | bk));

@@ -13,7 +13,7 @@ import numpy as np
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--ns", type=int, default=65536, help="sections per cell (4 units each for most cells)")
-ap.add_argument("--mask", type=lambda x: int(x, 0), default=0x8003FFFF, help="cells to run, bit 31 = the checks")
+ap.add_argument("--mask", type=lambda x: int(x, 0), default=0x8007FFFF, help="cells to run, bit 31 = the checks")
 ap.add_argument("--reps", type=int, default=3)
 ap.add_argument("--sysfs-node", type=int, default=None, help="sysfs node of the chip (default: TT_VISIBLE_DEVICES)")
 ap.add_argument("--break-arm", type=int, default=0, help="1: the lean-load check loads one tile where it claims four; 2: the fused blocks store the wrong register. The checks must then fail")
@@ -28,7 +28,8 @@ NV, CB_V, CB_HDR, CB_DONE, CB_H = 24, 0, 1, 2, 3
 CELLS = {0: "empty section", 1: "stock load (init once)", 2: "stock load (init each)", 3: "stock pack to L1",
          4: "stock add", 5: "stock mul", 6: "stock addcmul", 7: "stock where", 8: "stock bf16 load (reconfig)", 9: "lean load x1", 10: "lean load x2",
          11: "lean load x4", 12: "fused block, issued", 13: "fused block, sfpi", 14: "fused block, MOP",
-         15: "add block, MOP", 16: "scheduled block, NOPs", 17: "scheduled block, no NOPs"}
+         15: "add block, MOP", 16: "scheduled block, NOPs", 17: "scheduled block, no NOPs",
+         18: "pipelined add in place (load macro)"}
 node = a.sysfs_node if a.sysfs_node is not None else int(os.environ["TT_VISIBLE_DEVICES"].split(",")[0])
 CLK = f"/sys/class/tenstorrent/tenstorrent!{node}/tt_aiclk"
 
@@ -146,6 +147,11 @@ if a.mask >> 31 & 1:
                             eq_stock=int((got.view(np.uint32) == arena[16].view(np.uint32)).sum()),
                             max_rel=float(np.max(np.abs(got.astype(np.float64) - t64[0] - (t64[0] * t64[1] + t64[2]) * t64[1])
                                                  / np.abs(two.astype(np.float64)))), lanes=1024)
+    if NV > 23:
+        add = (t[0] + t[1]).astype(np.float32)
+        checks["pipelined add"] = dict(eq_stock=int((arena[23].view(np.uint32) == arena[22].view(np.uint32)).sum()),
+                                       eq_s1=int((arena[23].view(np.uint32) == t[1].view(np.uint32)).sum()),
+                                       stock_eq_numpy=int((arena[22].view(np.uint32) == add.view(np.uint32)).sum()), lanes=1024)
 keep = runs[1:]
 med = lambda xs: float(np.median(xs))
 rows = {}
