@@ -512,11 +512,13 @@ void kernel_main() {
                 noc_async_read(dpage(d, pi + 1), dst + 4096 - w, w);
         }
     };
-#ifdef CFD_KIN_A   // run_mesh --knockin a: every constant page (kind 2, fp32 and bf16) is read from DRAM twice into the
-                   // same place, so the state stays bitwise and the run pays this class of reads twice
+#ifdef CFD_KIN_A   // run_mesh --knockin a (CFD_KIN_A = 4: constant pages, kind 2) and p (6: every DRAM page of a stream,
+                   // kinds 1 and 2): the page's read is issued twice into the same place, so the state stays bitwise
+                   // and the run pays this class of reads twice. The two reads overlap: this is twice the traffic, not
+                   // twice the round trip
     auto window = [&](uint32_t d, uint32_t t, int32_t sh, uint32_t dst) {
         window1(d, t, sh, dst);
-        if ((d >> 28) == 2) window1(d, t, sh, dst);
+        if ((CFD_KIN_A >> (d >> 28)) & 1) window1(d, t, sh, dst);
     };
 #endif
 
