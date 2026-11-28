@@ -31,7 +31,7 @@ import time
 import numpy as np
 
 TESTS = ["load", "store", "copy", "memcpy", "scatter", "scatter_d", "d16x4", "d16x8", "pair16", "off32", "abs32",
-         "noc1", "nocq", "noci"]
+         "noc1", "nocq", "noci", "d16a16", "d16a32", "abs32a16", "abs32a32"]
 WHO = ["brisc", "ncrisc", "unpack", "math", "pack"]
 NSRC = 40 * 1024
 
@@ -40,7 +40,7 @@ typedef uint32_t u32;
 typedef uint16_t u16;
 #define GB_O3 __attribute__((noinline, optimize("O3")))
 #define GB_DEF __attribute__((noinline))
-constexpr u32 GB_NT = 14, GB_LIMIT = 2000000000u, GB_END = 0xff;
+constexpr u32 GB_NT = 18, GB_LIMIT = 2000000000u, GB_END = 0xff;
 
 GB_O3 static u32 gb_load(const u32* src, u32 n) {
     u32 s = 0;
@@ -132,8 +132,61 @@ GB_O3 static void gb_abs32(const u32* tab, u32 n, u32* out) {
     asm volatile("" ::: "memory");
 }
 
-// test k on RISC-V `me`: cycles of R passes over one 1,024-lane page into sw[64 + 32 me + k], a checksum of the page
-// it left into sw[80 + 32 me + k]
+// Hand-scheduled forms. The compiled loops above put a load 3 to 5 instructions in front of its use, and this core
+// then loses 0.65 to 2.7 cycles per load (flx-kernel's fit of the gb2 disassembly); a use 8 or more instructions
+// later is free (copy: 19 instructions, 25.0 cycles a turn). Here a turn holds 16 values in 16 registers: 16 index
+// loads, 16 address adds, 16 value loads, 16 stores, so every use is 16 instructions behind its load. The a32
+// forms run two such batches a turn (the turn itself costs 3 instructions and about 6 cycles).
+#define GB_LHU(r, k, b) "lhu " #r ", 2*" #k "+" #b "(%[ix])\n"
+#define GB_LDP(r, k, b) "lw " #r ", 4*" #k "+" #b "(%[ix])\n"
+#define GB_ADR(r, k, b) "sh2add " #r ", " #r ", %[src]\n"
+#define GB_LDV(r, k, b) "lw " #r ", 0(" #r ")\n"
+#define GB_STV(r, k, b) "sw " #r ", 4*" #k "+" #b "(%[out])\n"
+#define GB_R16(F, b)                                                                                              \
+    F(t0, 0, b) F(t1, 1, b) F(t2, 2, b) F(t3, 3, b) F(t4, 4, b) F(t5, 5, b) F(t6, 6, b) F(s2, 7, b) F(s3, 8, b) \
+    F(s4, 9, b) F(s5, 10, b) F(s6, 11, b) F(s7, 12, b) F(s8, 13, b) F(s9, 14, b) F(s10, 15, b)
+#define GB_CLOB "t0", "t1", "t2", "t3", "t4", "t5", "t6", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "memory"
+GB_O3 static void gb_d16a16(const u32* src, const u16* ix, u32 n, u32* out) {
+    const u16* const end = ix + (n & ~15u);
+    if (ix != end)
+        asm volatile("1:\n" GB_R16(GB_LHU, 0) GB_R16(GB_ADR, 0) GB_R16(GB_LDV, 0) GB_R16(GB_STV, 0)
+                     "addi %[ix], %[ix], 32\naddi %[out], %[out], 64\nbne %[ix], %[end], 1b\n"
+                     : [ix] "+r"(ix), [out] "+r"(out) : [src] "r"(src), [end] "r"(end) : GB_CLOB);
+    for (u32 e = n & ~15u; e < n; ++e) *out++ = src[*ix++];
+    asm volatile("" ::: "memory");
+}
+GB_O3 static void gb_d16a32(const u32* src, const u16* ix, u32 n, u32* out) {
+    const u16* const end = ix + (n & ~31u);
+    if (ix != end)
+        asm volatile("1:\n" GB_R16(GB_LHU, 0) GB_R16(GB_ADR, 0) GB_R16(GB_LDV, 0) GB_R16(GB_STV, 0)
+                     GB_R16(GB_LHU, 32) GB_R16(GB_ADR, 32) GB_R16(GB_LDV, 32) GB_R16(GB_STV, 64)
+                     "addi %[ix], %[ix], 64\naddi %[out], %[out], 128\nbne %[ix], %[end], 1b\n"
+                     : [ix] "+r"(ix), [out] "+r"(out) : [src] "r"(src), [end] "r"(end) : GB_CLOB);
+    for (u32 e = n & ~31u; e < n; ++e) *out++ = src[*ix++];
+    asm volatile("" ::: "memory");
+}
+GB_O3 static void gb_abs32a16(const u32* ix, u32 n, u32* out) {
+    const u32* const end = ix + (n & ~15u);
+    if (ix != end)
+        asm volatile("1:\n" GB_R16(GB_LDP, 0) GB_R16(GB_LDV, 0) GB_R16(GB_STV, 0)
+                     "addi %[ix], %[ix], 64\naddi %[out], %[out], 64\nbne %[ix], %[end], 1b\n"
+                     : [ix] "+r"(ix), [out] "+r"(out) : [end] "r"(end) : GB_CLOB);
+    for (u32 e = n & ~15u; e < n; ++e) *out++ = *reinterpret_cast<const u32*>(*ix++);
+    asm volatile("" ::: "memory");
+}
+GB_O3 static void gb_abs32a32(const u32* ix, u32 n, u32* out) {
+    const u32* const end = ix + (n & ~31u);
+    if (ix != end)
+        asm volatile("1:\n" GB_R16(GB_LDP, 0) GB_R16(GB_LDV, 0) GB_R16(GB_STV, 0)
+                     GB_R16(GB_LDP, 64) GB_R16(GB_LDV, 64) GB_R16(GB_STV, 64)
+                     "addi %[ix], %[ix], 128\naddi %[out], %[out], 128\nbne %[ix], %[end], 1b\n"
+                     : [ix] "+r"(ix), [out] "+r"(out) : [end] "r"(end) : GB_CLOB);
+    for (u32 e = n & ~31u; e < n; ++e) *out++ = *reinterpret_cast<const u32*>(*ix++);
+    asm volatile("" ::: "memory");
+}
+
+// test k on RISC-V `me`: cycles of R passes over one 1,024-lane page into sw[64 + 64 me + k], a checksum of the page
+// it left into sw[96 + 64 me + k]
 static void gb_test(u32 k, volatile u32* sw, u32 me) {
     const u32 R = sw[2];
     const u32* src = reinterpret_cast<const u32*>(sw[3]);
@@ -184,12 +237,16 @@ static void gb_test(u32 k, volatile u32* sw, u32 me) {
             own = true;
             break;
 #endif
+        case 14: for (u32 r = 0; r < R; ++r) gb_d16a16(src, t_16, 1024, out); break;
+        case 15: for (u32 r = 0; r < R; ++r) gb_d16a32(src, t_16, 1024, out); break;
+        case 16: for (u32 r = 0; r < R; ++r) gb_abs32a16(t_abs, 1024, out); break;
+        case 17: for (u32 r = 0; r < R; ++r) gb_abs32a32(t_abs, 1024, out); break;
         default: page = false; break;
     }
     const u32 t1 = GB_NOW();
     if (page) for (u32 i = 0; i < 1024; ++i) chk = chk * 31 + out[i];
-    sw[64 + 32 * me + k] = own ? dt : t1 - t0;
-    sw[80 + 32 * me + k] = chk;
+    sw[64 + 64 * me + k] = own ? dt : t1 - t0;
+    sw[96 + 64 * me + k] = chk;
 }
 
 // a RISC-V other than BRISC: every test when BRISC starts it, then its done word
@@ -311,7 +368,7 @@ def model(core, src_addr, dst_addr, me, reps):
     ld = int(sum(int(np.bitwise_xor.reduce(src[1024 * (r & 31):1024 * (r & 31) + 1024].reshape(-1, 8), axis=1).astype(np.uint64).sum()) for r in range(reps)) & 0xffffffff)
     noc = chk(src[1024 + off:2048 + off])
     st = chk(np.full(1024, 0xA5A50000 + reps - 1, np.uint32))
-    return [ld, st, cp, cp, g, g, g, g, g, g, g, noc, noc, noc]
+    return [ld, st, cp, cp, g, g, g, g, g, g, g, noc, noc, noc, g, g, g, g]
 
 
 def main():
@@ -391,11 +448,11 @@ def main():
                             continue
                         want = model(c, int(w[3]), int(w[8]), m, a.reps) if ok else None
                         for k, name in enumerate(TESTS):
-                            if k >= 11 and m >= 2:
+                            if name.startswith("noc") and m >= 2:
                                 continue
-                            row["cyc"][f"{WHO[m]}.{name}"] = int(w[64 + 32 * m + k]) / (a.reps * 1024)
+                            row["cyc"][f"{WHO[m]}.{name}"] = int(w[64 + 64 * m + k]) / (a.reps * 1024)
                             if ok:
-                                row["chk_ok"][f"{WHO[m]}.{name}"] = int(w[80 + 32 * m + k]) == want[k]
+                                row["chk_ok"][f"{WHO[m]}.{name}"] = int(w[96 + 64 * m + k]) == want[k]
                     res.append(row)
                 bad = [r for r in res[-n:] if not r["ok"] or not all(r["chk_ok"].values())]
                 print("mask %2d round %d: %.2f s%s" % (mask, rnd, wall, "  BAD " + json.dumps(bad[0])[:300] if bad else ""), flush=True)
