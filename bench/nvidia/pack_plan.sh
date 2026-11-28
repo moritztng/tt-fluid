@@ -1,9 +1,12 @@
 #!/bin/bash
 # Box-side plan: k independent SPUMA SPDP cases at once on ONE GPU, HPC_motorbike Small (8,662,309 cells), forceCoeffs
 # on, from the potentialFoam start, each case through spuma_run.sh exactly as the one-case-per-GPU baseline ran.
-# A cell is <k>:<mode>[:<variant>]. Mode "mps" shares the GPU through CUDA MPS (kernels of different cases overlap),
-# "off" leaves the default time-slicing. A variant runs fvSolution.spuma.mbs.<variant> instead of the baseline
-# dictionary (tag P_<mode>_k<k>_<variant>). "auto" picks the next k from the two MPS cells before it: 8 (or 6) while packing still
+# A cell is <k>:<mode>[:<variant>[:<its>[:<need-s>]]]. Mode "mps" shares the GPU through CUDA MPS (kernels of different
+# cases overlap), "off" leaves the default time-slicing. A variant runs fvSolution.spuma.mbs.<variant> instead of the
+# baseline dictionary (tag P_<mode>_k<k>_<variant>; empty or "-" = baseline). <its> other than IT makes a timing screen
+# (tag suffix _it<its>): compare its ClockTime with a full cell's at the same iteration, it carries no Cd grade.
+# <need-s> is the time the cell must have left to start (default NEED, else 400 + 500 k); given in the cell, it also
+# ends the cell at 1.5x that, so a screen that thrashes cannot eat the cells after it. "auto" picks the next k from the two MPS cells before it: 8 (or 6) while packing still
 # pays and host RAM allows, else 3. The batch makespan (launch of the first case to exit of the last) is the number:
 # cases per GPU-hour = k x 3600 / makespan.
 # Usage: pack_plan.sh <work-dir> <deadline-seconds>    env CELLS ("1:off 2:mps 4:mps auto 2:off"), IT (800), GPU (0)
@@ -20,20 +23,25 @@ lscpu | grep -E "Model name|^CPU\(s\)|Socket"; nproc; free -g | head -2
 : > $W/cells.tsv
 
 cell() {
-  local k=$1 mode=$2 tag=P_${2}_k$1${3:+_$3} fvs=$H/fvSolution.spuma.mbs${3:+.$3} L pool i pids=() ta tb
-  L=$(left); [ $L -lt $(( ${NEED:-$(( 400 + 500 * k ))} )) ] && { stamp "$tag skipped, ${L}s left"; return; }
-  pool=$(( 72 / k )); [ $pool -gt 60 ] && pool=60   # GiB of managed memory per case; a case touches ~6.2 GiB
+  local k=$1 mode=$2 var=${3:-} it=${4:-$IT} need=${5:-${NEED:-$(( 400 + 500 * $1 ))}} tag fvs L pool i pids=() ta tb
+  [ "$var" = - ] && var=
+  tag=P_${mode}_k$k${var:+_$var}; fvs=$H/fvSolution.spuma.mbs${var:+.$var}; [ $it != $IT ] && tag=${tag}_it$it
+  L=$(left); [ $L -lt $need ] && { stamp "$tag skipped, ${L}s left, needs $need"; return; }
+  [ -n "${5:-}" ] && [ $L -gt $(( need * 3 / 2 )) ] && L=$(( need * 3 / 2 ))
+  # GiB of managed memory per case. Only touched pages are backed (a case touches ~6.1 GiB, 60 GiB pool or 9), so
+  # past k=9 the pools oversubscribe the card on paper and the touched total (k x 6.1) is what has to fit.
+  pool=$(( 72 / k )); [ $pool -gt 60 ] && pool=60; [ $pool -lt 8 ] && pool=8
   unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY
   if [ $mode = mps ]; then
     export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps CUDA_MPS_LOG_DIRECTORY=/tmp/mps-log
     mkdir -p $CUDA_MPS_PIPE_DIRECTORY $CUDA_MPS_LOG_DIRECTORY
     nvidia-cuda-mps-control -d; stamp "$tag MPS daemon rc=$?"
   fi
-  stamp "$tag: $k cases x $IT it, pool $pool GiB each, ${L}s left"
+  stamp "$tag: $k cases x $it it, pool $pool GiB each, ${L}s left"
   for i in $(seq 0 $((k-1))); do
     R=$W/${tag}_c$i; rm -rf $R; mkdir -p $R; cp -al $W/mbs_np1/constant $W/mbs_np1/0 $R/; cp -r $W/mbs_np1/system $R/
     CUDA_VISIBLE_DEVICES=$G SPUMA=spumaS BFX=$W/libspumaBoundFix_spdp.so timeout -s TERM $L \
-      bash $H/spuma_run.sh $R $IT $pool $fvs 1 > $W/run_${tag}_c$i.out 2>&1 &
+      bash $H/spuma_run.sh $R $it $pool $fvs 1 > $W/run_${tag}_c$i.out 2>&1 &
     pids+=($!)
   done
   ta=$(date +%s.%N)
@@ -50,7 +58,7 @@ cell() {
   wait "${pids[@]}"; tb=$(date +%s.%N)
   kill $smi $rss $look 2>/dev/null
   [ $mode = mps ] && { echo quit | nvidia-cuda-mps-control; stamp "$tag MPS stopped"; }
-  python3 - $W $tag $k $ta $tb $IT <<'EOF' | tee -a $W/cells.tsv
+  python3 - $W $tag $k $ta $tb $it <<'EOF' | tee -a $W/cells.tsv
 import glob, re, statistics as st, sys
 W, tag, k, ta, tb, IT = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]), int(sys.argv[6])
 its, clock = [], []
@@ -94,7 +102,7 @@ print(k)")
     stamp "auto -> k=$k (mps k2 ${m2:-none} s, k4 ${m4:-none} s)"
     cell $k mps; unset NEED
   else
-    IFS=: read -r ck cm cv <<< "$c"; cell $ck $cm $cv
+    IFS=: read -r ck cm cv ci cn <<< "$c"; cell $ck $cm "$cv" "$ci" "$cn"
   fi
 done
 stamp "PLAN-END"
