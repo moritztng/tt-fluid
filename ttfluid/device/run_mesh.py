@@ -446,8 +446,10 @@ if IMG is not None and not a.l1_check:
     # ttnn load and the mesh opens: numpy and file reads on two threads, the constants (which need no state) on one.
     filled = lambda name: (image_dev.chip_shape(IMG, P, name),
                            lambda k, out, row=None: image_dev.chip_fill(IMG, k, P, name, out, STATE, row))
-    # constants and homes are mostly zero pages: the host writes the pages that hold a value, the chips lay the array
-    staged = {name: image_dev.Staged(DEVBLK, *filled(name), lambda k, name=name: image_dev.chip_pages(IMG, k, P, name, STATE))
+    # constants and homes are mostly zero pages: the host writes the pages that hold a value, the chips lay the array.
+    # CFD_IMG_STAGE_MB: the most the host stages of an array at a time, over all chips (two such parts are alive)
+    staged = {name: image_dev.Staged(DEVBLK, *filled(name), lambda k, name=name: image_dev.chip_pages(IMG, k, P, name, STATE),
+                                     int(os.environ.get("CFD_IMG_STAGE_MB", 1024)) << 20)
               for name in ("consts", "home")}
     src = lambda name: staged[name].src() if name in staged else filled(name)
 

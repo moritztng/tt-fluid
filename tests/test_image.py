@@ -37,14 +37,18 @@ def test_put_state_is_the_inverse_of_state():
     assert np.count_nonzero(A) + np.count_nonzero(H) == 4 * n
 
 
-def lay(sg, k, W, stage):
-    """kernels/place.cpp on the host: what W workers leave in a chip's array, from the map and the arguments they get."""
-    m, args = image_dev.page_map(sg.on[k], W)
+def lay(sg, k, W):
+    """upload_placed on the host: what W workers per part (kernels/place.cpp) leave in a chip's array, from the staged
+    pages, the maps and the arguments they get."""
     out = np.full(sg.full, 0xDEADBEEF, np.uint32)        # whatever the DRAM held before
-    for w, first, count, staged in args:
-        for j in range(count):
-            out[first + j] = stage[staged] if m[w, j >> 5] >> (j & 31) & 1 else 0
-            staged += int(m[w, j >> 5] >> (j & 31) & 1)
+    for p in (sg.part(j) for j in range(sg.parts)):
+        stage = np.zeros(p.shape, np.uint32)
+        p.fill(k, stage)
+        m, args = image_dev.page_map(p.on(k), W, p.size)
+        for w, first, count, staged in args:
+            for j in range(count):
+                out[p.first + first + j] = stage[staged] if m[w, j >> 5] >> (j & 31) & 1 else 0
+                staged += int(m[w, j >> 5] >> (j & 31) & 1)
     return out
 
 
@@ -70,15 +74,16 @@ def test_staged_upload_lays_the_array_a_full_upload_writes(tmp_path):
         full = np.zeros(home.shape, np.uint32)
         fill(0, full)
         assert st is None or not np.array_equal(full, home.view(np.uint32))
-        sg = image_dev.Staged([0], full.shape, fill, lambda k: image_dev.chip_pages(img, k, P, "home", st)).mark()
-        assert sg.sparse and 9 <= sg.shape[0] < len(full) // 20      # a row lies across two blocks of its file
-        stage = np.zeros(sg.shape, np.uint32)
-        sg.fill(0, stage)
-        for W in (2 * P, 7, 1):
-            assert np.array_equal(lay(sg, 0, W, stage), full)
-        on = sg.on[0].copy()                             # the gate can fail: one staged page marked zero
-        sg.on[0][np.flatnonzero(on)[3]] = False
-        assert not np.array_equal(lay(sg, 0, 2 * P, stage), full)
+        pages = lambda k: image_dev.chip_pages(img, k, P, "home", st)
+        sg = image_dev.Staged([0], full.shape, fill, pages).mark()
+        assert sg.sparse and sg.parts == 1 and 9 <= sg.shape[0] < len(full) // 20      # a row lies across two blocks of its file
+        for cap in (None, 10 * 4096, 3 * 4096, 4096):    # one part; parts of at most 10 and 3 staged pages; as many as there may be
+            sg = image_dev.Staged([0], full.shape, fill, pages, cap).mark()
+            assert sg.parts == 1 if cap is None else sg.parts > 1 and (sg.parts == 64 or sg.rows.max() * 4096 <= cap)
+            for W in (2 * P, 7, 1):
+                assert np.array_equal(lay(sg, 0, W), full)
+            sg.on[0][1] = False                          # the gate can fail: a page that holds values marked zero
+            assert not np.array_equal(lay(sg, 0, 2 * P), full)
 
 
 def scan(X, W, HPG, ranges):
