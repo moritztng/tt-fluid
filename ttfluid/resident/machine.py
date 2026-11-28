@@ -987,7 +987,7 @@ def slot_extents(code, space, cells, slotfold, L, T):
 class Machine:
     def __init__(self, prog, mesh, P, nslot=NSLOT, log=print, layout="rcb", tiles=None, l1_vec=None, fuse=False, scratch_cap=32,
                  span_homes=False, hoist=False, cap_min=False, sched=False, amg_vec=False, ptiles=False, bcast_run=False, joint_red=False, fold1=False,
-                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, lsplit=False, hpack=False):
+                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, lsplit=False, hpack=False, gsmin=0.0):
         # two-stage reductions: fold the chip's partials, then the K chip sums; no joint reductions then. Needed when
         # K * P partials do not fit one fold tile, and the default from 8 chips (r13 2x4: 520.3 vs 546.9 ms/it)
         self.red2 = bool(chip_cores) and ((P > LANES or P >= 8 * chip_cores) if red2 is None else red2)
@@ -1004,6 +1004,7 @@ class Machine:
         self.hlate = hlate     # a halo goes out right before its first gather, not after its source's last write
         self.hre = hre         # >0: a halo last read more than hre MIR back is sent again, not held in its slot
         self.pseg = pseg
+        self.gsmin = float(gsmin)   # _split_gathers: least share of a map's values its shift must cover to split it
         self.narrow_on, self.narrow, self.narrow_slot, self.pre_h, self.narrow_home = narrow, set(), {}, {}, set()   # narrow: bf16 DRAM pages for eligible constants (_narrow)
         self.coff, self.cpages, self.hpages, self.dslots = {}, 0, 0, []
         self.F = prog.dtype.type
@@ -1581,6 +1582,12 @@ class Machine:
                     best, cover = (k, int(vals[np.argmax(cnt)])), sel & (d == vals[np.argmax(cnt)])
                     ncov = int(cover.sum())
             if ncov < min_per_core * self.P:
+                continue
+            # gsmin: the 24 values a core date from a 32-cycle scalar copy. With dense tables and three gather threads
+            # a patched value is ~9 cycles of wall, and the split costs a block over every tile of the destination
+            # plus a C -> N handshake: a shift (or zero fill) that covers under this share of the map's values is
+            # left to the gather, which then writes every lane itself. Same values in the same lanes
+            if self.gsmin and ncov < self.gsmin * (len(t["core"]) + len(t["zc"])):
                 continue
             self.base[mid] = best             # None: zero fill
             self.maps.tab[mid] = Maps.drop(t, cover)
