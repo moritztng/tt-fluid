@@ -235,7 +235,9 @@ def upload(md, K, DEVBLK, shape, fill, name=None, host=None):
     import ttnn
     prof = name and os.environ.get("CFD_UPLOAD_PROFILE")
     t0 = time.time()
-    h, shard = host.result() if host is not None else host_shards(md, K, DEVBLK, shape, fill)
+    box = host.result() if host is not None else host_shards(md, K, DEVBLK, shape, fill)
+    h, shard = box
+    box.clear()   # a future keeps its result: without this the host buffer would outlive the write
     t1 = time.time()
     t = ttnn.allocate_tensor_on_device(shard, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
     ttnn.copy_host_to_device_tensor(h, t)
@@ -327,24 +329,33 @@ def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, host=None):
     return t
 
 
-def host_shards(md, K, DEVBLK, shape, fill):
-    """upload's host side: the K shards as one multi-device host tensor and one shard's shape, ready for
-    copy_host_to_device_tensor (run_mesh --cases builds the next case's homes with it while the device runs this one).
-    The shards are slices of one zeroed buffer, which costs RAM only where fill writes, and ttnn borrows it: a shard
-    along dim 0 of a row-major buffer needs no copy (a from_torch without a mesh mapper always makes one, at ~1 GB/s).
-    One write of all shards also sidesteps copy_host_to_device_tensor into a get_device_tensors() view, which writes
-    EVERY device (ttnn 0.68: all 8 chips read back the last chip's data)."""
-    import torch
-    import ttnn
+def host_buffer(K, DEVBLK, shape, fill):
+    """The K shards of an array in one zeroed (K * rows, words) uint32 buffer, shard d filled by fill(DEVBLK[d], out)
+    on a thread of its own. The zeros cost RAM only where fill writes. numpy and file reads only: a launch builds its
+    arrays with this while ttnn loads and the mesh opens."""
     from concurrent.futures import ThreadPoolExecutor
     rows, words = shape
     buf = np.zeros((K * rows, words), np.uint32)
     with ThreadPoolExecutor(K) as ex:
         list(ex.map(lambda d: fill(DEVBLK[d], buf[d * rows:(d + 1) * rows]), range(K)))
+    return buf
+
+
+def host_shards(md, K, DEVBLK, shape, fill, buf=None):
+    """upload's host side: [the K shards as one multi-device host tensor, one shard's shape], ready for
+    copy_host_to_device_tensor (run_mesh --cases builds the next case's homes with it while the device runs this one).
+    The shards are slices of one buffer (buf, or host_buffer's) that ttnn borrows: a shard along dim 0 of a row-major
+    buffer needs no copy (a from_torch without a mesh mapper always makes one, at ~1 GB/s). One write of all shards
+    also sidesteps copy_host_to_device_tensor into a get_device_tensors() view, which writes EVERY device (ttnn 0.68:
+    all 8 chips read back the last chip's data). A list, so that upload can take the tensor out of a future's result
+    and the buffer is freed when the write is done."""
+    import torch
+    import ttnn
+    buf = host_buffer(K, DEVBLK, shape, fill) if buf is None else buf
     # tagged int32, not uint32: the same bytes, and the program reads the buffer as raw words either way
     h = ttnn.from_torch(torch.from_numpy(buf.view(np.int32)), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
                         mesh_mapper=ttnn.ShardTensorToMesh(md, dim=0))
-    return h, ttnn.Shape([rows, words])
+    return [h, ttnn.Shape([shape[0], shape[1]])]
 
 
 def download_chip(t, d):
