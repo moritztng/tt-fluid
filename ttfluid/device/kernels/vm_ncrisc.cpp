@@ -382,9 +382,25 @@ void kernel_main() {
     // one part's residue entries (lane << 16 | source lane) into out, a tight loop per source kind: an L1 source
     // directly, a DRAM-homed one a tile at a time through the gather cache (consecutive entries mostly share a tile).
     // Without the cache the values go through value()'s batch; the caller flushes
+#if defined(CFD_KIN_H) && !defined(CFD_TABSTREAM)
+#error "--knockin h doubles the tile loop of the table-stream GATHER (--tabstream)"
+#endif
+#ifdef CFD_KIN_X   // run_mesh --knockin x: every value patched into a stream page is copied CFD_KIN_X times (bitwise):
+                   // an L1 or halo section and the zero lanes by repeating their loop, a DRAM-homed run by repeating its
+                   // copy loops while its tile is the cached one (one lookup, so no second fetch: that is arm b).
+                   // GATHER ops copy once (arm h)
+#if !defined(CFD_TSORT) || !defined(CFD_TABSTREAM) || defined(CFD_BPATCH)
+#error "--knockin x: the reader must do every patch copy itself (--tsort 1 --tabstream, no --bpatch)"
+#endif
+    static_assert(NGC != 0, "--knockin x needs a gather cache");
+    uint32_t xrep = 1;
+#define XREP(x) for (uint32_t xr_ = 0; xr_ < xrep; ++xr_) { x; asm volatile("" ::: "memory"); }
+#else
+#define XREP(x) x
+#endif
     auto patch = [&](uint32_t d, const uint32_t* xs, uint32_t n, uint32_t* out) {
         if ((d >> 28) == 0) {
-            scatter(A + d * 1024, xs, n, out);
+            XREP(scatter(A + d * 1024, xs, n, out));
             return;
         }
 #ifdef CFD_TSORT
@@ -397,6 +413,11 @@ void kernel_main() {
                 value(d, xs[e] & XI, reinterpret_cast<volatile uint32_t*>(&dummy));
                 const uint32_t* cp = const_cast<const uint32_t*>(glp);
                 asm volatile("" ::: "memory");
+#ifdef CFD_KIN_X
+                const uint32_t ex = e;
+                for (uint32_t xr_ = 0; xr_ < xrep; ++xr_) {
+                    e = ex;
+#endif
                 for (; e + 4 <= n && (xs[e + 3] & XT) == tb; e += 4) {
                     const uint32_t x0 = xs[e], x1 = xs[e + 1], x2 = xs[e + 2], x3 = xs[e + 3];
                     const uint32_t v0 = cp[x0 & 1023], v1 = cp[x1 & 1023], v2 = cp[x2 & 1023], v3 = cp[x3 & 1023];
@@ -406,6 +427,10 @@ void kernel_main() {
                     out[x3 >> XS] = v3;
                 }
                 for (; e < n && (xs[e] & XT) == tb; ++e) out[xs[e] >> XS] = cp[xs[e] & 1023];
+#ifdef CFD_KIN_X
+                    asm volatile("" ::: "memory");
+                }
+#endif
             }
             asm volatile("" ::: "memory");
             return;
@@ -664,6 +689,9 @@ void kernel_main() {
                 break;
             case N_GATHER: {
                 ginv();
+#ifdef CFD_KIN_X
+                xrep = 1;
+#endif
                 const uint32_t nparts = (w >> 8) & 0xf;
 #ifdef CFD_TABSTREAM
                 {
@@ -694,6 +722,10 @@ void kernel_main() {
                         sp = sp_[t & 1], sn = sn_[t & 1];
                         if (t + 1 < tm) load_tile(q0, 2 * nparts + 1, t + 1, (t + 1) & 1, tm);
                         uint32_t* const dt = dst + WT * t;   // CFD_WIDE: entries carry the lane within tile t
+#ifdef CFD_KIN_H   // run_mesh --knockin h: this tile is gathered CFD_KIN_H times, by this core and by the threads it
+                   // shares the tile with (their jobs are posted again; same lanes, same values: bitwise)
+                        for (uint32_t hr_ = 0; hr_ < CFD_KIN_H && run; ++hr_) {
+#endif
 #ifdef CFD_BGTS
                         // BRISC scatters the upper (8 - CFD_BGTS) / 8 of every L1-source local and every halo section
                         // of this tile (vm_brisc.cpp bsvc, from inside its waits); this core does the rest and the
@@ -759,6 +791,11 @@ void kernel_main() {
 #ifdef CFD_TGTS
                         if (nt && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
 #endif
+#ifdef CFD_KIN_H
+                            asm volatile("" ::: "memory");
+                        }
+                        if (!run) break;
+#endif
 #ifdef CFD_GTILE
                         if (gowe + t + 1 >= gt && gowe && cb_pages_reservable_at_back(cb_nc, 1)) {
                             cb_reserve_back(cb_nc, 1);
@@ -821,6 +858,9 @@ void kernel_main() {
             }
             case N_STREAM: {
                 ginv();
+#ifdef CFD_KIN_X
+                xrep = CFD_KIN_X;
+#endif
                 // entries: src, shift << SS | (map + 1) << 4 | nparts (map + 1 = 0: no patch), then (part src, halo
                 // slot) per part
                 const uint32_t ne = N[pc] & 0xffff, tn = N[pc] >> 16 ? N[pc] >> 16 : NT;   // tn: pages per entry
@@ -911,9 +951,9 @@ void kernel_main() {
 #endif
                     for (uint32_t k = 0; k < hnp; ++k) {
                         patch(N[hp + 2 + 2 * k], sp[2 * k], sn[2 * k], const_cast<uint32_t*>(hpl));
-                        scatter(H + N[hp + 3 + 2 * k] * hmax, sp[2 * k + 1], sn[2 * k + 1], const_cast<uint32_t*>(hpl));
+                        XREP(scatter(H + N[hp + 3 + 2 * k] * hmax, sp[2 * k + 1], sn[2 * k + 1], const_cast<uint32_t*>(hpl)));
                     }
-                    for (uint32_t e = 0; e < sn[2 * hnp]; ++e) hpl[sp[2 * hnp][e]] = 0;
+                    XREP(for (uint32_t e = 0; e < sn[2 * hnp]; ++e) hpl[sp[2 * hnp][e]] = 0);
                     flush();
                     nvals += 1;
                     cb_push_back(cb_in, 1);
@@ -1052,7 +1092,7 @@ void kernel_main() {
                                 cyc[kk_] += t1_ - t0_, cnt[kk_] += sn[2 * k];
 #endif
                                 const uint32_t* h = hbuf(N[p + 3 + 2 * k]);
-                                scatter(h, sp[2 * k + 1], sn[2 * k + 1], const_cast<uint32_t*>(pl));
+                                XREP(scatter(h, sp[2 * k + 1], sn[2 * k + 1], const_cast<uint32_t*>(pl)));
 #ifdef CFD_PROF
                                 cyc[22] += get_timestamp_32b() - t1_, cnt[22] += sn[2 * k + 1];
 #endif
@@ -1060,7 +1100,7 @@ void kernel_main() {
 #ifdef CFD_PROF
                             const uint32_t tz_ = get_timestamp_32b();
 #endif
-                            for (uint32_t e = 0; e < sn[2 * np_]; ++e) pl[sp[2 * np_][e]] = 0;
+                            XREP(for (uint32_t e = 0; e < sn[2 * np_]; ++e) pl[sp[2 * np_][e]] = 0);
 #ifdef CFD_PROF
                             cyc[23] += get_timestamp_32b() - tz_, cnt[23] += sn[2 * np_];
 #endif
