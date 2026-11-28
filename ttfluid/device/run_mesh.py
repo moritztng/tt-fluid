@@ -381,6 +381,8 @@ else:
                 gateways={f"{x}->{y}" + (f".{k}" if a.gw > 1 else ""): g for (x, y, k), g in gw.items()}, shadow_kb=NSH * SHS * 4 / 1024,
                 gw_load={g: (v["gP"], v["gR"], len(v["rec"])) for g, v in gtab.items()},
                 cells_per_chip=[int(np.sum(m.lay.owner[prog.cells.name] // P == k)) for k in range(K)])
+    if E.tab_stream:
+        info["loc"] = list(E.tab_stream["loc"])   # for --bpatch auto on a run from the images
     print("plan", json.dumps(info), flush=True)
     if cb_bytes(E) > a.l1_bytes:   # images that cannot fit L1 fail only at launch, after the whole lowering: refuse them here
         msg = "CB bytes %d over --l1-bytes %d (halo %d B): more chips or a smaller case" % (cb_bytes(E), a.l1_bytes, E.m.hwords * 4)
@@ -542,9 +544,11 @@ GB = 1024 if 1024 + 32 * P <= 4000 else 4096   # vm_brisc.cpp gather slots: befo
 RB = 4096 if GB == 1024 else GB + 32 * P       # reduction broadcast
 E0 = RB + 2 * BW    # mesh words to E0 + 1616
 if a.bpatch is None or a.bpatch < 0:
-    lm = E.tab_stream.get("loc_mean", 0.0) if isinstance(getattr(E, "tab_stream", None), dict) else 0.0   # (images: pass --bpatch)
+    loc = E.tab_stream["loc"] if isinstance(E.tab_stream, dict) else None   # None: no streamed tables, or images lowered before they recorded it
+    lm = loc[0] / max(loc[1], 1) if loc else 0.0
     a.bpatch = 4 if lm >= a.bpatch_min else 0
-    print("--bpatch auto: %.1f local residue entries per patched map tile (min %.0f) -> %d" % (lm, a.bpatch_min, a.bpatch), flush=True)
+    print("--bpatch auto: %.1f local residue entries per patched map tile (min %.0f) -> %d" % (lm, a.bpatch_min, a.bpatch)
+          + (" (these images do not record the entries: lower again, or pass --bpatch 4)" if E.tab_stream and not loc else ""), flush=True)
 assert 0 <= a.bpatch < 8 and not (a.bpatch and not a.tabstream), "--bpatch K: 1..7 with --tabstream"
 assert 0 <= a.bgts < 8 and not (a.bgts and not a.tabstream), "--bgts K: 1..7 with --tabstream"
 assert not a.tsort or a.tabstream, "--tsort 1 needs --tabstream"

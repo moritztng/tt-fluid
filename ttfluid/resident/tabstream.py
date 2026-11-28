@@ -134,8 +134,9 @@ def stream(E, sort=False):
         l1.append(np.array(L, np.uint32))
         blob.append(np.array(B, np.uint32))
     loc = np.concatenate(loc) if loc else np.zeros(0)
-    # loc_mean: local residue entries per patched (map, tile), mean over cores (run_vm --bpatch auto)
-    return dict(sort=sort, loc_mean=float(loc.mean()) if len(loc) else 0.0, l1=l1, blob=blob, halo_off=halo_off, staging_words=staging, nparts=nparts,
+    # loc: local residue entries and the patched (map, tile)s they sit in, over these cores; run_mesh --bpatch auto
+    # tests their ratio. Two integers, so the chips of a per-chip lowering add up to the global lowering's pair.
+    return dict(sort=sort, loc=(int(loc.sum()), len(loc)), l1=l1, blob=blob, halo_off=halo_off, staging_words=staging, nparts=nparts,
                 l1_words=max(len(x) for x in l1), blob_words=max(len(x) for x in blob),
                 today_words=E.tab.shape[1])
 

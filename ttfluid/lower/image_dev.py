@@ -69,7 +69,8 @@ def setup(d, LOWER, K, P, R, C):
     tab_halo = np.concatenate([np.asarray(img.chip(k)["tab_halo"]) for k in range(K)])
     sizes = dict(sh["sizes"])
     c = sh["c"] if flags.get("n") == LOWER["n"] else set_outer(sh["c"], flags["n"], LOWER["n"])
-    E = SimpleNamespace(c=c, b=sh["b"], n=sh["n"], tab_stream=s["tab_stream"], loop_pages=s["loop_pages"],
+    # tab_stream as the encoding has it where run_mesh reads it: the local entry counts of --bpatch auto
+    E = SimpleNamespace(c=c, b=sh["b"], n=sh["n"], tab_stream=dict(loc=info["loc"]) if "loc" in info else s["tab_stream"], loop_pages=s["loop_pages"],
                         n_maxop=lambda: s["nmaxop"], sizes=lambda: sizes, out_names=list(sh["out_names"]),
                         tab_halo=tab_halo)
     gtab = {int(g): v for g, v in sh["gtab"].items()}
