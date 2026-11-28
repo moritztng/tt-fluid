@@ -9,11 +9,15 @@
 # ends the cell at 1.5x that, so a screen that thrashes cannot eat the cells after it. "auto" picks the next k from the two MPS cells before it: 8 (or 6) while packing still
 # pays and host RAM allows, else 3. The batch makespan (launch of the first case to exit of the last) is the number:
 # cases per GPU-hour = k x 3600 / makespan.
-# Usage: pack_plan.sh <work-dir> <deadline-seconds>    env CELLS ("1:off 2:mps 4:mps auto 2:off"), IT (800), GPU (0)
+# Usage: pack_plan.sh <work-dir> <deadline-seconds>    env CELLS ("1:off 2:mps 4:mps auto 2:off"), IT (800), GPUS ("0"), WRITE
+# GPUS="0 1 ... 7" fills a whole box: a cell then runs k cases on EACH listed GPU in one batch (cases _c0.. in GPU
+# order), so the makespan carries the shared host; per_case stays makespan / k, the per-GPU figure the price uses. One
+# MPS control daemon serves every GPU (NVIDIA: one per node). WRITE=1 has every case write its final fields (binary)
+# inside the wall, the counterpart of the state download a Tenstorrent run is charged.
 # Expects in <work-dir>: mbs_np1/ (the case), libspumaBoundFix_spdp.so, and the spumaS bundle unpacked under /opt.
 set -u
 W=$1; DL=$2; T0=$(date +%s); H=$(cd $(dirname $0) && pwd)
-IT=${IT:-800}; G=${GPU:-0}; CELLS=${CELLS:-1:off 2:mps 4:mps auto 2:off}
+IT=${IT:-800}; GS=${GPUS:-${GPU:-0}}; NG=$(echo $GS | wc -w); CELLS=${CELLS:-1:off 2:mps 4:mps auto 2:off}
 stamp() { echo "[$(date -u +%FT%TZ)] $*"; }
 left() { echo $(( DL - ($(date +%s) - T0) - 60 )); }
 ms() { awk -v t=$1 '$1=="CELL" && $2==t {print $3}' $W/cells.tsv | tail -1; }   # makespan of a finished cell, "" if none
@@ -23,7 +27,7 @@ lscpu | grep -E "Model name|^CPU\(s\)|Socket"; nproc; free -g | head -2
 : > $W/cells.tsv
 
 cell() {
-  local k=$1 mode=$2 var=${3:-} it=${4:-$IT} need=${5:-${NEED:-$(( 400 + 500 * $1 ))}} tag fvs L pool i pids=() ta tb
+  local k=$1 mode=$2 var=${3:-} it=${4:-$IT} need=${5:-${NEED:-$(( 400 + 500 * $1 ))}} tag fvs L pool g i j=0 pids=() ta tb
   [ "$var" = - ] && var=
   tag=P_${mode}_k$k${var:+_$var}; fvs=$H/fvSolution.spuma.mbs${var:+.$var}; [ $it != $IT ] && tag=${tag}_it$it
   L=$(left); [ $L -lt $need ] && { stamp "$tag skipped, ${L}s left, needs $need"; return; }
@@ -37,16 +41,16 @@ cell() {
     mkdir -p $CUDA_MPS_PIPE_DIRECTORY $CUDA_MPS_LOG_DIRECTORY
     nvidia-cuda-mps-control -d; stamp "$tag MPS daemon rc=$?"
   fi
-  stamp "$tag: $k cases x $it it, pool $pool GiB each, ${L}s left"
-  for i in $(seq 0 $((k-1))); do
-    R=$W/${tag}_c$i; rm -rf $R; mkdir -p $R; cp -al $W/mbs_np1/constant $W/mbs_np1/0 $R/; cp -r $W/mbs_np1/system $R/
-    CUDA_VISIBLE_DEVICES=$G SPUMA=spumaS BFX=$W/libspumaBoundFix_spdp.so timeout -s TERM $L \
-      bash $H/spuma_run.sh $R $it $pool $fvs 1 > $W/run_${tag}_c$i.out 2>&1 &
-    pids+=($!)
-  done
+  stamp "$tag: $k cases x $it it on GPU $GS, pool $pool GiB each, ${L}s left"
+  for g in $GS; do for i in $(seq 1 $k); do
+    R=$W/${tag}_c$j; rm -rf $R; mkdir -p $R; cp -al $W/mbs_np1/constant $W/mbs_np1/0 $R/; cp -r $W/mbs_np1/system $R/
+    CUDA_VISIBLE_DEVICES=$g SPUMA=spumaS BFX=$W/libspumaBoundFix_spdp.so timeout -s TERM $L \
+      bash $H/spuma_run.sh $R $it $pool $fvs 1 ${WRITE:+$it} > $W/run_${tag}_c$j.out 2>&1 &
+    pids+=($!); j=$((j+1))
+  done; done
   ta=$(date +%s.%N)
   echo 0 > $W/rss_$tag.txt
-  nvidia-smi -i $G --query-gpu=timestamp,power.draw,clocks.sm,clocks.mem,utilization.gpu,memory.used --format=csv,noheader \
+  nvidia-smi -i ${GS// /,} --query-gpu=timestamp,power.draw,clocks.sm,clocks.mem,utilization.gpu,memory.used --format=csv,noheader \
     -lms 1000 > $W/gpu_$tag.csv &
   local smi=$!
   # host RAM high-water of all solver processes, and one mid-run look at who is on the GPU (MPS clients show as M+C)
@@ -58,11 +62,11 @@ cell() {
   wait "${pids[@]}"; tb=$(date +%s.%N)
   kill $smi $rss $look 2>/dev/null
   [ $mode = mps ] && { echo quit | nvidia-cuda-mps-control; stamp "$tag MPS stopped"; }
-  python3 - $W $tag $k $ta $tb $it <<'EOF' | tee -a $W/cells.tsv
+  python3 - $W $tag $k $ta $tb $it $NG <<'EOF' | tee -a $W/cells.tsv
 import glob, re, statistics as st, sys
-W, tag, k, ta, tb, IT = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]), int(sys.argv[6])
+W, tag, k, ta, tb, IT, NG = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7])
 its, clock = [], []
-for c in sorted(glob.glob(f"{W}/{tag}_c*")):
+for c in sorted(glob.glob(f"{W}/{tag}_c*"), key=lambda c: int(c.rsplit("_c", 1)[1])):
     log = open(f"{c}/log.simpleFoam", errors="replace").read()
     its.append(len(re.findall(r"^Time = ", log, re.M)))
     m = re.findall(r"ClockTime = (\d+) s", log); clock.append(int(m[-1]) if m else 0)
@@ -71,13 +75,13 @@ num = lambda s: float(s.split()[0])
 p, sm, u, mem = ([num(r[i]) for r in rows] for i in (1, 2, 4, 5))
 busy = [x for x, y in zip(p, u) if y >= 50] or [0]
 srt = sorted(sm)
-print("CELL", tag, f"{tb-ta:.1f}", f"per_case={(tb-ta)/k:.1f}", f"ok={sum(i == IT for i in its)}/{k}", "its=" + ",".join(map(str, its)),
+print("CELL", tag, f"{tb-ta:.1f}", f"per_case={(tb-ta)/k:.1f}", f"ok={sum(i == IT for i in its)}/{k * NG}", f"gpus={NG}", "its=" + ",".join(map(str, its)),
       "clock=" + ",".join(map(str, clock)), f"power_mean={st.mean(p):.1f}W", f"power_busy={st.mean(busy):.1f}W",
       f"util_mean={st.mean(u):.1f}%", f"sm_median={srt[len(srt)//2]:.0f}MHz", f"sm_at_max={100*sum(x >= max(sm) for x in sm)/len(sm):.0f}%",
       f"gpu_mem_max={max(mem):.0f}MiB", f"host_rss_max={open(f'{W}/rss_{tag}.txt').read().strip()}MiB")
 EOF
   cat $W/${tag}_c*/summary.txt
-  for i in $(seq 0 $((k-1))); do rm -rf $W/${tag}_c$i/[1-9]* $W/${tag}_c$i/constant $W/${tag}_c$i/0; done   # keep logs and postProcessing
+  for R in $W/${tag}_c[0-9]*; do rm -rf $R/[1-9]* $R/constant $R/0; done   # keep logs and postProcessing
 }
 
 for c in $CELLS; do
