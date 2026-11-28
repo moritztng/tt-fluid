@@ -163,15 +163,16 @@ def carry_arena(img, k, P, a_out):
     return ar
 
 
-def upload(md, K, DEVBLK, shape, fill, name=None):
+def upload(md, K, DEVBLK, shape, fill, name=None, host=None):
     """A (K * rows, words) uint32 mesh tensor whose device d holds the array fill(DEVBLK[d], out) writes into its zeroed
-    (rows, words) buffer out, all shards written in one copy. With CFD_UPLOAD_PROFILE set and a name, prints where the
-    upload's wall clock went: building the host buffer (image read, state overlay) against the write to the chips,
-    which is synchronized so the split is the device's."""
+    (rows, words) buffer out, all shards written in one copy. host: a future of host_shards(...) for this array, built
+    ahead while another array was written. With CFD_UPLOAD_PROFILE set and a name, prints where the upload's wall clock
+    went: waiting for the host buffer (image read, state overlay) against the write to the chips, which is
+    synchronized so the split is the device's."""
     import ttnn
     prof = name and os.environ.get("CFD_UPLOAD_PROFILE")
     t0 = time.time()
-    h, shard = host_shards(md, K, DEVBLK, shape, fill)
+    h, shard = host.result() if host is not None else host_shards(md, K, DEVBLK, shape, fill)
     t1 = time.time()
     t = ttnn.allocate_tensor_on_device(shard, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
     ttnn.copy_host_to_device_tensor(h, t)

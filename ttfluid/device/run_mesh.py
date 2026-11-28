@@ -10,6 +10,7 @@ Options as run_vm.py, plus --mesh R,C (the chips' mesh; K = R * C partition bloc
 neighbouring blocks are neighbouring chips).
 """
 import argparse, collections, json, os, pickle, re, sys, threading, time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -604,8 +605,18 @@ elif IMG is not None:   # chip by chip: chip k's arrays are built from its image
         print("state from %s" % a.state_in, flush=True)
         stamp("state read")
     filled = lambda name: (image_dev.chip_shape(IMG, P, name), lambda k, out: image_dev.chip_fill(IMG, k, P, name, out, STATE))
-    up = lambda name: image_dev.upload(md, K, DEVBLK, *filled(name), name)
-    t_arena, t_const, t_home, t_blob = up("arena"), up("consts"), up("home"), up("blob")
+    # an array's host tensor is built while the array before it is written to the chips
+    ahead = ThreadPoolExecutor(1)
+    pre = lambda name: ahead.submit(image_dev.host_shards, md, K, DEVBLK, *filled(name))
+    up = lambda name, host=None: image_dev.upload(md, K, DEVBLK, *filled(name), name, host)
+    h_const = pre("consts")
+    t_arena = up("arena")
+    h_home = pre("home")
+    t_const = up("consts", h_const)
+    h_blob = pre("blob")
+    t_home = up("home", h_home)
+    t_blob = up("blob", h_blob)
+    ahead.shutdown()
     t_tab = image_dev.upload(md, K, DEVBLK, (P, L), lambda k, out: np.copyto(out, chip_tab(k)), "tab")
     stamp("images uploaded (arena, consts, home, blob, tab)")
     t_c, t_b, t_n = (to_dev(np.tile(code[k], (K, 1))) for k in "cbn")
