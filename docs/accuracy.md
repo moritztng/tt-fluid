@@ -101,8 +101,8 @@ rule gives 8.2.
 
 The rule stops holding on longer windows of one run. The long tt-fluid histories on record (a 5,000-iteration run on a
 Wormhole Galaxy, 3,000 on four p150a cards, 1,900 on QuietBox 2) give seven windows of 1,100 to 1,900 iterations, and
-their means spread 10.5 counts where independent blocks would give 5. The Galaxy run reads +6.5 counts on 201-1800 and
--16.0 on 1801-3400. So the tool counts one run as 600 iterations at most, however long its window, and the 12.5 bar is
+their means spread 10.5 counts where independent blocks would give 5. The Wormhole Galaxy run reads +6.5 counts on
+201-1800 and -16.0 on 1801-3400. So the tool counts one run as 600 iterations at most, however long its window, and the 12.5 bar is
 reached by pooling runs (below), not by running one of them longer.
 
 | graded | band, counts | a bias this large fails 9 times in 10 |
@@ -123,7 +123,8 @@ Three choices behind it:
 
 With `--base` the tool also reports the shift against a baseline run over the same window. Two correct runs that differ
 only in the order of their floating-point sums sit 11.5 counts apart (one standard deviation) on 201-800: the 28 pairs
-of identical SPUMA SPDP runs measure 16.1, the 28 double-precision pairs 8.8. A shift inside twice that is no change; about 1 pair in 20 of correct runs lies outside.
+of identical SPUMA SPDP runs measure 16.1, the 28 double-precision pairs 8.8. A shift inside twice that is no change;
+about 1 pair in 20 of correct runs lies outside.
 
 A change that only reorders the same arithmetic (another partition, another gather or reduction order) has a sharper
 check, printed with `--base` when both runs start from the same state. Such runs still track each other through
@@ -163,7 +164,7 @@ What the runs in `results/` grade as:
 One failure in 18 correct runs is what a two-sigma band gives. The three tt-fluid runs are one fp32 program on three
 partitions of the mesh (`results/tenstorrent/galaxy-blackhole/runs.status` has chips, commit, clock and final state of
 the Galaxy legs). They track each other to 0.5 counts through iteration 10 and then separate like any two runs. Taken
-alone, the first 600 iterations of the QuietBox 2 run read -22.8, outside the band; the pool reads -6.0 +- 8.4. The run
+alone, iterations 201-800 of the QuietBox 2 run read -22.8, outside the band; the pool reads -6.0 +- 8.4. The run
 means spread 7.7 counts where the rule gives 5.0, so the pool carries its own wider band, and with three runs it is a
 screen. A grade of record at 12.5 needs a fourth run.
 
