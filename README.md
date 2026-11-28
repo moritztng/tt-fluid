@@ -12,7 +12,7 @@ device closely but not bit for bit.
 On the OpenFOAM HPC benchmark's motorbike case (HPC_motorbike Small: 8.66 M cells, 800 SIMPLE iterations), a $9,999 Tenstorrent QuietBox 2
 costs **$0.115 per case**. An 8x H100 SXM server running the GPU port of OpenFOAM (SPUMA) at its cheapest documented
 price costs $0.270 per case with one case per GPU, $0.119 with four cases per GPU under NVIDIA MPS and **$0.096 with
-eight: a GPU packed with cases is cheaper per case than the QuietBox 2 today, by 1.2x.** Mean drag over seven runs on a Blackhole Galaxy is 3 drag counts (0.1 %) below OpenFOAM's
+eight: a GPU packed with cases is cheaper per case than the QuietBox 2 today, by 1.2x.** Mean drag over eight runs on a Blackhole Galaxy is 6 drag counts (0.1 %) below OpenFOAM's
 fp64 CPU result, against a bar of 12.5; nine SPUMA runs average 8 counts above it.
 
 > **Status, 2026-11-28.** The packed-GPU numbers are new. They were measured on one H100 SXM, priced as one eighth of
@@ -64,7 +64,7 @@ start. One run is a screen with a band of 17.8 counts. The bar is 12.5 counts on
 
 | runs | Cd vs OpenFOAM fp64, counts | grade |
 |---|---|---|
-| tt-fluid fp32, 7 runs on one Blackhole Galaxy (4 chips each) | -17.8 to +7.0; pooled -3.3 +- 4.9 | pass, band 12.5 |
+| tt-fluid fp32, 8 runs on one Blackhole Galaxy (4 chips each) | -21.6 to +10.2; pooled -5.7 +- 4.9 | pass, band 12.5 |
 | SPUMA SPDP, 9 runs (8 on H100, 1 on B200) | -12.6 to +27.0; pooled +8.4 +- 5.0 | pass, band 12.5 |
 
 **occDrivAer.** The coarse occDrivAer car (1.6 M cells, [cases/occDrivAer](cases/occDrivAer)) ran iterations 1-3999 on

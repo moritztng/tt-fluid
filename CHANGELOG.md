@@ -31,7 +31,9 @@ All notable changes to this project are documented here. The format follows
   (1e-15). In fp32 it is now floored at 1e-6, the value OpenFOAM's own single-precision build uses; `omegaMin` and
   `kMin` in the RAS dictionary override the defaults. The new floor moves the rounding of every fp32 run from its
   first iterations, so earlier final states are not reproduced bit for bit
-  ([accuracy](docs/accuracy.md#a-known-behaviour-of-the-case)).
+  ([accuracy](docs/accuracy.md#a-known-behaviour-of-the-case)). Eight runs on the new floor, the start that went NaN
+  included, all end and pool to -5.7 +- 4.9 drag counts against OpenFOAM fp64 (bar 12.5); seven runs on the old floor
+  read -3.3 +- 4.9.
 - PBiCGStab's breakdown test compared against 1e-300, which is zero in fp32, so it could never stop a solve. It now
   uses the smallest magnitude of the precision.
 
