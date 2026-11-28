@@ -18,7 +18,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--node", required=True, help="sysfs node of the visible chip")
 ap.add_argument("--aiclk-log", required=True)
 ap.add_argument("--out", default="roof_dm.jsonl")
-ap.add_argument("--only", default="scalar,noc,dram,ping")
+ap.add_argument("--only", default="scalar,noc,dram,mix,ping")
 ap.add_argument("--break-arm", type=int, default=0)
 a = ap.parse_args()
 
@@ -26,7 +26,7 @@ import torch  # noqa: E402
 import ttnn  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-TB, NX, NI, NR, M, SW = 4096, 16, 8, 16, 16384, 65536
+TB, NX, NI, NR, M, SW, WP = 4096, 16, 8, 16, 16384, 65536, 256
 dev = ttnn.open_device(device_id=0)
 dev.disable_and_clear_program_cache()   # every launch changes runtime arguments; the kernel binaries stay cached on disk
 g = dev.compute_with_storage_grid_size()
@@ -49,7 +49,8 @@ inp[:, :NX * 1024] = X
 inp[:, NX * 1024:NX * 1024 + M // 2] = perm.view(np.uint32)
 t_in, t_str = to_dev(inp), to_dev(STR)
 t_out = to_dev(np.zeros((nc, (1 + NR) * 1024), np.uint32))
-acc = [x for t in (t_in, t_out, t_str) for x in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+t_wr = to_dev(np.zeros((nc, WP * 1024), np.uint32))   # op 9's store row, 1 MB a core
+acc = [x for t in (t_in, t_out, t_str, t_wr) for x in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
 
 
 def clock(t0, t1):
@@ -57,7 +58,7 @@ def clock(t0, t1):
     return dict(min=min(v, default=None), max=max(v, default=None), n=len(v))
 
 
-def launch(cores, op, reps, nbytes, nb, mask, peers=None):
+def launch(cores, op, reps, nbytes, nb, mask, peers=None, mix=0):
     """One program on `cores`; returns (ticks[core, role], R[core, words], t0, t1)."""
     grid = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in cores])
     cbs = [ttnn.CBDescriptor(total_size=n * TB, core_ranges=grid, format_descriptors=[
@@ -75,7 +76,8 @@ def launch(cores, op, reps, nbytes, nb, mask, peers=None):
         k = ttnn.KernelDescriptor(kernel_source=str(HERE / "roof_dm.cpp"), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                                   core_ranges=grid, compile_time_args=[role, 0, 1, SW] + acc, config=cfg)
         k.runtime_args = rt
-        k.common_runtime_args = [t_in.buffer_address(), t_out.buffer_address(), t_str.buffer_address(), op, reps, nbytes, nb, mask]
+        k.common_runtime_args = [t_in.buffer_address(), t_out.buffer_address(), t_str.buffer_address(), op, reps, nbytes, nb, mask,
+                                 t_wr.buffer_address(), mix]
         k.defines = [("ROOF_BREAK", str(a.break_arm))]
         ks.append(k)
     t0 = time.time()
@@ -91,7 +93,7 @@ def launch(cores, op, reps, nbytes, nb, mask, peers=None):
     return h[:, :, 0].astype(np.int64), o[idx, 1024:], t0, t1
 
 
-def expect(cores, op, reps, nbytes, nb, mask, peers):
+def expect(cores, op, reps, nbytes, nb, mask, peers, mix=0):
     """R as numpy says it must be."""
     R = np.zeros((len(cores), NR * 1024), np.uint32)
     for i, c in enumerate(cores):
@@ -112,33 +114,52 @@ def expect(cores, op, reps, nbytes, nb, mask, peers):
                 npg = SW * 4 // nbytes
                 for n in range(max(0, reps - nb), reps):
                     R[i, role * 8192 + (n % nb) * w:role * 8192 + (n % nb + 1) * w] = STR[ci, (n % npg) * w:(n % npg + 1) * w]
+            elif op == 9:
+                npg, nr = SW * 4 // nbytes, reps // 16 * (mix >> (16 - 8 * role) & 255)
+                for n in range(max(0, nr - nb), nr):
+                    R[i, role * 8192 + (n % nb) * w:role * 8192 + (n % nb + 1) * w] = STR[ci, (n % npg) * w:(n % npg + 1) * w]
             elif op == 8:
                 pi = ALL.index(peers[i])
                 R[i, role * 8192:role * 8192 + w] = X[pi, role * 8192:role * 8192 + w]
     return R
 
 
+def stores_ok(cores, reps, nbytes, mix):
+    """Op 9: every page NCRISC reports stored is in the DRAM store row, with this launch's stamp."""
+    w, nw = nbytes // 4, reps // 16 * (mix & 255)
+    o = ttnn.to_torch(t_wr).numpy().view(np.uint32).reshape(nc, -1)
+    for c in cores:
+        ci = ALL.index(c)
+        page = X[ci, 8192:8192 + w].copy()
+        page[:2] = reps, mix
+        if nw and not (o[ci, :nw * w].reshape(nw, w) == page).all():
+            return False
+    return True
+
+
 rows, bad = [], 0
 
 
-def cell(name, cores, op, r1, r2, nbytes=0, nb=1, mask=1, peers=None, unit=1, **kw):
+def cell(name, cores, op, r1, r2, nbytes=0, nb=1, mask=1, peers=None, unit=1, mix=0, **kw):
     """Cost per unit = (ticks at r2 - ticks at r1) / (r2 - r1) / unit, median and worst over cores and active RISCs."""
     global bad
-    launch(cores, op, r1, nbytes, nb, mask, peers)                       # JIT and warm
-    ta, _, _, _ = launch(cores, op, r1, nbytes, nb, mask, peers)
-    tb, R, t0, t1 = launch(cores, op, r2, nbytes, nb, mask, peers)
-    tc, _, _, t1 = launch(cores, op, r2, nbytes, nb, mask, peers)
-    ok = bool(np.array_equal(R, expect(cores, op, r2, nbytes, nb, mask, peers)))
+    launch(cores, op, r1, nbytes, nb, mask, peers, mix)                  # JIT and warm
+    ta, _, _, _ = launch(cores, op, r1, nbytes, nb, mask, peers, mix)
+    tb, R, t0, t1 = launch(cores, op, r2, nbytes, nb, mask, peers, mix)
+    ok = bool(np.array_equal(R, expect(cores, op, r2, nbytes, nb, mask, peers, mix))) and (op != 9 or stores_ok(cores, r2, nbytes, mix))
+    tc, _, _, t1 = launch(cores, op, r2, nbytes, nb, mask, peers, mix)
     bad += not ok
     act = [r for r in (0, 1) if mask >> r & 1]
     if op == 8:
         act, tb, tc, ta = act[:1], tb[:1], tc[:1], ta[:1]                # the ping side holds the round trip
+    if op == 9:   # the job is REPS pages a core and ends with the slower of its two RISC-Vs
+        ta, tb, tc, act = ta.max(1, keepdims=True), tb.max(1, keepdims=True), tc.max(1, keepdims=True), [0]
     per = (tb[:, act] - ta[:, act]) / (r2 - r1) / unit
     per2 = (tc[:, act] - ta[:, act]) / (r2 - r1) / unit
     row = dict(probe="roof_dm", cell=name, op=op, cores=len(cores), mask=mask, bytes=nbytes, nb=nb, reps=[r1, r2],
                cyc=round(float(np.median(per)), 3), cyc_worst_core=round(float(per.max()), 3), cyc_run2=round(float(np.median(per2)), 3),
                check="PASS" if ok else "FAIL", aiclk=clock(t0, t1), node=a.node, chip=os.environ.get("TT_VISIBLE_DEVICES"), grid=[g.x, g.y], **kw)
-    if op == 7:   # chip rate from the slowest core, at the clock of the row
+    if op in (7, 9):   # chip rate from the slowest core, at the clock of the row
         mhz = row["aiclk"]["min"] or 1350
         row["GBs_chip"] = round(len(cores) * len(act) * nbytes * (r2 - r1) / ((tb[:, act] - ta[:, act]).max() / (mhz * 1e6)) / 1e9, 1)
         row["cyc_per_4k"] = round(row["cyc"] * 4096 / nbytes, 1)
@@ -165,6 +186,11 @@ try:
                 for nb in nbs:
                     for mask in (1, 2, 3):
                         cell(f"DRAM read stream, {cn}", cores, 7, 64, 2112, nbytes=nbytes, nb=nb, mask=mask)
+    if "mix" in want:   # one job of pages a core, split between the two RISC-Vs (BRISC on NoC 0, NCRISC on NoC 1)
+        for a0, a1, w, nm in ((16, 0, 0, "reads on NoC 0"), (10, 6, 0, "reads on both"), (13, 0, 3, "reads on NoC 0, stores on NoC 1"),
+                              (10, 3, 3, "reads on both, stores on NoC 1"), (8, 5, 3, "reads on both, stores on NoC 1")):
+            for nb in (1, 8):
+                cell(f"DRAM mixed job {a0}/{a1}/{w}: {nm}", ALL, 9, 64, 1088, nbytes=4096, nb=nb, mask=3, mix=a0 << 16 | a1 << 8 | w, split=[a0, a1, w])
     if "ping" in want:
         far = (g.x - 1, g.y - 1)
         for peer, pn in (((1, 0), "1 hop x"), ((0, 1), "1 hop y"), (far, "far corner")):

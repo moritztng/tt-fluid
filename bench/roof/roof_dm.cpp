@@ -8,6 +8,8 @@
 //   6 NoC write of BYTES to its own L1, a barrier after each
 //   7 DRAM read stream: pages of BYTES from this core's DRAM row into an NB-slot ring, one transaction id per slot
 //   8 ping-pong with a peer core: write BYTES into the peer's R, raise its semaphore, wait for the answer
+//   9 mixed DRAM job of REPS pages a core, split by MIX = A0 << 16 | A1 << 8 | W sixteenths: BRISC reads A0, NCRISC
+//     reads A1 (stream row into the ring, as op 7) and stores W (its half of X, stamped REPS and MIX, to the store row)
 // Header page (cb_h), words role * 8 + {0: ticks of the timed loop, 1: 0xC0DE0000 | op, 2: REPS, 3: BYTES as the kernel
 // saw them}. BRISC writes header + R back. ROOF_BREAK 1 makes every op do less than it reports: the host check must fail.
 #include "api/dataflow/dataflow_api.h"
@@ -28,6 +30,10 @@ void kernel_main() {
     const auto in = TensorAccessor(in_args, get_common_arg_val<uint32_t>(0), (NX + NI) * TB);
     const auto out = TensorAccessor(out_args, get_common_arg_val<uint32_t>(1), (1 + NR) * TB);
     const auto str = TensorAccessor(str_args, get_common_arg_val<uint32_t>(2), SW * 4);
+    constexpr auto wr_args = TensorAccessorArgs<str_args.next_compile_time_args_offset()>();
+    constexpr uint32_t WP = 256;                               // 4 KB pages of this core's DRAM store row
+    const auto wr = TensorAccessor(wr_args, get_common_arg_val<uint32_t>(8), WP * TB);
+    const uint32_t MIX = get_common_arg_val<uint32_t>(9);
     const uint32_t base = get_write_ptr(cb_a);
     const uint32_t* __restrict x = reinterpret_cast<const uint32_t*>(base);
     const uint16_t* __restrict id = reinterpret_cast<const uint16_t*>(base + NX * TB);
@@ -107,6 +113,30 @@ void kernel_main() {
             noc_async_read(row + ((i + ROOF_BREAK) % npg) * BYTES, mine + slot * BYTES, BYTES);
         }
         noc_async_read_barrier();
+        t1 = get_timestamp_32b();
+        noc_async_read_set_trid(0);
+    } else if (on && OP == 9) {
+        const uint32_t w16 = role ? MIX & 255 : 0;
+        const uint32_t nr = REPS / 16 * (MIX >> (16 - 8 * role) & 255), nw = w16 ? REPS / 16 * w16 - ROOF_BREAK : 0;
+        const uint64_t row = str.get_noc_addr(core), wrow = wr.get_noc_addr(core);
+        const uint32_t npg = SW * 4 / BYTES, src = base + role * 8 * TB;
+        if (nw) { uint32_t* st = reinterpret_cast<uint32_t*>(src); st[0] = REPS; st[1] = MIX; }
+        uint32_t ir = 0, iw = 0, due = 0;
+        t0 = get_timestamp_32b();
+        for (uint32_t i = 0; i < nr + nw; ++i) {       // stores spread evenly among the reads
+            due += nw;
+            if (due >= nr + nw) {
+                due -= nr + nw;
+                noc_async_write(src, wrow + iw++ * BYTES, BYTES);
+            } else {
+                const uint32_t slot = ir % NB, trid = slot + 1;
+                if (ir >= NB) noc_async_read_barrier_with_trid(trid);
+                noc_async_read_set_trid(trid);
+                noc_async_read(row + ((ir++ + ROOF_BREAK) % npg) * BYTES, mine + slot * BYTES, BYTES);
+            }
+        }
+        noc_async_read_barrier();
+        noc_async_write_barrier();
         t1 = get_timestamp_32b();
         noc_async_read_set_trid(0);
     } else if (on && OP == 8) {
