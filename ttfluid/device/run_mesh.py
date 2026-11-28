@@ -133,7 +133,7 @@ ap.add_argument("--stop", type=int, default=0, help="bisect a hang: every core a
 for k, h in [("jointred", "krylov.JOINT + Machine(joint_red=True)"), ("cg1", "krylov.CG1"), ("fold1", "Machine(fold1=True)"),
              ("fusepart", "Machine(fusepart=True)"), ("gsplit", "Machine(gsplit=True)"), ("wplace", "Machine(wplace=True)"),
              ("bcast", "Machine(bcast_run=True)"), ("bgather", "Machine(bgather=True)"), ("bscal", "Machine(bscal=True)"),
-             ("bjoint", "krylov.BJOINT (pair with --jointred 1)"), ("cse", "Machine(cse_ir=True): value numbering over the traced IR, bit-exact"), ("narrow", "bf16 in-place DRAM constants (Machine(narrow=True), C_LDRH)")]:
+             ("bjoint", "krylov.BJOINT (pair with --jointred 1)"), ("cse", "Machine(cse_ir=1..4): value numbering over traced IR (1 basic, 2 content-id index arrays, 3 CFG/dominator-aware, 4 + pull_gather through ew DAGs), bit-exact"), ("narrow", "bf16 in-place DRAM constants (Machine(narrow=True), C_LDRH)")]:
     ap.add_argument("--" + k, type=int, default=0, help="as run_vm.py: " + h)
 ap.add_argument("--gtile", type=int, default=0, help="1 (with --tabstream): a gather whose next sync hands it to a tile loop that reads it "
                 "plainly posts one token per finished tile and compute waits once per pass, so the loop starts on tile 0 "

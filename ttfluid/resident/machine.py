@@ -287,62 +287,359 @@ def _acid(a):
     return (a.dtype.str, a.shape, hashlib.sha1(np.ascontiguousarray(a).tobytes()).digest())
 
 
-def cse(code, content=False):
+def _cfg_dom(code):
+    """Basic blocks, reachable set, dominator-tree children, and per-block kill sets.
+    kill_at[b]: registers defined on any path from the end of idom[b] to the start of b without revisiting idom[b]."""
+    targets = {ins[-1] for ins in code if ins[0] in ("jump", "jumpif")}
+    blocks, cur = [], []
+    for ins in code:
+        if ins[0] == "label" and ins[1] in targets and cur:
+            blocks.append(cur)
+            cur = []
+        cur.append(ins)
+        if ins[0] in ("jump", "jumpif"):
+            blocks.append(cur)
+            cur = []
+    if cur:
+        blocks.append(cur)
+    nb = len(blocks)
+    lbl_blk = {ins[1]: b for b, blk in enumerate(blocks) for ins in blk if ins[0] == "label"}
+    succ = [[] for _ in range(nb)]
+    pred = [[] for _ in range(nb)]
+    for b, blk in enumerate(blocks):
+        last = blk[-1]
+        if last[0] == "jump":
+            ss = [lbl_blk[last[1]]]
+        elif last[0] == "jumpif":
+            ss = ([b + 1] if b + 1 < nb else []) + [lbl_blk[last[2]]]
+        else:
+            ss = [b + 1] if b + 1 < nb else []
+        for s in dict.fromkeys(ss):
+            succ[b].append(s)
+            pred[s].append(b)
+    reach, stk = set(), [0] if nb else []
+    while stk:
+        b = stk.pop()
+        if b not in reach:
+            reach.add(b)
+            stk.extend(succ[b])
+    dom = {0: {0}} if nb else {}
+    for b in reach:
+        if b != 0:
+            dom[b] = set(reach)
+    changed = True
+    while changed:
+        changed = False
+        for b in sorted(reach):
+            if b == 0:
+                continue
+            ps = [p for p in pred[b] if p in reach]
+            nd = {b} | (set.intersection(*(dom[p] for p in ps)) if ps else set())
+            if nd != dom[b]:
+                dom[b] = nd
+                changed = True
+    children = defaultdict(list)
+    idom = {}
+    for b in sorted(reach):
+        if b == 0:
+            continue
+        need = len(dom[b]) - 1
+        p = next(d for d in dom[b] if d != b and len(dom[d]) == need)
+        idom[b] = p
+        children[p].append(b)
+    b_defs = [{d for ins in blk for d in _uses_defs(ins)[1]} for blk in blocks]
+    kill_at = {0: set()}
+    for b in reach:
+        if b == 0:
+            continue
+        p = idom[b]
+        seen = set()
+        q = [x for x in pred[b] if x in reach and x != p]
+        while q:
+            u = q.pop()
+            if u in seen or u == p:
+                continue
+            seen.add(u)
+            for x in pred[u]:
+                if x in reach and x != p and x not in seen:
+                    q.append(x)
+        k = set()
+        for u in seen:
+            k |= b_defs[u]
+        kill_at[b] = k
+    return blocks, reach, children, kill_at
+
+
+def cse(code, content=False, cfg=False):
     """Value numbering: an ew / gather / bsum / reduce that repeats an earlier one (same op on the same registers) is
     dropped and its uses read the earlier result. Same operations on the same values, so bit-exact; what goes is the
     trace's recomputation (grad U built three times in the momentum phase, interp of one field per caller, ...).
     Only single-definition registers take part as results. A copy into a register forgets every entry that reads it;
-    a jump target forgets everything (a value from before a loop head or a merge may not hold on every path)."""
+    with cfg=False a jump target forgets everything, with cfg=True (--cse 3) dominator-tree value numbering forgets
+    only entries whose result or operands are written on a path from idom(b) to b (keeping p, k, U[1..2], grad(p),
+    grad(k) live across Krylov solves that do not touch them)."""
     aid = _acid if content else _aid     # content: equal index arrays match whatever object holds them (--cse 2)
     defs = Counter(d for ins in code for d in _uses_defs(ins)[1])
-    targets = {ins[-1] for ins in code if ins[0] in ("jump", "jumpif")}
-    memo, readers, ren, out = {}, defaultdict(list), {}, []
-    rn = lambda r: ren.get(r, r)
-    for ins in code:
-        op = ins[0]
-        if op == "label" and ins[1] in targets:
-            memo.clear()
-            readers.clear()
-        if op == "ew":
-            ins = ins[:3] + tuple(rn(a) for a in ins[3:])
-            args = ins[3:]
-            key = ("ew", ins[2]) + (tuple(sorted(args)) if ins[2] in ("add", "mul") else args)
-        elif op == "gather":
-            ins = ("gather", ins[1], [(rn(s), c, p) for s, c, p in ins[2]])
-            args = tuple(s for s, _, _ in ins[2])
-            key = ("gather",) + tuple((s, aid(c), aid(p)) for s, c, p in ins[2])
-        elif op == "bsum":
-            ins, args = ("bsum", ins[1], rn(ins[2])), (rn(ins[2]),)
-            key = ("bsum",) + args
-        elif op == "reduce":
-            ins, args = ("reduce", ins[1], ins[2], rn(ins[3])), (rn(ins[3]),)
-            key = ("reduce", ins[2]) + args
-        else:
-            if op == "copy":
-                ins = ("copy", ins[1], rn(ins[2]))
-                for k in readers.pop(ins[1], ()):
-                    memo.pop(k, None)
-                for k in [k for k, v in memo.items() if v == ins[1]]:
-                    del memo[k]
-            elif op == "jumpif":
-                ins = ("jumpif", rn(ins[1]), ins[2])
-            elif op == "out":
-                ins = ("out", ins[1], rn(ins[2]))
-            elif op == "keep":
-                ins = ("keep", sorted({rn(r) for r in ins[1]}))
+    if not cfg:
+        targets = {ins[-1] for ins in code if ins[0] in ("jump", "jumpif")}
+        memo, readers, ren, out = {}, defaultdict(list), {}, []
+        rn = lambda r: ren.get(r, r)
+        for ins in code:
+            op = ins[0]
+            if op == "label" and ins[1] in targets:
+                memo.clear()
+                readers.clear()
+            if op == "ew":
+                ins = ins[:3] + tuple(rn(a) for a in ins[3:])
+                args = ins[3:]
+                key = ("ew", ins[2]) + (tuple(sorted(args)) if ins[2] in ("add", "mul") else args)
+            elif op == "gather":
+                ins = ("gather", ins[1], [(rn(s), c, p) for s, c, p in ins[2]])
+                args = tuple(s for s, _, _ in ins[2])
+                key = ("gather",) + tuple((s, aid(c), aid(p)) for s, c, p in ins[2])
+            elif op == "bsum":
+                ins, args = ("bsum", ins[1], rn(ins[2])), (rn(ins[2]),)
+                key = ("bsum",) + args
+            elif op == "reduce":
+                ins, args = ("reduce", ins[1], ins[2], rn(ins[3])), (rn(ins[3]),)
+                key = ("reduce", ins[2]) + args
+            else:
+                if op == "copy":
+                    ins = ("copy", ins[1], rn(ins[2]))
+                    for k in readers.pop(ins[1], ()):
+                        memo.pop(k, None)
+                    for k in [k for k, v in memo.items() if v == ins[1]]:
+                        del memo[k]
+                elif op == "jumpif":
+                    ins = ("jumpif", rn(ins[1]), ins[2])
+                elif op == "out":
+                    ins = ("out", ins[1], rn(ins[2]))
+                elif op == "keep":
+                    ins = ("keep", sorted({rn(r) for r in ins[1]}))
+                out.append(ins)
+                continue
+            r = ins[1]
+            if defs[r] == 1 and key in memo:
+                ren[r] = memo[key]
+                continue
+            if defs[r] == 1:
+                memo[key] = r
+                for a in set(args):
+                    if defs[a] > 1:
+                        readers[a].append(key)
             out.append(ins)
-            continue
-        r = ins[1]
-        if defs[r] == 1 and key in memo:
-            ren[r] = memo[key]
-            continue
-        if defs[r] == 1:
-            memo[key] = r
-            for a in set(args):
-                if defs[a] > 1:
-                    readers[a].append(key)
-        out.append(ins)
-    return out, ren
+        return out, ren
+
+    blocks, reach, children, kill_at = _cfg_dom(code)
+    out_blocks = [list(blk) for blk in blocks]
+    all_ren = {}
+
+    def walk(b, memo_in, vkey_in, readers_in, ren_in):
+        memo = dict(memo_in)
+        vkey = dict(vkey_in)
+        readers = {a: list(ks) for a, ks in readers_in.items()}
+        ren = dict(ren_in)
+        rn = lambda r: ren.get(r, r)
+
+        def kill(reg):
+            k0 = vkey.pop(reg, None)
+            if k0 is not None:
+                memo.pop(k0, None)
+            for k in readers.pop(reg, ()):
+                v = memo.pop(k, None)
+                if v is not None:
+                    vkey.pop(v, None)
+
+        for d in kill_at[b]:
+            kill(d)
+        bout = []
+        for ins in blocks[b]:
+            op = ins[0]
+            if op == "ew":
+                ins = ins[:3] + tuple(rn(a) for a in ins[3:])
+                args = ins[3:]
+                key = ("ew", ins[2]) + (tuple(sorted(args)) if ins[2] in ("add", "mul") else args)
+            elif op == "gather":
+                ins = ("gather", ins[1], [(rn(s), c, p) for s, c, p in ins[2]])
+                args = tuple(s for s, _, _ in ins[2])
+                key = ("gather",) + tuple((s, aid(c), aid(p)) for s, c, p in ins[2])
+            elif op == "bsum":
+                ins, args = ("bsum", ins[1], rn(ins[2])), (rn(ins[2]),)
+                key = ("bsum",) + args
+            elif op == "reduce":
+                ins, args = ("reduce", ins[1], ins[2], rn(ins[3])), (rn(ins[3]),)
+                key = ("reduce", ins[2]) + args
+            else:
+                if op == "copy":
+                    ins = ("copy", ins[1], rn(ins[2]))
+                    kill(ins[1])
+                elif op == "jumpif":
+                    ins = ("jumpif", rn(ins[1]), ins[2])
+                elif op == "out":
+                    ins = ("out", ins[1], rn(ins[2]))
+                elif op == "keep":
+                    ins = ("keep", sorted({rn(r) for r in ins[1]}))
+                bout.append(ins)
+                continue
+            r = ins[1]
+            if defs[r] == 1 and key in memo:
+                ren[r] = all_ren[r] = memo[key]
+                continue
+            if defs[r] == 1:
+                memo[key] = r
+                vkey[r] = key
+                for a in set(args):
+                    readers.setdefault(a, []).append(key)
+            else:
+                kill(r)
+            bout.append(ins)
+        out_blocks[b] = bout
+        for c in children[b]:
+            walk(c, memo, vkey, readers, ren)
+
+    if blocks:
+        walk(0, {}, {}, {}, {})
+    return [ins for blk in out_blocks for ins in blk], all_ren
+
+
+def pull_gather(code, space, max_ops=16):
+    """Pull a full-coverage cell gather through a pure elementwise DAG when every leaf is either a scalar immediate or
+    already gathered through the exact same (dst, pos) map in dominating scope: gather(f(a, b)) -> f(gather(a), gather(b)).
+    Bit-exact (every lane i runs the same fp32 operations in the same order on the same neighbour values); drops all 9
+    gathers and 9 halos of the momentum stress tensor T = nuEff * dev2(T(grad U)) since nuEff and grad U are already
+    gathered through cnbr."""
+    defs = Counter(d for ins in code for d in _uses_defs(ins)[1])
+    imms = {ins[1] for ins in code if ins[0] == "imm"}
+    blocks, reach, children, kill_at = _cfg_dom(code)
+    out_blocks = [list(blk) for blk in blocks]
+    full_cache = {}
+    mid_cache = {}
+    arange_cache = {}
+
+    def is_full_arange(dst, n):
+        k = (id(dst), n)
+        v = full_cache.get(k)
+        if v is None:
+            a = np.asarray(dst)
+            if a.ndim == 1 and a.size == n and (n == 0 or (a[0] == 0 and a[-1] == n - 1)):
+                ar = arange_cache.get(n)
+                if ar is None:
+                    ar = np.arange(n, dtype=a.dtype)
+                    arange_cache[n] = ar
+                v = bool(np.array_equal(a, ar))
+            else:
+                v = False
+            full_cache[k] = v
+        return v
+
+    def mid_of(dst, pos):
+        k = (id(dst), id(pos))
+        v = mid_cache.get(k)
+        if v is None:
+            v = (_acid(dst), _acid(pos))
+            mid_cache[k] = v
+        return v
+
+    npull = [0]
+
+    def walk(b, g_in, g_dep_in, ew_in, ew_dep_in):
+        g_avail = dict(g_in)                                    # (mid_key, src) -> gathered reg
+        g_dep = {r: list(ks) for r, ks in g_dep_in.items()}     # reg -> list of (mid_key, src) keys depending on reg
+        ew_def = dict(ew_in)                                    # reg -> ("ew", reg, op, *args) still valid
+        ew_dep = {r: list(ds) for r, ds in ew_dep_in.items()}   # reg -> list of ew_def regs reading reg
+
+        def kill(reg):
+            for k in g_dep.pop(reg, ()):
+                g_avail.pop(k, None)
+            if reg in ew_def:
+                del ew_def[reg]
+            for d in ew_dep.pop(reg, ()):
+                ew_def.pop(d, None)
+
+        for d in kill_at[b]:
+            kill(d)
+        bout = []
+        for ins in blocks[b]:
+            op = ins[0]
+            if op == "ew":
+                r = ins[1]
+                if defs[r] == 1 and space[r].name == "cells" and all(space[a].name in ("cells", "scalar") for a in ins[3:]):
+                    ew_def[r] = ins
+                    for a in set(ins[3:]):
+                        if a not in imms:
+                            ew_dep.setdefault(a, []).append(r)
+                else:
+                    kill(r)
+                bout.append(ins)
+            elif op == "gather":
+                r, parts = ins[1], ins[2]
+                if defs[r] != 1:
+                    kill(r)
+                    bout.append(ins)
+                    continue
+                if len(parts) == 1:
+                    s, dst, pos = parts[0]
+                    if space[s].name == "cells" and space[r] is space[s] and is_full_arange(dst, space[r].n):
+                        mk = mid_of(dst, pos)
+                        if (mk, s) not in g_avail and s in ew_def:
+                            plan, mapped, failed = [], {}, set()
+
+                            def can_pull(x):
+                                if x in mapped:
+                                    return True
+                                if x in failed:
+                                    return False
+                                if x in imms:
+                                    mapped[x] = x
+                                    return True
+                                if (mk, x) in g_avail:
+                                    mapped[x] = g_avail[(mk, x)]
+                                    return True
+                                dins = ew_def.get(x)
+                                if dins is None or space[x] is not space[s] or len(plan) >= max_ops:
+                                    failed.add(x)
+                                    return False
+                                for a in dins[3:]:
+                                    if not can_pull(a):
+                                        failed.add(x)
+                                        return False
+                                if len(plan) >= max_ops:
+                                    failed.add(x)
+                                    return False
+                                plan.append(dins)
+                                mapped[x] = None
+                                return True
+
+                            if can_pull(s):
+                                for idx_p, dins in enumerate(plan):
+                                    orig = dins[1]
+                                    out_r = r if idx_p == len(plan) - 1 else len(space)
+                                    if out_r == len(space):
+                                        space.append(space[r])
+                                    mapped[orig] = out_r
+                                    new_args = tuple(mapped[a] for a in dins[3:])
+                                    bout.append(("ew", out_r, dins[2]) + new_args)
+                                    # cache pulled subexpressions so sibling components (e.g. 9 entries of T) share them
+                                    g_avail[(mk, orig)] = out_r
+                                    g_dep.setdefault(orig, []).append((mk, orig))
+                                    g_dep.setdefault(out_r, []).append((mk, orig))
+                                npull[0] += 1
+                                continue
+                        g_avail[(mk, s)] = r
+                        g_dep.setdefault(s, []).append((mk, s))
+                        g_dep.setdefault(r, []).append((mk, s))
+                bout.append(ins)
+            else:
+                for d in _uses_defs(ins)[1]:
+                    kill(d)
+                bout.append(ins)
+        out_blocks[b] = bout
+        for c in children[b]:
+            walk(c, g_avail, g_dep, ew_def, ew_dep)
+
+    if blocks:
+        walk(0, {}, {}, {}, {})
+    return [ins for blk in out_blocks for ins in blk], npull[0]
 
 
 def dce(code):
@@ -430,8 +727,9 @@ class Maps:
     Per map, flat arrays over every (core, dst lane) the gather writes: kind (0 local, 1 halo, 3 zero), part, src
     lane or halo index. The halo of core i lists the remote cells any map reads on i, ordered by (owner, cell)."""
 
-    def __init__(self, prog, lay):
+    def __init__(self, prog, lay, space=None):
         self.prog, self.lay = prog, lay
+        self.space = prog.space if space is None else space
         self.key2id, self.maps, self.lanes = {}, [], []
         self.group = None   # cores per chip on a mesh of chips (Machine(chip_cores=))
         self.cores = None   # (lo, hi): finish builds the tables of these cores only
@@ -441,11 +739,11 @@ class Maps:
         if lanes is not None:
             ln = self.lay.lane[dst_space.name]
             parts = [(s, np.asarray(d)[ln[d] < lanes], np.asarray(p)[ln[np.asarray(d)] < lanes]) for s, d, p in parts]
-        key = (dst_space.name, lanes) + tuple((self.prog.space[s].name, d.tobytes(), np.asarray(p).tobytes())
+        key = (dst_space.name, lanes) + tuple((self.space[s].name, d.tobytes(), np.asarray(p).tobytes())
                                               for s, d, p in parts)
         if key not in self.key2id:
             self.key2id[key] = len(self.maps)
-            self.maps.append((dst_space, [(self.prog.space[s], np.asarray(d), np.asarray(p)) for s, d, p in parts]))
+            self.maps.append((dst_space, [(self.space[s], np.asarray(d), np.asarray(p)) for s, d, p in parts]))
             self.lanes.append(lanes)
         return self.key2id[key]
 
@@ -993,29 +1291,38 @@ class Machine:
         self.coff, self.cpages, self.hpages, self.dslots = {}, 0, 0, []
         self.F = prog.dtype.type
         # constants are preloaded: hoist their definitions (the trace emits them where first used, maybe in a loop)
+        space = list(prog.space)
         pre = [i for i in prog.code if i[0] in ("const", "imm", "state")]
         code = pre + [i for i in prog.code if i[0] not in ("const", "imm", "state")]
-        code = fold_constants(code, prog.space, prog.dtype)
-        if cse_ir:
+        code = fold_constants(code, space, prog.dtype)
+        cse_lv = int(cse_ir)
+        if cse_lv:
             n0 = len(code)
-            code = cse(code, content=int(cse_ir) >= 2)[0]
-            log(f"cse: {n0} -> {len(code)} instructions" + (" (index arrays by content)" if int(cse_ir) >= 2 else ""))
+            code = cse(code, content=cse_lv >= 2, cfg=cse_lv >= 3)[0]
+            tag = " (cfg + content)" if cse_lv >= 3 else " (index arrays by content)" if cse_lv >= 2 else ""
+            log(f"cse: {n0} -> {len(code)} instructions{tag}")
         code = dce(code)
+        if cse_lv >= 4:
+            code, npull = pull_gather(code, space)
+            if npull:
+                code = cse(code, content=True, cfg=True)[0]
+                code = dce(code)
+            log(f"pull_gather: {npull} gathers pulled through ew -> {len(code)} instructions")
         self.sliced, self.ext = sliced, {}
         if sliced:
-            code, D = self._sliced(code, prog, mesh, P, tiles, chip_cores if chip_line else None, log)
+            code, D = self._sliced(code, prog, mesh, P, tiles, chip_cores if chip_line else None, log, space)
         n0 = sum(1 for i in code if i[0] == "copy")
-        code, self.ren = coalesce(code, prog.space)
+        code, self.ren = coalesce(code, space)
         for r, t in (D.items() if sliced else ()):     # a merged register spans its widest member
             self.ext[self.ren(r)] = max(self.ext.get(self.ren(r), 0), t)
         code = dce(code)
         log(f"IR: {len(code)} instructions, copies {n0} -> {sum(1 for i in code if i[0] == 'copy')}")
         if lsched:
-            code = _lsched(code, prog.space, log)
+            code = _lsched(code, space, log)
         if self.redm:
             code = _adjacent_reduces(code)
         self.code = code
-        self.space = list(prog.space)
+        self.space = space
         self.imm = {ins[1]: self.F(ins[2]) for ins in code if ins[0] == "imm"}
         self.pre = {ins[1]: ins[2] for ins in code if ins[0] in ("const", "state")}
         # a constant copy coalescing merged with a variable (Var(zeros) of a Krylov loop) is written later: it is not
@@ -1054,7 +1361,7 @@ class Machine:
             fc, ln = face_counts(mesh), self.lay.lane[prog.cells.name]
             for k, Lk in enumerate(self.slotL):
                 assert not (fc > k).any() or ln[fc > k].max() < Lk * LANES, f"--sliced: slot {k} is not a lane prefix (prep --sliced?)"
-        self.maps = Maps(prog, self.lay)
+        self.maps = Maps(prog, self.lay, self.space)
         self.maps.group = chip_cores
         self.masks = {}
         assert not self.red2 or (chip_cores <= LANES and P // chip_cores <= LANES)
@@ -1108,27 +1415,29 @@ class Machine:
         self._sync()
         log(self.summary())
 
-    def _sliced(self, code, prog, mesh, P, tiles, chips, log):
+    def _sliced(self, code, prog, mesh, P, tiles, chips, log, space=None):
         """--sliced: each core's cells sorted widest first, so ELL slot k is a lane prefix of L_k tiles; every cells
         register gets the tiles it is read over (slot_extents), and a fold step over a slot narrower than its result
         becomes copy + in-place update of the first L_k tiles (the copy coalesces away when the accumulator dies there)."""
+        if space is None:
+            space = prog.space
         self._own = own = rcb(mesh.C, P, chips=P // chips if chips else None, faces=mesh_faces(mesh))
         fc = face_counts(mesh)
         T = max(-(-gmax(int(np.bincount(own, minlength=P).max())) // LANES), tiles or 1)
         self.slotL = L = [max(1, -(-gmax(int(np.bincount(own[fc > k], minlength=P).max())) // LANES))
                           for k in range(gmax(int(fc.max())))]
-        D = slot_extents(code, prog.space, prog.cells, prog.slotfold, L, T)
+        D = slot_extents(code, space, prog.cells, prog.slotfold, L, T)
         out, nf = [], 0
         for ins in code:
             d = ins[1] if ins[0] == "ew" else None
-            if d in prog.slotfold and len(ins) == 5 and prog.space[ins[3]] is prog.cells and D.get(ins[4], T) < D.get(d, 0):
+            if d in prog.slotfold and len(ins) == 5 and space[ins[3]] is prog.cells and D.get(ins[4], T) < D.get(d, 0):
                 out += [("copy", d, ins[3]), ("ew", d, ins[2], d, ins[4])]
                 nf += 1
             else:
                 out.append(ins)
-        ews = [i for i in code if i[0] == "ew" and prog.space[i[1]] is prog.cells]
+        ews = [i for i in code if i[0] == "ew" and space[i[1]] is prog.cells]
         log(f"sliced: slot tiles {L} of T {T}; {nf} fold steps in place; cells ew {len(ews)}, op-tiles "
-            f"{sum(min([D.get(x, T) for x in i[3:] if prog.space[x] is prog.cells] + [D.get(i[1], 0)]) for i in ews)} vs {len(ews) * T}")
+            f"{sum(min([D.get(x, T) for x in i[3:] if space[x] is prog.cells] + [D.get(i[1], 0)]) for i in ews)} vs {len(ews) * T}")
         return out, D
 
     def loop(self, ins):
