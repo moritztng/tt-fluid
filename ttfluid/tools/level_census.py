@@ -295,7 +295,7 @@ def census(prog, m, core, gcache, tsort, budgets):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mcache")
-    ap.add_argument("--core", type=int, default=0)
+    ap.add_argument("--core", default="0", help="core, or several separated by commas: the cache is loaded once")
     ap.add_argument("--gcache", type=int, default=-1, help="gather cache tiles; -1: T + 1, a whole vector")
     ap.add_argument("--scratch", default="32,64,128,256,0", help="one-tile scratch budgets of the fused schedule, 0 = no limit")
     ap.add_argument("--json")
@@ -303,10 +303,17 @@ def main():
     LOWER, prog, m = load(a.mcache)
     gc = a.gcache if a.gcache >= 0 else m.T + 1
     budgets = [int(x) for x in a.scratch.split(",")]
-    rows = census(prog, m, a.core, gc, bool(LOWER.get("tsort", 1)), budgets)
-    cpc = int(m.lay.count[prog.cells.name][a.core])
+    cores = [int(c) for c in a.core.split(",")]
+    for core in cores:
+        jp = a.json and Path(a.json)
+        report(LOWER, prog, m, core, gc, budgets, jp and (jp if len(cores) == 1 else jp.with_name("%s_c%d%s" % (jp.stem, core, jp.suffix))))
+
+
+def report(LOWER, prog, m, core, gc, budgets, jpath):
+    rows = census(prog, m, core, gc, bool(LOWER.get("tsort", 1)), budgets)
+    cpc = int(m.lay.count[prog.cells.name][core])
     kb = lambda p: p * 4096 / cpc / 1024
-    print(f"core {a.core}: {cpc} cells, T {m.T}, gcache {gc}; outer body, pages per core per outer it; KB/cell-it in the last lines")
+    print(f"core {core}: {cpc} cells, T {m.T}, gcache {gc}; outer body, pages per core per outer it; KB/cell-it in the last lines")
     print("%-3s %-3s %-22s %7s | %7s %7s %7s %6s %6s %8s | %7s %7s %7s %7s | " % (
         "reg", "lvl", "phases", "blocks", *KINDS, "today", "ld_dram", "ld_l1", "st_l1", "op_til")
         + " ".join("%8s" % ("S=%d" % s if s else "S=inf") for s in budgets) + " | peak")
@@ -331,8 +338,8 @@ def main():
     print("KB/cell-it: today %.1f; level-fused " % kb(allp) + ", ".join("%s %.1f" % ("S=%d" % s if s else "S=inf", kb(ftot[s])) for s in budgets))
     nlev = Counter(r["region"] for r in rows if r["work"]["blocks"])
     print("levels with blocks per region: " + " ".join("%d:%d" % kv for kv in sorted(nlev.items())))
-    if a.json:
-        Path(a.json).write_text(json.dumps(dict(cells=cpc, T=m.T, gcache=gc, today=dict(tot), today_kb=kb(allp),
+    if jpath:
+        Path(jpath).write_text(json.dumps(dict(cells=cpc, T=m.T, gcache=gc, today=dict(tot), today_kb=kb(allp),
                                                 fused_kb={str(s): kb(ftot[s]) for s in budgets}, rows=rows), indent=1, default=int))
 
 
