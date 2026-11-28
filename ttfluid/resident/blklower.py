@@ -32,11 +32,12 @@ class Infeasible(Exception):
     pass
 
 
-def lower_block(uops, stores, nslot, lregs=8, maxlen=32, hoist=True, info=None, accept=None):
+def lower_block(uops, stores, nslot, lregs=8, maxlen=32, hoist=True, info=None, accept=None, keep=False):
     """(items, stores2). A block without a body, one the allocation cannot fit into nslot slots, or one with a body
     that accept(spec) turns down (the generator cannot build its program) comes back unchanged (the same uop and store
     lists). info, when given, counts: lowered, body, nobody, fallback, and per cause fallback:<why> (a turned-down
-    body is fallback:rejected, its bodies are counted in rejected bodies)."""
+    body is fallback:rejected, its bodies are counted in rejected bodies). keep: a load stays in the slot the
+    original uop named when that slot is free; default the lowest free slot (fewer distinct bodies)."""
     info = info if info is not None else {}
 
     def bump(k, v=1):
@@ -53,7 +54,7 @@ def lower_block(uops, stores, nslot, lregs=8, maxlen=32, hoist=True, info=None, 
         bump("nobody")
         return list(uops), list(stores)
     try:
-        items, stores2 = _allocate(pl, ev, uses, bg.flow(uops, stores)[2], nslot)
+        items, stores2 = _allocate(pl, ev, uses, bg.flow(uops, stores)[2], nslot, keep, bump)
     except Infeasible as e:
         bump("fallback")
         bump("fallback:%s" % e)
@@ -70,7 +71,7 @@ def lower_block(uops, stores, nslot, lregs=8, maxlen=32, hoist=True, info=None, 
     return items, stores2
 
 
-def _allocate(pl, ev, uses, outs, nslot):
+def _allocate(pl, ev, uses, outs, nslot, keep=False, bump=lambda *a: None):
     pos = {e.out: i for i, e in enumerate(ev)}           # value -> the event that makes it
     const = {e.out: e.uop[2] for e in ev if e.kind == "K"}
     done = set()                                         # executed events (hoisted loads run ahead of their index)
@@ -96,7 +97,7 @@ def _allocate(pl, ev, uses, outs, nslot):
     for k, p in pl:
         if k == "load":
             u = p.uop
-            s = alloc(u[1])
+            s = alloc(u[1] if keep else None)
             items.append((u[0], s) + tuple(u[2:]))
             done.add(pos[p.out])
             at[p.out] = s
@@ -119,7 +120,17 @@ def _allocate(pl, ev, uses, outs, nslot):
                 items.append(("un", u[1], s) if u[0] == "un" else ("fold", s))
             else:                                        # may write any slot, an input's included
                 sweep()
-                s = alloc(u[2])
+                # the result keeps the original's relation to the operands where it can: onto operand k if the
+                # original wrote onto operand k and that operand dies here, else a slot no operand sits in
+                k = [j for j, q in enumerate(u[3:]) if q == u[2]]
+                if k and src[k[0]] in free:
+                    s = alloc(src[k[0]])
+                elif free - set(src):
+                    s = alloc(min(free - set(src)))
+                else:
+                    s = alloc()
+                if (s in src) != bool(k) or (k and s != src[k[0]]):
+                    bump("stock results placed unlike the original")
                 items.append(("op", u[1], s) + tuple(src))
             at[p.out] = s
         elif k == "body":
@@ -133,16 +144,36 @@ def _allocate(pl, ev, uses, outs, nslot):
             assert set(order) == set(p["ins"]), (order, p["ins"])
             ins = [(v, slot(v)) for v in order]
             done.update(pos[x.out] for x in ops)
+            dying = {v: s for v, s in ins if not live(v)}
             sweep()                                      # operands that die here give their slots to the results
-            res = []
+            fresh = free - set(dying.values())           # free slots no operand of this body sits in
+            dep, res, hazard = {}, [], []
             for x in ops:
-                if x.out in p["outs"]:
-                    s = alloc()
-                    at[x.out] = s
-                    res.append((x.out, s))
+                dep[x.out] = set().union(*[dep[v] if v in inside else {v} for v in x.ins if v not in const])
+                if x.out not in p["outs"]:
+                    continue
+                # in place on an operand the result is computed from (the load of that operand precedes the store by
+                # construction, and a load macro stores at its own address for free): the one used last; else a slot
+                # no operand of this body sits in; else the slot of an unrelated dying operand, flagged
+                own = [v for v in dep[x.out] if v in dying and dying[v] in free]
+                if own:
+                    s = dying[max(own, key=order.index)]
+                elif fresh & free:
+                    s = min(fresh & free)
+                elif free:
+                    s = min(free)
+                    hazard.append((x.out, [v for v, q in dying.items() if q == s][0]))
+                else:
+                    raise Infeasible("no free slot")
+                free.discard(s)
+                at[x.out] = s
+                res.append((x.out, s))
             assert len(res) == len(p["outs"])
-            items.append(("body", dict(ins=ins, outs=res, ops=[(x.name, x.out) + tuple(x.ins) for x in ops],
-                                       const={v: const[v] for x in ops for v in x.ins if v in const})))
+            spec = dict(ins=ins, outs=res, ops=[(x.name, x.out) + tuple(x.ins) for x in ops],
+                        const={v: const[v] for x in ops for v in x.ins if v in const})
+            if hazard:      # (result, operand): the result takes the slot of an operand it does not depend on
+                spec["hazard"] = hazard
+            items.append(("body", spec))
         else:
             raise AssertionError(k)
         sweep()
@@ -309,6 +340,11 @@ def selfcheck(m, nslot=None, seed=0, log=print, **policy):
                     w["body consts"] += passes * len(u[1]["const"])
                     keys[body_key(u[1])] += passes
                     keys0[body_key(u[1], False)] += passes
+                    si = dict(u[1]["ins"])
+                    w["body outs in place"] += passes * sum(s in si.values() for _, s in u[1]["outs"])
+                    w["body hazards"] += passes * len(u[1].get("hazard", ()))
+                    assert len(set(si.values())) == len(si) and len({s for _, s in u[1]["outs"]}) == len(u[1]["outs"])
+                    assert all(0 <= s < nslot for s in list(si.values()) + [s for _, s in u[1]["outs"]])
                 elif u[0] in ("op", "un", "fold"):
                     w["stock ops after"] += passes
     T = m.T
@@ -316,7 +352,8 @@ def selfcheck(m, nslot=None, seed=0, log=print, **policy):
     log("blocks %d: lowered %d (bodies %d), without a body %d, fallbacks %d %s, rejected bodies %d" % (
         c["blocks"], info.get("lowered", 0), info.get("body", 0), info.get("nobody", 0), info.get("fallback", 0),
         {k: v for k, v in info.items() if k.startswith("fallback:")}, info.get("rejected bodies", 0)))
-    log("stores %d, mismatching stores %d in %d blocks" % (c["stores"], c["mismatching stores"], c["mismatching blocks"]))
+    log("stores %d, mismatching stores %d in %d blocks; stock results placed unlike the original %d (static sites)" % (
+        c["stores"], c["mismatching stores"], c["mismatching blocks"], info.get("stock results placed unlike the original", 0)))
     log("per tile-it: " + ", ".join("%s %.1f" % (k, v / T) for k, v in sorted(w.items())))
     log("distinct bodies: %d with their Dest slots, %d without; the 40 commonest with slots cover %.1f %% of body tiles" % (
         len(keys), len(keys0), 100.0 * sum(v for _, v in keys.most_common(40)) / max(sum(keys.values()), 1)))
@@ -331,6 +368,7 @@ if __name__ == "__main__":
     ap.add_argument("path")
     ap.add_argument("--nslot", type=int)
     ap.add_argument("--no-hoist", action="store_true")
+    ap.add_argument("--keep", action="store_true", help="a load stays in the slot the original uop named when it is free")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     import cloudpickle
@@ -341,5 +379,5 @@ if __name__ == "__main__":
     with f:
         LOWER, prog, m = cloudpickle.load(f)
     print(a.path.split("/")[-1])
-    r = selfcheck(m, a.nslot, a.seed, hoist=not a.no_hoist)
+    r = selfcheck(m, a.nslot, a.seed, hoist=not a.no_hoist, keep=a.keep)
     raise SystemExit(1 if r["c"].get("mismatching stores") else 0)
