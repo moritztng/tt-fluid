@@ -15,7 +15,7 @@ R = ROOT / "results"
 HI = 800
 TT = [["quietbox2-p300x4/qb2k2_D1A.hist.json:0", "quietbox2-p300x4/qb2k2_D2A.hist.json:800"],
       ["galaxy-blackhole/hC_1.hist.json:0", "galaxy-blackhole/hC_2.hist.json:500"],
-      ["galaxy-blackhole/d_l0_b0.hist.json:0"]]
+      *([f"galaxy-blackhole/{f.name}:0"] for f in sorted((R / "tenstorrent/galaxy-blackhole").glob("[dg]*.hist.json")))]
 
 
 def data():

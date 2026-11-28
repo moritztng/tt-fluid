@@ -127,14 +127,14 @@ of identical SPUMA SPDP runs measure 16.1, the 28 double-precision pairs 8.8. A 
 about 1 pair in 20 of correct runs lies outside.
 
 A change that only reorders the same arithmetic (another partition, another gather or reduction order) has a sharper
-check, printed with `--base` when both runs start from the same state. Such runs still track each other through
-iteration 10: two partitions of the same device program differ by at most 0.5 counts of Cd there, the 28 pairs of
-SPUMA SPDP runs by 0.01. The limit is 1 count. Double precision against mixed precision is 58 counts apart by then, and
-a 0.1 % error in the force is 17 counts at iteration 1. The check stops at iteration 10 because the device pair
-separates soon after: at iteration 12 one velocity solve takes 14 iterations on one partition and 13 on the other, and
-three iterations later the two drag values are 44 counts apart. A run that tracks its base is a reorder of it; anything
-else is graded on the window. Eleven iterations are enough for this check: given a run that short, the tool prints
-the tracking line alone.
+check, printed with `--base` when both runs start from the same state or from states one rounding step apart. Such runs
+still track each other through iteration 5: nine device runs (three partitions, and six starts with the velocity scaled
+by 1 +- k x 1e-7) differ by at most 0.3 counts of Cd there, the 28 pairs of SPUMA SPDP runs by 0.01. The limit is 1
+count. Double precision against mixed precision is 52 counts apart by then, and a 0.1 % error in the force is 17 counts
+at iteration 1. The check stops at iteration 5 because the runs separate soon after: one linear solve takes one
+iteration more in one run than in the other, and by iteration 10 a run from a scaled start is up to 18 counts from the
+unscaled one. A run that tracks its base is a reorder of it; anything else is graded on the window. Six iterations
+are enough for this check: given a run that short, the tool prints the tracking line alone.
 
 Runs that track each other are draws of one arithmetic, so their windows can be pooled into one grade, which is how
 a set of 800-iteration runs reaches the 12.5 bar. Each `--pool` adds a run; the tool refuses one that does not track
@@ -156,22 +156,31 @@ What the runs in `results/` grade as:
 |---|---|---|---|---|
 | SPUMA SPDP, 8 runs on H100 and 1 on B200, pooled | 201-800 | +8.4 +- 5.0 | 12.5 | pass |
 | 16 SPUMA runs on H100 and 2 on B200 (SPDP and fp64), one by one | 201-800 | -12.6 to +27.0, mean +5.3 | 17.8 | 17 pass, 1 fails (+27.0) |
+| SPUMA SPDP with the inlet 1 % and 0.3 % too fast, wrong on purpose | 201-800 | +82.0 and +43.5 | 17.8 | both fail |
+| tt-fluid, Blackhole Galaxy, seven 4-chip runs pooled | 201-799 | -3.3 +- 4.9 | 12.5 | pass |
+| the seven one by one | 201-799 | -17.8 to +7.0 | 17.8 | 6 pass, 1 fails (-17.8, by 0.03) |
+| tt-fluid, Blackhole Galaxy, 2 chips | 201-3499 | -3.1 | 17.8 | pass |
 | tt-fluid, QuietBox 2 board A, 2 chips | 201-1899 | -17.0 | 17.8 | pass, by 0.8 |
-| tt-fluid, Blackhole Galaxy, 2 chips | 201-1999 | +3.8 | 17.8 | pass |
-| tt-fluid, Blackhole Galaxy, 4 chips | 201-799 | -4.3 | 17.8 | pass |
-| the three tt-fluid runs pooled | as above | -6.0 +- 8.4 | 16.9 | pass (three runs: a screen) |
+| all nine tt-fluid runs pooled | as above | -5.7 +- 4.6 | 12.5 | pass |
 
-One failure in 18 correct runs is what a two-sigma band gives. The three tt-fluid runs are one fp32 program on three
-partitions of the mesh (`results/tenstorrent/galaxy-blackhole/runs.status` has chips, commit, clock and final state of
-the Galaxy legs). They track each other to 0.5 counts through iteration 10 and then separate like any two runs. Taken
-alone, iterations 201-800 of the QuietBox 2 run read -22.8, outside the band; the pool reads -6.0 +- 8.4. The run
-means spread 7.7 counts where the rule gives 5.0, so the pool carries its own wider band, and with three runs it is a
-screen. A grade of record at 12.5 needs a fourth run.
+One failure in 18 correct runs is what a two-sigma band gives, and so is one in seven that misses by 0.03 counts. The
+two wrong-on-purpose runs show the gate can fail a real solve: with the inlet at 20.2 m/s instead of 20 and the forces
+still normalised with 20, SPUMA reads +82.0 counts (`results/nvidia/h100-wrong-inlet`).
+
+The seven Galaxy runs are tt-fluid's grade of record. They ran at once on seven 4-chip blocks of one Blackhole Galaxy,
+each from the potentialFoam start with the velocity scaled by 1 +- k x 1e-7 (k = 0 to 4), so they are seven draws of one
+fp32 program (`results/tenstorrent/galaxy-blackhole/runs.status` has chips, commit, clock and final state of every
+run). Their means spread as the rule predicts (3.4 counts on the pooled mean against 3.3), and the pool reads
+-3.3 +- 4.9 against the 12.5 bar. The two 2-chip runs are the same program on other partitions. Taken alone,
+iterations 201-800 of the QuietBox 2 run read -22.8, outside the band for one run; pooled with the others the nine read
+-5.7 +- 4.6.
 
 ```bash
 G=results/tenstorrent/galaxy-blackhole; Q=results/tenstorrent/quietbox2-p300x4
-python3 bench/cdgrade.py --run $G/hC_1.hist.json:0 $G/hC_2.hist.json:500 $G/hC_3.hist.json:1000 $G/hC_4.hist.json:1500 \
-    --pool $Q/qb2k2_D1A.hist.json:0 $Q/qb2k2_D2A.hist.json:800 --pool $G/d_l0_b0.hist.json:0
+python3 bench/cdgrade.py --run $G/d_l0_b0.hist.json:0 $(for f in $G/glx1_*.hist.json; do echo --pool $f:0; done)
+python3 bench/cdgrade.py --run $G/d_l0_b0.hist.json:0 $(for f in $G/glx1_*.hist.json; do echo --pool $f:0; done) \
+    --pool $(for i in 1 2 3 4 5 6 7; do echo $G/hC_$i.hist.json:$(((i - 1) * 500)); done) \
+    --pool $Q/qb2k2_D1A.hist.json:0 $Q/qb2k2_D2A.hist.json:800
 ```
 
 The QuietBox 2 runs behind the cost table (`vq3_A`, `vq3_B`) ran a later build with three performance changes (gather
