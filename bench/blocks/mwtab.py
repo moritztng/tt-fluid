@@ -78,9 +78,10 @@ def table(path, its, T):
         out.append(line("PACK " + nm + (" (store back-pressure)" if nm == "writer page" else ""), v))
     asum = sum(w["acq"].values())
     out.append(line("= waited for the packer, all causes", asum))
+    out.append(line("last poll of each acquire + the drain after it", w["tail"].get("acq", 0) + w.get("acq_after", 0) + w["tail"].get("acq_after", 0)))
     out.append(line("MATH's own queued work, drained at loads and acquires", w["own"] + w["tail"]["own"]))
     slots = sum(ops[k]["cyc"] for k in ("LD", "LDS", "LDR+STW", "ACQ") if k in ops)
-    booked = lsum + asum + w["own"] + w["load_after"] + sum(w["tail"].values())
+    booked = lsum + asum + w["own"] + w["load_after"] + w.get("acq_after", 0) + sum(w["tail"].values())
     out.append("  check: booked %.2f M of the LD + LDS + LDR+STW + ACQ slots' %.2f M per tile-it (%.1f %%; the rest is interpreting)"
                % (per(booked), per(slots), 100 * booked / slots))
     return r, out, dict(rows, **{"PACK " + k: v for k, v in w["acq"].items()}), tot

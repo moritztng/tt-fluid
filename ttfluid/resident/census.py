@@ -188,7 +188,7 @@ def prof(hdr, log=print):
               ", ".join("%s %.1f%% (%d x %.0f)" % (nm, 100 * v["share"], v["n"], v["per"]) for nm, v in top), flush=True)
     log("census n STREAM parts: " + ", ".join("%s %.3g cyc (%d)" % (nm, v["cyc"], v["n"])
                                                 for nm, v in c["n_stream"].items()), flush=True)
-    if hdr.shape[1] >= 992 and int(hdr[:, 988:991].astype("int64").sum()):
+    if hdr.shape[1] >= 1000 and int(hdr[:, 988:991].astype("int64").sum()):
         c["mwait"] = mwait(hdr)
         log("census mwait", json.dumps(c["mwait"]), flush=True)
     return c
@@ -203,13 +203,15 @@ MW_P = ("at work", "writer page", "code page", "BRISC token page", "NCRISC token
 
 def mwait(hdr):
     """Cycles a core (mean over cores) MATH spent draining its Tensix pipeline, by cause: load[unpack state | reader
-    class] at a load's wait for the unpacker, acq[pack state] after an acquire, own = its own queued work before either,
-    load_after = the drain after a load (the get and the clears); tail = the last poll
+    class] at a load's wait for the unpacker, acq[pack state] at an acquire's wait for the packer, own = its own queued
+    work before either, load_after / acq_after = the drain after each (cross-checks: the get and the clears, nothing);
+    tail = the last poll
     of each kind (nobody waited for), n = drains of each kind."""
     w64 = lambda i: float((hdr[:, i].astype("float64") + hdr[:, i + 1].astype("float64") * 2.0 ** 32).mean())
     load = {"%s | %s" % (MW_U[u], MW_N[n]): w64(700 + 2 * (16 * u + n)) for u in range(8) for n in range(16)}
     acq = {MW_P[q]: w64(960 + 2 * q) for q in range(8)}
     return dict(load={k: round(v) for k, v in load.items() if v}, acq={k: round(v) for k, v in acq.items() if v},
-                own=round(w64(976)), load_after=round(w64(978)),
-                tail=dict(load_after=round(w64(980)), acq=round(w64(982)), own=round(w64(984)), load=round(w64(986))),
+                own=round(w64(976)), load_after=round(w64(978)), acq_after=round(w64(992)),
+                tail=dict(load_after=round(w64(980)), acq_after=round(w64(982)), own=round(w64(984)), load=round(w64(986)),
+                          acq=round(w64(994))),
                 n=dict(load=float(hdr[:, 988].mean()), acq=float(hdr[:, 989].mean()), own=float(hdr[:, 990].mean())))
