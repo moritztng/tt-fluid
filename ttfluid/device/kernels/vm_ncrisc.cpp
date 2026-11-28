@@ -369,6 +369,61 @@ void kernel_main() {
 #else
 #define hscatter scatter
 #endif
+#if defined(CFD_GAHEAD) && defined(CFD_TRID)
+#error "--gahead is written for the full-barrier reader (no CFD_TRID): its reads are untagged"
+#endif
+#if defined(CFD_GAHEAD) && defined(CFD_TSORT)
+    // --gahead N: the gather-cache pages one patched page needs are read TOGETHER, before its entries are applied.
+    // The tables are sorted by source tile (CFD_TSORT), so a part's entries are a few runs: gprep finds their ends
+    // by galloping, looks every run's page up and issues the ones that miss at once; the caller waits ONE barrier
+    // for all of them, where patch() alone issues one read and waits one barrier per miss, in series. The slots stay
+    // pinned until the page is applied and patch() takes the run ends and page pointers kept here, so it neither
+    // looks up nor waits. Bounded by N runs a page and NGC - 1 pinned slots (one stays free for patch()'s own
+    // misses): a part that does not fit goes through patch() as before. Same pages, same values: only the waits move.
+    constexpr uint32_t GAR = CFD_GAHEAD;
+    uint32_t ga_end[GAR], ga_pg[GAR], ga_b[8], ga_e[8], ga_n = 0, ga_pin = 0, ga_ok = 0, ga_k = 0;
+    bool ga_rd = false;
+    auto gprep = [&](uint32_t k, uint32_t d, const uint32_t* xs, uint32_t n) {
+        ga_b[k] = ga_n;
+        for (uint32_t f = 0; f < n;) {
+            if (ga_n == GAR) return;
+            const uint32_t tb = xs[f] & XT;
+            uint32_t lo = f, st = 1;                      // xs[lo] is in the run
+            while (lo + st < n && (xs[lo + st] & XT) == tb) lo += st, st <<= 1;
+            uint32_t hi = lo + st < n ? lo + st : n;      // the first entry known to be past it
+            while (hi - lo > 1) {
+                const uint32_t mid = (lo + hi) >> 1;
+                if ((xs[mid] & XT) == tb) lo = mid;
+                else hi = mid;
+            }
+            const uint32_t t = tb >> 10;
+            uint32_t j = 0;
+            while (j < NGC && !(gcd[j] == d && gct[j] == t)) ++j;
+            if (j < NGC ? !((gpin[j >> 5] >> (j & 31)) & 1) : true) {   // a slot this page does not hold yet
+                if (ga_pin + 1 >= NGC) return;
+                if (j == NGC) {
+                    while ((gpin[gcn >> 5] >> (gcn & 31)) & 1) gcn = gcn + 1 == NGC ? 0 : gcn + 1;
+                    j = gcn;
+                    gcn = gcn + 1 == NGC ? 0 : gcn + 1;
+                    noc_async_read(dpage(d, t), get_write_ptr(cb_gc) + j * 4096, 4096);
+                    gcd[j] = d;
+                    gct[j] = t;
+                    gld = 0xffffffffu;                    // value()'s last-page shortcut may have named this slot
+                    ++gmiss;
+                    ga_rd = true;
+                }
+                gpin[j >> 5] |= 1u << (j & 31);
+                ++ga_pin;
+            }
+            ga_end[ga_n] = hi;
+            ga_pg[ga_n] = get_write_ptr(cb_gc) + j * 4096;
+            ++ga_n;
+            f = hi;
+        }
+        ga_e[k] = ga_n;
+        ga_ok |= 1u << k;
+    };
+#endif
     // one part's residue entries (lane << 16 | source lane) into out, a tight loop per source kind: an L1 source
     // directly, a DRAM-homed one a tile at a time through the gather cache (consecutive entries mostly share a tile).
     // Without the cache the values go through value()'s batch; the caller flushes
@@ -382,6 +437,27 @@ void kernel_main() {
         // xs[e..e + 3] all are
         if constexpr (NGC != 0) {
             uint32_t e = 0, dummy;
+#ifdef CFD_GAHEAD
+            if ((ga_ok >> ga_k) & 1) {   // gprep holds every run of this part: no lookup and no wait in here
+                for (uint32_t r = ga_b[ga_k]; r < ga_e[ga_k]; ++r) {
+                    const uint32_t* cp = reinterpret_cast<const uint32_t*>(ga_pg[r]);
+                    const uint32_t fe = ga_end[r];
+                    asm volatile("" ::: "memory");
+                    for (; e + 4 <= fe; e += 4) {
+                        const uint32_t x0 = xs[e], x1 = xs[e + 1], x2 = xs[e + 2], x3 = xs[e + 3];
+                        const uint32_t v0 = cp[x0 & 1023], v1 = cp[x1 & 1023], v2 = cp[x2 & 1023], v3 = cp[x3 & 1023];
+                        out[x0 >> XS] = v0;
+                        out[x1 >> XS] = v1;
+                        out[x2 >> XS] = v2;
+                        out[x3 >> XS] = v3;
+                    }
+                    for (; e < fe; ++e) out[xs[e] >> XS] = cp[xs[e] & 1023];
+                }
+                ga_ok &= ~(1u << ga_k);
+                asm volatile("" ::: "memory");
+                return;
+            }
+#endif
             while (e < n) {
                 const uint32_t tb = xs[e] & XT;
                 value(d, xs[e] & XI, reinterpret_cast<volatile uint32_t*>(&dummy));
@@ -1008,12 +1084,29 @@ void kernel_main() {
                                 S[M_SEQ] = ++bseq;
                             }
 #endif
+#if defined(CFD_GAHEAD) && defined(CFD_TSORT)
+                            if constexpr (NGC > 1) {   // every DRAM-source part's pages, issued together, one wait
+                                ga_n = 0, ga_pin = 0, ga_ok = 0, ga_rd = false;
+                                for (uint32_t k = 0; k < np_; ++k) {
+                                    const uint32_t sd = N[p + 2 + 2 * k];
+#ifdef CFD_BPATCH
+                                    if ((sd >> 28) != 0) gprep(k, sd, sp[2 * k], nkeep[k]);
+#else
+                                    if ((sd >> 28) != 0) gprep(k, sd, sp[2 * k], sn[2 * k]);
+#endif
+                                }
+                                if (ga_rd) noc_async_read_barrier();
+                            }
+#endif
                             for (uint32_t k = 0; k < np_; ++k) {
                                 const uint32_t sd = N[p + 2 + 2 * k];
 #ifdef CFD_PROF
                                 // parts 20..23: local L1-source, local DRAM-source, halo, zero entries (cycles, entries)
                                 uint32_t t0_ = get_timestamp_32b();
                                 const uint32_t kk_ = (sd >> 28) == 0 ? 20 : 21;
+#endif
+#if defined(CFD_GAHEAD) && defined(CFD_TSORT)
+                                ga_k = k;
 #endif
 #ifdef CFD_BPATCH
                                 patch(sd, sp[2 * k], nkeep[k], const_cast<uint32_t*>(pl));
@@ -1034,6 +1127,10 @@ void kernel_main() {
                             const uint32_t tz_ = get_timestamp_32b();
 #endif
                             for (uint32_t e = 0; e < sn[2 * np_]; ++e) pl[sp[2 * np_][e]] = 0;
+#if defined(CFD_GAHEAD) && defined(CFD_TSORT)
+                            for (uint32_t w = 0; w < NGW; ++w) gpin[w] = 0;   // the page is applied: its slots are free
+                            ga_ok = 0;
+#endif
 #ifdef CFD_PROF
                             cyc[23] += get_timestamp_32b() - tz_, cnt[23] += sn[2 * np_];
 #endif
