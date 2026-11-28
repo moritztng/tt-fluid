@@ -92,9 +92,10 @@ class _Pickler(pickle.Pickler):
 
 
 class Cache:
-    def __init__(self, root, log=print, omit=()):
-        """omit: input names left out of every key. Only for the test that proves the gate can fail."""
-        self.root, self.log, self.omit = Path(root).expanduser(), log, set(omit)
+    def __init__(self, root, floor_gb=0, log=print, omit=()):
+        """floor_gb: an entry that would leave the disk under this many GB free is not stored (the lowering goes on).
+        omit: input names left out of every key. Only for the test that proves the gate can fail."""
+        self.root, self.floor, self.log, self.omit = Path(root).expanduser(), floor_gb * 1e9, log, set(omit)
         self.root.mkdir(parents=True, exist_ok=True)
 
     def key(self, stage, inputs):
@@ -116,7 +117,11 @@ class Cache:
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir()
         try:
-            n = self._store(tmp, value)
+            n = self._store(tmp, value, self.floor)
+            if n is None:
+                self.log("cache: %s not stored, the disk would fall under its floor" % stage, flush=True)
+                shutil.rmtree(tmp)
+                return value
             (tmp / "inputs.json").write_text(json.dumps(inputs, indent=1, sort_keys=True, default=str))
             os.rename(tmp, d)
         except OSError:   # another lowering stored the same entry first (rename onto a full directory), or the disk is full
@@ -127,11 +132,14 @@ class Cache:
         return value
 
     @staticmethod
-    def _store(d, value):
-        """value.pkl + buffers.bin: every out-of-band buffer at a 4-KB boundary, its offset and length in the index."""
+    def _store(d, value, floor=0):
+        """value.pkl + buffers.bin: every out-of-band buffer at a 4-KB boundary, its offset and length in the index.
+        Returns the bytes written, or None when they would leave the disk under `floor` bytes free."""
         bufs = []
         with open(d / "value.pkl", "wb") as f:
             _Pickler(f, protocol=5, buffer_callback=bufs.append).dump(value)
+        if shutil.disk_usage(d).free - sum(b.raw().nbytes for b in bufs) < floor:
+            return None
         index, off = [], 0
         with open(d / "buffers.bin", "wb") as f:
             for b in bufs:

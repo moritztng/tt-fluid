@@ -310,7 +310,7 @@ else:
                            source=lcache.source_digest(["ttfluid.solver", "ttfluid.resident.trace", "ttfluid.resident.program", "ttfluid.resident.krylov",
                                                         "ttfluid.resident.sa", "ttfluid.resident.amg", "ttfluid.resident.synth"]),
                            rcb=a.amg and lcache.source_digest(["ttfluid.resident.machine"]))   # --amg aggregates on the cores' partition
-            CACHE = lcache.Cache(a.cache, omit=a.cache_omit.split(","))
+            CACHE = lcache.Cache(a.cache, a.min_free_gb, omit=a.cache_omit.split(","))
             if not a.owner:   # the cores' partition is a stage of its own, keyed by the points and faces it cuts: a changed trace keeps it
                 import inspect
                 _rcb, _busy = ttfluid.resident.machine.rcb, []
