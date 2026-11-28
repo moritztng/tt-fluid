@@ -138,9 +138,10 @@ void kernel_main() {
 #ifdef CFD_DMP
     // D-gather mailbox: 64 B before TMB for MATH (trisc1) and PACK (trisc2) on dense tiles
     constexpr uint32_t DMB = CFD_SYNCB / 4 - 144;
-    enum : uint32_t { D_SRC = DMB, D_IX = DMB + 1, D_OUT = DMB + 2,
-                      D_MSEQ = DMB + 4, D_MOFF = DMB + 5, D_MDONE = DMB + 6,
-                      D_PSEQ = DMB + 8, D_POFF = DMB + 9, D_PDONE = DMB + 10 };
+    enum : uint32_t { D_SRC = DMB, D_IX = DMB + 1, D_OUT = DMB + 2, D_SRC1 = DMB + 3,
+                      D_MSEQ = DMB + 4, D_MOFF = DMB + 5, D_MDONE = DMB + 6, D_SRC2 = DMB + 7,
+                      D_PSEQ = DMB + 8, D_POFF = DMB + 9, D_PDONE = DMB + 10, D_OUT1 = DMB + 11,
+                      D_OUT2 = DMB + 13 };
 #ifdef CFD_DMP_M
     uint32_t mseq = 0;
 #endif
@@ -621,6 +622,88 @@ void kernel_main() {
 #endif
         return true;
     };
+#ifdef CFD_G3
+    // Dispatch a 3-component 1,024-lane dense gather sharing one index stream across up to 5 RISCs (0 extra L1).
+    auto dense_tile_3 = [&](const uint32_t* gs0, const uint32_t* gs1, const uint32_t* gs2,
+                            const uint16_t* ix, uint32_t* o0, uint32_t* o1, uint32_t* o2,
+                            uint32_t nN, uint32_t nB, uint32_t nU, uint32_t nM, uint32_t nP) -> bool {
+        uint32_t off = nN;
+#ifdef CFD_BMBOX
+        if (nB) {
+            S[M_JOB] = reinterpret_cast<uint32_t>(gs0);
+            S[M_JOB + 1] = reinterpret_cast<uint32_t>(ix + off);
+            S[M_JOB + 2] = nB | (3u << 30);
+            S[M_JOB + 3] = reinterpret_cast<uint32_t>(o0 + off);
+            S[M_JOB + 4] = reinterpret_cast<uint32_t>(gs1);
+            S[M_JOB + 5] = reinterpret_cast<uint32_t>(gs2);
+            S[M_JOB + 6] = reinterpret_cast<uint32_t>(o1 + off);
+            S[M_JOB + 7] = reinterpret_cast<uint32_t>(o2 + off);
+            S[M_N] = 1;
+            off += nB;
+        }
+#endif
+#ifdef CFD_TMBOX
+        if (nU) {
+            S[T_JOB] = reinterpret_cast<uint32_t>(gs0);
+            S[T_JOB + 1] = reinterpret_cast<uint32_t>(ix + off);
+            S[T_JOB + 2] = nU | (3u << 30);
+            S[T_JOB + 3] = reinterpret_cast<uint32_t>(o0 + off);
+            S[T_JOB + 4] = reinterpret_cast<uint32_t>(gs1);
+            S[T_JOB + 5] = reinterpret_cast<uint32_t>(gs2);
+            S[T_JOB + 6] = reinterpret_cast<uint32_t>(o1 + off);
+            S[T_JOB + 7] = reinterpret_cast<uint32_t>(o2 + off);
+            S[T_N] = 1;
+            off += nU;
+        }
+#endif
+#ifdef CFD_DMP
+        if (nM || nP) {
+            S[D_SRC] = reinterpret_cast<uint32_t>(gs0);
+            S[D_SRC1] = reinterpret_cast<uint32_t>(gs1);
+            S[D_SRC2] = reinterpret_cast<uint32_t>(gs2);
+            S[D_IX] = reinterpret_cast<uint32_t>(ix);
+            S[D_OUT] = reinterpret_cast<uint32_t>(o0);
+            S[D_OUT1] = reinterpret_cast<uint32_t>(o1);
+            S[D_OUT2] = reinterpret_cast<uint32_t>(o2);
+#ifdef CFD_DMP_M
+            if (nM) { S[D_MOFF] = off | 0x8000u | (nM << 16); off += nM; }
+#endif
+#ifdef CFD_DMP_P
+            if (nP) { S[D_POFF] = off | 0x8000u | (nP << 16); off += nP; }
+#endif
+        }
+#endif
+        (void)off; (void)nB; (void)nU; (void)nM; (void)nP;
+        asm volatile("" ::: "memory");
+        invalidate_l1_cache();
+#ifdef CFD_DMP_M
+        if (nM) S[D_MSEQ] = ++mseq;
+#endif
+#ifdef CFD_DMP_P
+        if (nP) S[D_PSEQ] = ++pseq;
+#endif
+#ifdef CFD_BMBOX
+        if (nB) S[M_SEQ] = ++bseq;
+#endif
+#ifdef CFD_TMBOX
+        if (nU) S[T_SEQ] = ++tseq;
+#endif
+        if (nN) cfd_gather16_3(gs0, gs1, gs2, ix, nN, o0, o1, o2);
+#ifdef CFD_BMBOX
+        if (nB && !WAIT_UNTIL(S[M_DONE] == bseq, 21)) return false;
+#endif
+#ifdef CFD_TMBOX
+        if (nU && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) return false;
+#endif
+#ifdef CFD_DMP_M
+        if (nM && !WAIT_UNTIL(S[D_MDONE] == mseq, 23)) return false;
+#endif
+#ifdef CFD_DMP_P
+        if (nP && !WAIT_UNTIL(S[D_PDONE] == pseq, 24)) return false;
+#endif
+        return true;
+    };
+#endif
 #endif
 
     // BRISC zeroes the sync region and loads the tables before it releases `go` (1 = run, 2 = its barrier failed)
@@ -1047,6 +1130,104 @@ void kernel_main() {
                     const uint32_t lo = t * 1024, hi = lo + 1024;
                     p = e0;
                     for (uint32_t e = 0; e < ne && run; ++e) {
+#if defined(CFD_DENSE) && defined(CFD_G3) && defined(CFD_TABSTREAM) && !defined(CFD_DEFER) && !defined(CFD_TRID)
+                        if (RING >= 3 && e + 2 < ne) {
+                            const uint32_t w1_ = N[p + 1];
+                            const uint32_t np3 = w1_ & 0xf;
+                            const uint32_t mid3 = (w1_ >> 4) & SM;
+                            const uint32_t mq3 = (np3 == 1 && mid3) ? T[mid3] : 0;
+                            if (mq3 && (T[(mq3 & 0xfffffu) + 1] >> 31) && t < (mq3 >> 20) &&
+                                N[p + 5] == w1_ && N[p + 9] == w1_) {
+                                const uint32_t sd0 = N[p + 2], sd1 = N[p + 6], sd2 = N[p + 10];
+                                if (((sd0 | sd1 | sd2) >> 28) == 0) {
+                                    if (pend) drain();
+                                    bool ok3 = true;
+                                    PSUB(10, ok3 = WAIT_UNTIL(cb_pages_reservable_at_back(cb_in, 3), 17));
+                                    if (!ok3) { run = false; break; }
+                                    cb_reserve_back(cb_in, 3);
+                                    const uint32_t pg0 = get_write_ptr(cb_in);
+                                    uint32_t pg1 = pg0 + PS; if (pg1 >= in1) pg1 -= RING * PS;
+                                    uint32_t pg2 = pg1 + PS; if (pg2 >= in1) pg2 -= RING * PS;
+#ifdef CFD_PROF
+                                    const uint32_t tp_ = get_timestamp_32b();
+#endif
+                                    load_tile(mq3 & 0xfffffu, 3, t, 0, mq3 >> 20);
+                                    sp = sp_[0], sn = sn_[0];
+                                    PSUB(16, noc_async_read_barrier());
+#ifdef CFD_PROF
+                                    cyc[17] += sn[0] + sn[1] + sn[2];
+                                    uint32_t t0_ = get_timestamp_32b();
+#endif
+                                    const int32_t sh3 = static_cast<int32_t>(w1_) >> SS;
+                                    const uint32_t off_al = (4 * sh3) & (DA - 1);
+                                    uint32_t* const pd0 = reinterpret_cast<uint32_t*>(pg0 + off_al);
+                                    uint32_t* const pd1 = reinterpret_cast<uint32_t*>(pg1 + off_al);
+                                    uint32_t* const pd2 = reinterpret_cast<uint32_t*>(pg2 + off_al);
+#ifdef CFD_PSHARE
+                                    static_assert(CFD_PN + CFD_PB + CFD_PU + CFD_PM + CFD_PP == 64, "pshare sum");
+                                    constexpr uint32_t pN = 16 * CFD_PN, pB = 16 * CFD_PB, pU = 16 * CFD_PU, pM = 16 * CFD_PM, pP = 16 * CFD_PP;
+#else
+#ifdef CFD_BPATCH
+                                    constexpr uint32_t pB = 1024 - 1024 * CFD_BPATCH / 8;
+#else
+                                    constexpr uint32_t pB = 0;
+#endif
+#if defined(CFD_BPATCH) && defined(CFD_TPAT)
+                                    constexpr uint32_t pU = 1024 * CFD_TPAT / 8 < (1024 - pB) ? 1024 * CFD_TPAT / 8 : 0;
+#else
+                                    constexpr uint32_t pU = 0;
+#endif
+                                    constexpr uint32_t pN = 1024 - pB - pU, pM = 0, pP = 0;
+#endif
+                                    if (!dense_tile_3(A + sd0 * 1024, A + sd1 * 1024, A + sd2 * 1024,
+                                                      reinterpret_cast<const uint16_t*>(sp[0]),
+                                                      pd0, pd1, pd2, pN, pB, pU, pM, pP)) {
+                                        run = false;
+                                        break;
+                                    }
+#ifdef CFD_PROF
+                                    uint32_t t1_ = get_timestamp_32b();
+                                    cyc[20] += t1_ - t0_, cnt[20] += 3 * sn[0];
+#endif
+                                    volatile uint32_t* pl0 = reinterpret_cast<volatile uint32_t*>(pd0) - (WT ? 0 : lo);
+                                    volatile uint32_t* pl1 = reinterpret_cast<volatile uint32_t*>(pd1) - (WT ? 0 : lo);
+                                    volatile uint32_t* pl2 = reinterpret_cast<volatile uint32_t*>(pd2) - (WT ? 0 : lo);
+                                    if (sn[1]) {
+                                        const uint32_t* h0 = hbuf(N[p + 3]);
+                                        const uint32_t* h1 = hbuf(N[p + 7]);
+                                        const uint32_t* h2 = hbuf(N[p + 11]);
+                                        const uint32_t* hs = sp[1];
+                                        for (uint32_t hi_ = 0, hn = sn[1]; hi_ < hn; ++hi_) {
+                                            const uint32_t x = hs[hi_], dst = x >> 16, src = x & 0xffffu;
+                                            pl0[dst] = h0[src];
+                                            pl1[dst] = h1[src];
+                                            pl2[dst] = h2[src];
+                                        }
+                                    }
+#ifdef CFD_PROF
+                                    uint32_t tz_ = get_timestamp_32b();
+                                    cyc[22] += tz_ - t1_, cnt[22] += 3 * sn[1];
+#endif
+                                    for (uint32_t zi = 0, zn = sn[2]; zi < zn; ++zi) {
+                                        const uint32_t z = sp[2][zi];
+                                        pl0[z] = 0; pl1[z] = 0; pl2[z] = 0;
+                                    }
+#ifdef CFD_PROF
+                                    cyc[23] += get_timestamp_32b() - tz_, cnt[23] += 3 * sn[2];
+                                    cyc[12] += get_timestamp_32b() - tp_;
+                                    cnt[12] += 3;
+#endif
+                                    flush();
+                                    cb_push_back(cb_in, 3);
+                                    npages += 3;
+                                    nvals += 3;
+                                    p += 12;
+                                    e += 2;
+                                    continue;
+                                }
+                            }
+                        }
+#endif
                         const uint32_t d = N[p];
                         const int32_t sh = static_cast<int32_t>(N[p + 1]) >> SS;
 #ifdef CFD_TRID

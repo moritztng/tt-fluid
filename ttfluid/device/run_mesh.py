@@ -120,6 +120,15 @@ ap.add_argument("--dshare", default="", help="N,B,U,M,P (five non-negative ints 
                 "GATHER tiles across NCRISC, BRISC, UNPACK, MATH, PACK (CFD_DSHARE). Empty: use --bgts/--tgts. Bit-exact")
 ap.add_argument("--pshare", default="", help="N,B,U,M,P (five non-negative ints summing to 64, 16-lane chunks): per-RISC shares of dense "
                 "STREAM tiles (CFD_PSHARE). Empty: same as --dshare when --dshare is set, else --bpatch/--tpat. Bit-exact")
+ap.add_argument("--g3", type=int, default=0, help="1: share dense gather tables and run 3-wide Zba dense gather (CFD_G3) on consecutive "
+                "identical-map L1-source STREAM entries across active RISCs (0 extra L1). A run flag, bit-exact")
+ap.add_argument("--usolve", default="bicgstab", choices=["bicgstab", "bicgstab3", "bicgstab3s", "jacobi3", "mr3"],
+                help="multi-component asymmetric U solve: bicgstab (default), bicgstab3 (3-RHS bitwise), bicgstab3s (split X), jacobi3 (3-RHS smoothSolver), mr3 (3-RHS MR)")
+ap.add_argument("--tsolve", default="bicgstab", choices=["bicgstab", "jacobi", "mr"],
+                help="single-component asymmetric k/omega solve: bicgstab (default), jacobi (smoothSolver), mr (GMRES(1))")
+ap.add_argument("--ucad", type=int, default=1, help="exit-test cadence for --usolve jacobi3 / --tsolve jacobi (sweeps per true-residual check)")
+ap.add_argument("--uomega", type=float, default=1.0, help="Jacobi relaxation weight for --usolve jacobi3 / --tsolve jacobi (1.0 = undamped)")
+ap.add_argument("--usolve-break", type=int, default=0, help="1: broken-arm gate toggle (corrupts Uy slot-0 gather in off_matvec_multi; must FAIL)")
 ap.add_argument("--amg", action="store_true", help="p PCG preconditioned by smoothed aggregation (ttfluid.resident.sa), aggregates on the K x 72 global cores; "
                 "the coarse levels are chip-local (sa.setup chip_cores): only the fine level exchanges between chips")
 ap.add_argument("--amg-kind", default="sa", choices=["sa"])
@@ -249,6 +258,11 @@ import ttfluid.resident.trace  # noqa: E402
 ttfluid.resident.trace.FIELD_MAJOR = bool(a.hlate)
 ttfluid.resident.krylov.CG1 = bool(a.cg1)
 ttfluid.resident.krylov.BJOINT = bool(a.bjoint)
+ttfluid.resident.krylov.USOLVE = a.usolve
+ttfluid.resident.krylov.TSOLVE = a.tsolve
+ttfluid.resident.krylov.UCAD = a.ucad
+ttfluid.resident.krylov.UOMEGA = a.uomega
+ttfluid.resident.krylov.UBREAK = bool(a.usolve_break)
 stamp("python imports done")
 
 t0 = time.time()
@@ -262,7 +276,7 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit", "span", "hpack", "gsmin") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit", "span", "hpack", "gsmin", "usolve", "tsolve", "ucad", "uomega", "usolve_break") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
@@ -369,7 +383,7 @@ else:
         if a.cache:   # the stage's key: every flag, file, environment variable and source file the trace reads (lower/cache.py)
             from ttfluid.lower import cache as lcache
             TRACE_FLAGS = ("what", "n", "layout", "mesh", "strips", "arch", "cores", "phase", "amg", "amg_kind", "amg_smoothed", "amg_stack", "amg_lag", "amg_lag_warm",
-                           "amg_global", "amg_depth", "amg_min_core", "vpre", "vpost", "vcoarse", "vgamma", "jointred", "cg1", "bjoint", "hlate")
+                           "amg_global", "amg_depth", "amg_min_core", "vpre", "vpost", "vcoarse", "vgamma", "jointred", "cg1", "bjoint", "hlate", "usolve", "tsolve", "ucad", "uomega", "usolve_break")
             with ST("cache key"):
                 key = dict({k: getattr(a, k) for k in TRACE_FLAGS}, case=lcache.tree_digest(a.case),
                            forces=a.forces and [a.forces.rsplit(":", 1)[-1], ":" in a.forces and lcache.tree_digest(a.forces.rsplit(":", 1)[0])],
@@ -926,6 +940,7 @@ def kd(src, ct, cfg, rt=None, crt=None):
         ([("CFD_BPATCH", str(a.bpatch))] if a.bpatch and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_BGTS", str(a.bgts))] if a.bgts and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_DENSE", "1")] if a.tabdense and src in ("vm_ncrisc.cpp", "vm_brisc.cpp", "vm_compute.cpp") else []) + \
+        ([("CFD_G3", "1")] if a.g3 and a.tabdense and src in ("vm_ncrisc.cpp", "vm_brisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_TGTS", str(a.tgts))] if a.tgts and src in ("vm_ncrisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_TPAT", str(a.tpat))] if a.tpat and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_DSHARE", "1"), ("CFD_DN", str(dshare[0])), ("CFD_DB", str(dshare[1])), ("CFD_DU", str(dshare[2])), ("CFD_DM", str(dshare[3])), ("CFD_DP", str(dshare[4]))] if dshare and src == "vm_ncrisc.cpp" else []) + \
@@ -1254,7 +1269,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         h[:, w] += h[:, w + 400] << 32
     root = [k * P for k in range(K)]
     gws = sorted(gtab)
-    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, tpat=a.tpat, dshare=a.dshare, pshare=a.pshare, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
+    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, tpat=a.tpat, dshare=a.dshare, pshare=a.pshare, g3=a.g3, usolve=a.usolve, tsolve=a.tsolve, ucad=a.ucad, uomega=a.uomega, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
                plan=info, sizes=E.sizes(), l1=l1, rows=nrow, walls=walls, ticks=ticks,
                ms_device=[max(t) / amax / 1e3 for t in ticks], aiclk=clks,
                same_history_all_chips=bool(all(np.array_equal(hist_all[0, :nrow], hist_all[k, :nrow]) for k in range(K))),

@@ -761,20 +761,32 @@ class EllMatrix:
         x = psi.internal
         bsrc = self.source + self._rs(self.bsrc)
         comps = [None] if psi.width == 1 else [c for c in range(psi.width) if self.ops.mesh.solutionD[c]]
-        perfs = []
-        for c in comps:
-            diag = self.diag + self.bdiag_c(0 if c is None else c)
-            b = bsrc if c is None else bsrc[:, c]
-            A = _EllOp(diag, self.off, self.ops.cnbr, self.ops.rowsum, self.ops.rowdot)
-            if self.ops.device is not None and (symmetric or self.ops.device_all):   # SpMV on the chip
-                A = _DeviceOp(A, self.ops.device)
-            xc = (x if c is None else x[:, c]).copy()
-            perf = self.ops.krylov(symmetric)(A, xc, b, controls)
-            if c is None:
-                x[:] = xc
-            else:
+        km = None if symmetric else getattr(self.ops, "krylov_multi", None)
+        if km is not None and len(comps) > 1 and self.ops.device is None:
+            As, xcs, bs = [], [], []
+            for c in comps:
+                diag = self.diag + self.bdiag_c(c)
+                As.append(_EllOp(diag, self.off, self.ops.cnbr, self.ops.rowsum, self.ops.rowdot))
+                xcs.append(x[:, c].copy())
+                bs.append(bsrc[:, c])
+            perfs = km(As, xcs, bs, controls)
+            for c, xc in zip(comps, xcs):
                 x[:, c] = xc
-            perfs.append(perf)
+        else:
+            perfs = []
+            for c in comps:
+                diag = self.diag + self.bdiag_c(0 if c is None else c)
+                b = bsrc if c is None else bsrc[:, c]
+                A = _EllOp(diag, self.off, self.ops.cnbr, self.ops.rowsum, self.ops.rowdot)
+                if self.ops.device is not None and (symmetric or self.ops.device_all):   # SpMV on the chip
+                    A = _DeviceOp(A, self.ops.device)
+                xc = (x if c is None else x[:, c]).copy()
+                perf = self.ops.krylov(symmetric)(A, xc, b, controls)
+                if c is None:
+                    x[:] = xc
+                else:
+                    x[:, c] = xc
+                perfs.append(perf)
         psi.correct_bc()
         return functools.reduce(np.maximum, [p.initial for p in perfs])
 

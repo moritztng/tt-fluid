@@ -119,6 +119,19 @@ static __attribute__((noinline, optimize("O3"))) void cfd_bsvc_run(volatile tt_l
         const uint32_t n = mb[12 + 4 * j + 2];
         uint32_t* out = reinterpret_cast<uint32_t*>(mb[12 + 4 * j + 3]);
 #ifdef CFD_DENSE
+#ifdef CFD_G3
+        if ((n >> 30) == 3u) {   // 3-component dense tile sharing one index stream (vm_ncrisc.cpp)
+            cfd_gather16_3(src,
+                           reinterpret_cast<const uint32_t*>(mb[16]),
+                           reinterpret_cast<const uint32_t*>(mb[17]),
+                           reinterpret_cast<const uint16_t*>(xs),
+                           n & 0x3fffffffu,
+                           out,
+                           reinterpret_cast<uint32_t*>(mb[18]),
+                           reinterpret_cast<uint32_t*>(mb[19]));
+            continue;
+        }
+#endif
         if (n >> 31) {   // lanes of a dense tile (vm_ncrisc.cpp): out[e] = src[ix[e]]
             cfd_gather16(src, reinterpret_cast<const uint16_t*>(xs), n & 0x7fffffffu, out);
             continue;

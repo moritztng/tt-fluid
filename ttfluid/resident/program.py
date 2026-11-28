@@ -60,16 +60,46 @@ class TracedOps(EllOps):
         return self._fold(np.minimum, init, s, 0) if isinstance(s, T) else super().rowmin(s, init)
 
     def krylov(self, symmetric):
-        f = krylov.pcg if symmetric else krylov.pbicgstab
-        if symmetric and getattr(self, "amg_levels", None) is not None:   # an empty SALevels (--amg-depth 0) is falsy
-            levels = self.amg_levels
-            f = lambda A, x, b, c: krylov.amg_pcg(A, x, b, c, levels)
+        if symmetric:
+            kind, f = "pcg", krylov.pcg
+            if getattr(self, "amg_levels", None) is not None:   # an empty SALevels (--amg-depth 0) is falsy
+                levels = self.amg_levels
+                f = lambda A, x, b, c: krylov.amg_pcg(A, x, b, c, levels)
+        elif krylov.TSOLVE == "jacobi":
+            kind, f = "jacobi", lambda A, x, b, c: krylov.smooth_jacobi_multi([A], [x], [b], c)[0]
+        elif krylov.TSOLVE == "mr":
+            kind, f = "mr", lambda A, x, b, c: krylov.mr_multi([A], [x], [b], c)[0]
+        else:
+            kind, f = "pbicgstab", krylov.pbicgstab
 
         def run(A, x, b, c):
             perf = f(A, x, b, c)
-            self.perfs.append(("pcg" if symmetric else "pbicgstab", perf))
+            self.perfs.append((kind, perf))
             return perf
         return run
+
+    @property
+    def krylov_multi(self):
+        mode = krylov.USOLVE
+        if mode == "bicgstab":
+            return None
+        if mode == "bicgstab3":
+            fn = lambda As, xs, bs, c: krylov.pbicgstab_multi(As, xs, bs, c, split_x=False)
+        elif mode == "bicgstab3s":
+            fn = lambda As, xs, bs, c: krylov.pbicgstab_multi(As, xs, bs, c, split_x=True)
+        elif mode == "jacobi3":
+            fn = krylov.smooth_jacobi_multi
+        elif mode == "mr3":
+            fn = krylov.mr_multi
+        else:
+            raise ValueError(f"unknown USOLVE mode: {mode}")
+
+        def run_multi(As, xs, bs, c):
+            perfs = fn(As, xs, bs, c)
+            for p in perfs:
+                self.perfs.append((mode, p))
+            return perfs
+        return run_multi
 
     def bslots(self, d, like):
         """Per-slot array, patch values on each patch's boundary slots, 0 elsewhere."""

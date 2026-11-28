@@ -912,7 +912,11 @@ def _lsched(code, space, log=print):
             return m
         best, pb = blk, peak(blk)
         q0 = pb
-        if len(blk) > 2:
+        def _gmap(ins):
+            return tuple((id(c), id(p)) for _, c, p in ins[2]) if ins[0] == "gather" else None
+        paired = any(_gmap(blk[k]) is not None and _gmap(blk[k]) == _gmap(blk[k + 1])
+                     for k in range(len(blk) - 1))
+        if len(blk) > 2 and not paired:
             pred, lastw, reads = [set() for _ in blk], {}, defaultdict(list)
             for k, ins in enumerate(blk):
                 u, d = _uses_defs(ins)
@@ -2282,18 +2286,26 @@ class Machine:
         isv = lambda r: r != "__anchor__" and not isinstance(r, tuple) and self.is_vec(r)
         rweight = Counter()
         for j, ins in enumerate(mir):
-            regs = []
+            regs, gregs = [], []
             if ins[0] in ("blk", "seg"):
-                regs = [r for b in ([ins] if ins[0] == "blk" else ins[1])
-                        for r in [u[2] for u in b[1] if u[0] in ("ld", "lds", "ldr") and u[2] is not None] +
-                        [y for u in b[1] if u[0] == "ldr" for y, _ in u[5]] + [r for _, r in b[2]]]
+                for b in ([ins] if ins[0] == "blk" else ins[1]):
+                    regs += [u[2] for u in b[1] if u[0] in ("ld", "lds") and u[2] is not None] + [r for _, r in b[2]]
+                    for u in b[1]:
+                        if u[0] == "ldr":
+                            if u[2] is not None:
+                                gregs.append(u[2])
+                            gregs += [y for y, _ in u[5]]
             elif ins[0] == "gather":
-                regs = [ins[1]] + [x for x, _ in ins[3]]
+                regs = [ins[1]]
+                gregs = [x for x, _ in ins[3]]
             elif ins[0] == "halo":
                 regs = [ins[2]]
             for r in regs:
                 if r in phys and isv(r):
                     rweight[r] += passes[j]
+            for r in gregs:
+                if r in phys and isv(r):
+                    rweight[r] += 10 * passes[j]
         # per register, heaviest first: the lowest of l1_vec L1 colours no interfering register holds, else a
         # DRAM colour the same way (a slot-wise pick leaves a loop's L1 slots idle through the outer body). An L1
         # colour is T tiles wide whatever the registers in it (a narrower multigrid value fills the front of its
