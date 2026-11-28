@@ -4,7 +4,7 @@ import time
 import numpy as np
 
 from ttfluid.lower import image_dev
-from ttfluid.lower.image import GAP, LANES, Image, Pages, _ChipFiles
+from ttfluid.lower.image import GAP, LANES, Image, Pages, _ChipFiles, load_state, par_zero
 from ttfluid.resident.machine import DBASE
 
 
@@ -157,6 +157,119 @@ def test_state_download_reads_only_the_pages_that_hold_a_value():
         m[0, 0] ^= np.uint32(1 << 2)                      # a page the scan missed: the state has to differ
         on = image_dev.map_pages(m, len(X))
         S = int(on.sum())
-        pages = Pages(collect(X, m, on, W, S), np.where(on, np.cumsum(on) - 1, S).reshape(P, hp))
+        pages = Pages(collect(X, m, on, W, S), np.where(on, np.cumsum(on) - 1, S).reshape(P, hp), zero_row=S)
         back = img.state(lambda k: A, lambda k: pages.view(np.float32))
         assert not np.array_equal(back["U"], state["U"])
+
+
+def test_load_state_mmap_and_compressed(tmp_path):
+    rng = np.random.default_rng(7)
+    arrays = {
+        "p": rng.standard_normal(5000).astype(np.float32),
+        "U": rng.standard_normal((5000, 3)).astype(np.float32),
+        "phi": np.asfortranarray(rng.standard_normal((2000, 5)).astype(np.float32)),
+    }
+    p_raw, p_cmp = tmp_path / "raw.npz", tmp_path / "cmp.npz"
+    np.savez(p_raw, **arrays, hist="[]")
+    np.savez_compressed(p_cmp, **arrays, hist="[]")
+    for path, expect_mmap in ((p_raw, True), (p_cmp, False)):
+        got = load_state(path)
+        assert set(got) == set(arrays)
+        for k, v in arrays.items():
+            assert np.array_equal(got[k], v)
+            assert got[k].dtype == v.dtype
+        if expect_mmap:
+            assert not got["p"].flags.writeable
+
+
+def test_contiguous_layout_roundtrip_parts_and_zero_skip(tmp_path):
+    rng = np.random.default_rng(9)
+    P, hp, nt = 5, 40, 4
+    # Core 2 is empty; chip 1's boundary space is empty; lanes are strictly 0..n_c-1 per core (real lowering layout)
+    counts0 = [1500, 2100, 0, 500, 1100]
+    counts1 = [1300, 900, 1024, 0, 1400]
+    n0, n1 = sum(counts0), sum(counts1)
+    n_cells = n0 + n1
+    perm = rng.permutation(n_cells)
+    ids0, ids1 = perm[:n0], perm[n0:]
+
+    def make_cl(counts):
+        c = np.repeat(np.arange(P, dtype=np.int32), counts)
+        l = np.concatenate([np.arange(cnt, dtype=np.int32) for cnt in counts])
+        shuf = rng.permutation(len(c))
+        return c[shuf], l[shuf]
+
+    c0, l0 = make_cl(counts0)
+    c1, l1 = make_cl(counts1)
+    b_n = 77
+    bc0 = np.zeros(b_n, np.int32)
+    bl0 = np.arange(b_n, dtype=np.int32)
+    regs_u = [["cells", 0, 3], ["cells", DBASE + 1, 3], ["cells", DBASE + 4, 3]]
+    shared = dict(
+        scalars=dict(K=2, P=P, ntiles=nt, tab_stream=False),
+        spaces={"cells": n_cells, "inlet": b_n},
+        const_state={"k/0": np.float32(0.25)},
+        state=[
+            ["U", [3], regs_u],
+            ["p", [], [["cells", DBASE + 8, 3]]],
+            ["bval", [], [["inlet", DBASE + 11, 1]]],
+            ["k", [], [["cells", None, None]]],
+        ],
+    )
+    home0 = np.zeros((P * hp, LANES), np.float32)
+    home1 = np.zeros((P * hp, LANES), np.float32)
+    home0[0] = rng.standard_normal(LANES)
+    home1[P * hp - 1] = rng.standard_normal(LANES)
+    Image(shared, {
+        0: {"home": home0, "ids/cells": ids0, "core/cells": c0, "lane/cells": l0,
+            "ids/inlet": np.arange(b_n), "core/inlet": bc0, "lane/inlet": bl0},
+        1: {"home": home1, "ids/cells": ids1, "core/cells": c1, "lane/cells": l1,
+            "ids/inlet": np.empty(0, np.int64), "core/inlet": np.empty(0, np.int32), "lane/inlet": np.empty(0, np.int32)},
+    }).write(tmp_path)
+    img = Image.load(tmp_path)
+    assert img._layout(0, "cells")[0] is True
+    assert img._layout(1, "inlet")[0] is True
+    state = {
+        "U": rng.standard_normal((n_cells, 3)).astype(np.float32),
+        "p": np.zeros(n_cells, np.float32),
+        "bval": rng.standard_normal(b_n).astype(np.float32),
+        "k": np.full(n_cells, 0.25, np.float32),
+    }
+    state["U"][:, 2] = 0.0
+    # Split across many parts so cores straddle part boundaries, and verify pooled Ahead + place match full fill
+    fill = lambda k, out, row=None: image_dev.chip_fill(img, k, P, "home", out, state, row)
+    pages = lambda k: image_dev.chip_pages(img, k, P, "home", state)
+    full = [np.zeros((P * hp, LANES), np.uint32) for _ in range(2)]
+    for k in range(2):
+        fill(k, full[k])
+    sg = image_dev.Staged([0, 1], (P * hp, LANES), fill, pages, cap=8 * 4096).mark()
+    assert sg.sparse and sg.parts >= 4
+    ahead = image_dev.Ahead(sg, alive=2)
+    seen_ids = set()
+    for p in sg.pieces():
+        got = ahead.next()
+        seen_ids.add(id(got.base if got.base is not None else got))
+        ref = image_dev.host_buffer(2, [0, 1], p.shape, p.fill)
+        assert np.array_equal(got, ref)
+        ahead.done()
+    assert len(seen_ids) <= 2
+    for k in range(2):
+        assert np.array_equal(lay(sg, k, 2 * P), full[k])
+    # Full round trip through scan + collect + Pages(..., zero_row=S)
+    A = [np.zeros((P, nt, LANES), np.float32) for _ in range(2)]
+    for k in range(2):
+        img.put_state(k, A[k], None, state)
+    ranges = image_dev.state_pages(img)
+    p_out = []
+    for k in range(2):
+        m = scan(full[k], 2 * P, hp, ranges)
+        on = image_dev.map_pages(m, len(full[k]))
+        S = int(on.sum())
+        p_out.append(Pages(collect(full[k], m, on, 2 * P, S),
+                           np.where(on, np.cumsum(on) - 1, S).reshape(P, hp), zero_row=S).view(np.float32))
+    back = img.state(lambda k: A[k], lambda k: p_out[k])
+    assert all(np.array_equal(back[k], state[k]) for k in state)
+    # par_zero smoke test on > 4 MB array
+    big = np.ones((2048, LANES), np.uint32)
+    par_zero(big)
+    assert not big.any()

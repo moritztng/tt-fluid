@@ -45,9 +45,9 @@ ap.add_argument("--cases", type=int, default=0, help="with --from-images: this m
                 "(sweep mode), each from the images' start (or --state-in), each with its own state npz and result row; the mesh "
                 "opens once and the next case's DRAM homes are built on the host while the device runs this one; a case that "
                 "diverges does not stop the cases after it, and the process then exits with status 4")
-ap.add_argument("--overlap", type=int, default=1, help="--cases: 1 = case k's outputs are copied on the device, case k+1 is "
-                "launched, and case k is read and saved over a second command queue while k+1 runs (the next homes are "
-                "written there too); 0 = the serial path (read, save, write, launch)")
+ap.add_argument("--overlap", type=int, default=0, help="--cases: 0 (default) = placed homes updated in place and state assembly + "
+                "save overlapped on the host while the next case runs; 1 = case k's outputs copied on the device on CQ 0 "
+                "and transferred over CQ 1 while k+1 runs")
 ap.add_argument("--out", default="results_mesh.jsonl")
 ap.add_argument("--noemu", action="store_true")
 ap.add_argument("--write", default="", help="as run_vm.py: write the final fields (OpenFOAM format) into this case dir copy")
@@ -513,11 +513,12 @@ if IMG is not None and not a.l1_check:
     def with_state():   # the arena and the homes carry the start state
         global STATE
         if a.state_in:
-            with np.load(a.state_in) as z:     # read once: a key of an npz is re-read from the file on every access
-                STATE = {k: z[k] for k in z.files if k != "hist"}
+            STATE = image_dev.load_state(a.state_in)
             print("state from %s" % a.state_in, flush=True)
             stamp("state read")
-        return dict(home=image_dev.Ahead(staged["home"]), arena=image_dev.host_buffer(K, DEVBLK, *filled("arena")))
+        # arena is small (~60 MB/chip) and uploaded first: build it before home Ahead grabs _READERS
+        ar = image_dev.host_buffer(K, DEVBLK, *filled("arena"))
+        return dict(arena=ar, home=image_dev.Ahead(staged["home"]))
     early = ThreadPoolExecutor(1)
     ahead = dict(consts=image_dev.Ahead(staged["consts"]), state=early.submit(with_state))
     early.shutdown(wait=False)
@@ -690,9 +691,11 @@ elif IMG is not None:   # chip by chip: chip k's arrays are built from its image
     ahead["blob"] = blob.submit(host, "blob")
     blob.shutdown(wait=False)
     t_arena = image_dev.upload(md, K, DEVBLK, *filled("arena"), "arena", lambda: host("arena", ahead.pop("arena")))
-    # a later run of --runs uploads the homes again and builds them then
-    up = lambda name: image_dev.upload_placed(md, cells, grid, cores, DEVBLK, staged[name], name, ahead.pop(name, None))
-    t_const, t_home = up("consts"), up("home")
+    # a later run of --runs / --cases updates t_home in place
+    up = lambda name, out=None, ah=None: image_dev.upload_placed(
+        md, cells, grid, cores, DEVBLK, staged[name], name, ah, out=out)
+    t_const = up("consts", ah=ahead.pop("consts", None))
+    t_home = up("home", ah=ahead.pop("home", None))
     t_blob = image_dev.upload(md, K, DEVBLK, *filled("blob"), "blob", ahead.pop("blob").result)
     t_tab = image_dev.upload(md, K, DEVBLK, (P, L), lambda k, out: np.copyto(out, chip_tab(k)), "tab")
     stamp("images uploaded (arena, consts, home, blob, tab)")
@@ -849,48 +852,63 @@ def main():
     if OVL:
         return main_overlap(io)
     rows_all = []
-    nxt = None   # --cases: the next case's homes, built on the host during this case's run
-    for rr in range(a.cases or a.legs or a.runs):
-        if nxt is not None:   # written into the same buffer: the program's addresses stay valid
-            ttnn.copy_host_to_device_tensor(nxt, t_home)
-            nxt = None
-            stamp("case %d: homes written" % rr)
-        elif rr and a.legs:   # the next leg continues: homes stay on the device, the arena's state registers from the dump
-            ttnn.deallocate(t_arena)
-            t_arena = image_dev.upload(md, K, DEVBLK, image_dev.chip_shape(IMG, P, "arena"), lambda k, out: np.copyto(
-                out, image_dev.carry_arena(IMG, k, P, o[k * P:(k + 1) * P, 1024:].reshape(P, nv, 1024))))
-            io[0] = t_arena
-            common[0] = t_arena.buffer_address()
-            stamp("leg %d: arena carried" % rr)
-        elif rr:   # every run starts from the uploaded state: the DRAM homes were written by the last one
-            ttnn.deallocate(t_home)
-            t_home = up("home") if IMG is not None else to_dev(home)
-            io[-1] = t_home
-            common[-1] = t_home.buffer_address()
-        launch(rr, io)
-        with Aiclk() as clk:
-            w0 = time.time()
-            ttnn.generic_op(io, mesh_program())
-            print("run %d: enqueued after %.1f s (compile included), waiting for the device" % (rr, time.time() - w0), flush=True)
-            if rr + 1 < a.cases:
-                nxt = next_homes()
-                stamp("case %d: homes built on the host" % (rr + 1))
-            ttnn.synchronize_device(md)
-            walls.append(time.time() - w0)
-        clks.append(clk.summary())
-        o = from_dev(t_out, np.uint32)
-        o = o.reshape(K * P, -1)
-        ticks.append(core0_ticks(o))
-        print("run %d wall %.3f s core0 ticks %s aiclk %s" % (rr, walls[-1], ticks[-1], clks[-1]), flush=True)
-        stamp("run %d done, dump read" % rr)
-        if a.legs:   # every leg's history rows, in order
-            hl = from_dev(t_hist, np.uint32).reshape(K, H, 16)
-            rows_all += [{nm: float(hl[0, q, i:i + 1].view(np.float32)[0]) for i, nm in enumerate(E.out_names)}
-                         for q in range(min(int(o.reshape(K * P, -1)[0, 14]), H))]
-            if rows_all and not all(np.isfinite(v) for v in rows_all[-1].values()):
-                break   # this leg ended on a non-finite row: the next one would only carry it
-        if a.cases:   # every case its own answer, read before the next case's homes overwrite this one's
-            report(o, walls[-1:], ticks[-1:], clks[-1:], None, ".c%d" % rr)
+    nxt = None   # --cases: Ahead(staged["home"]) for the next case, built on the host during this case's run
+    rep_ex = ThreadPoolExecutor(1) if a.cases else None
+    prev_rep = None
+    pr = image_dev.state_pages(IMG) if a.cases else None
+    try:
+        for rr in range(a.cases or a.legs or a.runs):
+            if nxt is not None:   # placed into the same buffer: the program's addresses stay valid
+                up("home", out=t_home, ah=nxt)
+                nxt = None
+                stamp("case %d: homes written" % rr)
+            elif rr and a.legs:   # the next leg continues: homes stay on the device, the arena's state registers from the dump
+                ttnn.deallocate(t_arena)
+                t_arena = image_dev.upload(md, K, DEVBLK, image_dev.chip_shape(IMG, P, "arena"), lambda k, out: np.copyto(
+                    out, image_dev.carry_arena(IMG, k, P, o[k * P:(k + 1) * P, 1024:].reshape(P, nv, 1024))))
+                io[0] = t_arena
+                common[0] = t_arena.buffer_address()
+                stamp("leg %d: arena carried" % rr)
+            elif rr:   # every run starts from the uploaded state: the DRAM homes were written by the last one
+                if IMG is not None:
+                    t_home = up("home", out=t_home)
+                else:
+                    ttnn.deallocate(t_home)
+                    t_home = to_dev(home)
+                io[-2] = t_home
+                common[-2] = t_home.buffer_address()
+            launch(rr, io)
+            with Aiclk() as clk:
+                w0 = time.time()
+                ttnn.generic_op(io, mesh_program())
+                print("run %d: enqueued after %.1f s (compile included), waiting for the device" % (rr, time.time() - w0), flush=True)
+                if rr + 1 < a.cases:
+                    nxt = image_dev.Ahead(staged["home"])
+                ttnn.synchronize_device(md)
+                walls.append(time.time() - w0)
+            clks.append(clk.summary())
+            o = from_dev(t_out, np.uint32)
+            o = o.reshape(K * P, -1)
+            ticks.append(core0_ticks(o))
+            print("run %d wall %.3f s core0 ticks %s aiclk %s" % (rr, walls[-1], ticks[-1], clks[-1]), flush=True)
+            stamp("run %d done, dump read" % rr)
+            if a.legs:   # every leg's history rows, in order
+                hl = from_dev(t_hist, np.uint32).reshape(K, H, 16)
+                rows_all += [{nm: float(hl[0, q, i:i + 1].view(np.float32)[0]) for i, nm in enumerate(E.out_names)}
+                             for q in range(min(int(o.reshape(K * P, -1)[0, 14]), H))]
+                if rows_all and not all(np.isfinite(v) for v in rows_all[-1].values()):
+                    break   # this leg ended on a non-finite row: the next one would only carry it
+            if a.cases:   # read device outputs now so t_home can be overwritten; assemble and save on the host while case rr+1 runs
+                hist_c = from_dev(t_hist, np.uint32)
+                hp_c = image_dev.download_state(md, cells, grid, cores, DEVBLK, t_home, P, HPG, pr)
+                if prev_rep is not None:
+                    prev_rep.result()
+                prev_rep = rep_ex.submit(report, o, walls[-1:], ticks[-1:], clks[-1:], None, ".c%d" % rr, hist_c, hp_c)
+        if prev_rep is not None:
+            prev_rep.result()
+    finally:
+        if rep_ex is not None:
+            rep_ex.shutdown(wait=True)
     if not a.cases:
         report(o, walls, ticks, clks, rows_all if a.legs else None, "")
 
@@ -1091,9 +1109,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
                                               max(float(np.max(np.abs(es[kk]))), 1e-30)) for kk in es if np.size(es[kk])})
     if tag:
         res["case_index"] = int(tag[2:])
-    np.savez(str(Path(a.out).with_suffix("")) + f"{tag}_{a.what}_{R}x{C}_state.npz",
-             **{kk: np.asarray(v) for kk, v in dev_state.items()}, hist=json.dumps(rows))
-    stamp("state saved")
+    state_path = str(Path(a.out).with_suffix("")) + f"{tag}_{a.what}_{R}x{C}_state.npz"
     if a.write and a.what == "case" and not res["abort"]["cores"]:
         import shutil
         from ttfluid.resident.program import apply_state
@@ -1109,12 +1125,28 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
     print(json.dumps(res), flush=True)
     with open(a.out, "a") as f:
         f.write(json.dumps(res) + "\n")
+    _submit_save(state_path, {kk: np.asarray(v) for kk, v in dev_state.items()}, json.dumps(rows))
     if res["abort"]["cores"] or not nrow:   # a run that aborted on its bounded waits is a failure, not a row
         raise SystemExit(3)
     if res["diverged"]:   # the state is saved and the row is in the result; the answer is not one
         if not a.cases:
             raise SystemExit(4)
         diverged_cases.append(tag)   # the program ended by itself, so the cases after this one still run
+
+
+_SAVER = ThreadPoolExecutor(1)
+_SAVES = []
+
+
+def _save_state(path, state_dict, hist_json):
+    np.savez(path, **state_dict, hist=hist_json)
+    stamp("state saved")
+
+
+def _submit_save(path, state_dict, hist_json):
+    while _SAVES:
+        _SAVES.pop(0).result()
+    _SAVES.append(_SAVER.submit(_save_state, path, state_dict, hist_json))
 
 
 try:
@@ -1126,3 +1158,8 @@ finally:   # a failed build or run must still release the mesh, or the interpret
     ttnn.close_mesh_device(md)
     if FAB:
         ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
+    try:
+        while _SAVES:
+            _SAVES.pop(0).result()
+    finally:
+        _SAVER.shutdown(wait=True)
