@@ -33,7 +33,7 @@ C_LDRH = 43             # C_LDR of a bf16 page (Machine narrow), widened to fp32
 C_STWH = 44             # C_STW packed to bf16 (Machine narrow 2)
 C_PH = 45               # phase marker (Encoded(phase=...)): phase id in the top 16 bits; vm_compute CFD_PHASE
 NARROW = 1 << 27        # desc bit: a bf16 constant page (vm_ncrisc window)
-C_LDK = 46              # C_LDR of a constant page the fold table may serve (Machine kfold): operand word = the
+C_LDK = 46              # C_LDR of a constant page the fold table may serve (Machine kfold): bits 12 up = the
 #                         constant's page offset; a non-zero code of page offset + tile fills the slot, no page comes
 FOLD = 1 << 26          # desc bit: the reader skips the pages of this constant that the fold table codes (vm_ncrisc)
 TILE = 0x80     # op bit: tile operand += loop counter
@@ -326,8 +326,8 @@ class Encoded:
                     assert u[3] % 4 == 0
                     c(W(C_LDS, u[1]) | tf(u[2]) | phys[u[2]] << 16, u[3] // 4)
                 elif k == "ldr" and m.kfolds(u):
-                    assert phys[u[2]] - KBASE < FOLD
-                    c(W(C_LDK, u[1]), phys[u[2]] - KBASE)
+                    assert phys[u[2]] - KBASE < 1 << 20 and page_phase(0) == 0
+                    c(W(C_LDK, u[1]) | phys[u[2]] - KBASE << 12)
                 elif k == "ldr":
                     if u[2] is not None and (m.fetched_from.get(u[2]) in m.narrow or u[2] in m.narrow_home):
                         assert u[3] % 8 == 0 and u[4] is None
@@ -706,13 +706,16 @@ class Encoded:
 
     def _kfold_break(self, pages, pal, code):
         """--kfold-broken on core 0, the arms a gate has to fail on: 1 = one page that is not uniform gets a code (the
-        page a stream reads whose words differ most from the palette value); 2 = one palette value is one ulp off."""
+        page a stream reads whose words differ most from the palette value); 2 = every non-zero palette value is one
+        ulp off (a uniform 1.0 page is mostly a mask, which one ulp does not move: pitzDaily and the hood cut keep
+        their state when only that value is off)."""
         m = self.m
         if self.kfold_broken == 2:
-            k = int(np.argmax(np.bincount(code[code > 0], minlength=4)[1:] * (pal != 0)))   # the most used non-zero value
-            assert pal[k] != 0 and (code == k + 1).any(), "no non-zero uniform page on core 0"
-            pal[k] += 1
-            self.kfold_broke = "core 0: palette %d %#010x -> %#010x" % (k, pal[k] - 1, pal[k])
+            ks = [k for k in range(3) if int(pal[k]) & 0x7fffffff and (code == k + 1).any()]
+            assert ks, "no non-zero uniform page on core 0"
+            was = pal.copy()
+            pal[ks] += 1
+            self.kfold_broke = "core 0: palette " + ", ".join("%#010x -> %#010x" % (was[k], pal[k]) for k in ks)
             return
         read = np.zeros(len(code), bool)     # pages some FOLD stream reads
         for x in m.mir:

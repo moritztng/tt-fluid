@@ -230,11 +230,11 @@ class DevSim:
                 pcs[ag] = pc + 1
             elif op == E.C_LDK:     # --kfold: a coded page fills the slot, no ring page (the tile loop counter picks it)
                 lp = self.tloop.get(ag)
-                if not self._kfolded(i, int(S[pc + 1]), lp[0] if lp and lp[0] < lp[1] else 0):
+                if not self._kfolded(i, w >> 12, lp[0] if lp and lp[0] < lp[1] else 0):
                     if q[(i, "rin")] == 0:
                         return None
                     q[(i, "rin")] -= 1
-                pcs[ag] = pc + 2
+                pcs[ag] = pc + 1
             elif op in (E.C_STW, E.C_STWH):
                 if q[(i, "rout")] >= self.ring:
                     return None

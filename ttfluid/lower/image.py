@@ -61,6 +61,8 @@ class Image:
                   tab_stream=bool(E.tab_stream), nmaxop=int(E.n_maxop()), loop_pages=int(E.loop_pages))
         if len(getattr(m.maps, "plans", ())) > 1:      # multigrid halo plans: slot sizes per plan (Machine.hoff)
             sc.update(nplans=len(m.maps.plans), hwords=int(m.hwords))
+        if getattr(m, "kfold_tile", None) is not None:      # --kfold: the fold table's arena tile (kernel define CFD_KFOLD)
+            sc.update(kfold_tile=int(m.kfold_tile))
         # the state: per name the registers' (phys, tiles, space) or a constant (prog_pre) value
         state, spaces = [], {}
         for name, cr in m.prog.state:

@@ -115,6 +115,7 @@ class MachineEmu:
         self.check = True
         self.labels = {ins[1]: i for i, ins in enumerate(m.mir) if ins[0] == "label"}
         self.history, self.counts = [], Counter()
+        self.kcoded = np.zeros(m.P, np.int64)     # --kfold: constant pages the fold table served, per core
         self.pcc = Counter()     # executions per MIR index (region census)
         self.optiles = Counter()  # executed tile ops: "op" compute uops, "ld" loads (a --sliced A/B weighted by trips)
         # the same per SIMPLE phase (program.PHASES, from the phase markers of build(phase=True)), plus "ldr" DRAM page
@@ -394,6 +395,8 @@ class MachineEmu:
                 if t == 0:
                     self._page[id(u)] = self._ldr_vector(u)
                 D[u[1]] = self._page[id(u)][:, t * LANES:(t + 1) * LANES].copy()
+                if u[2] is not None and m.phys[u[2]] >= KBASE:
+                    self.counts["ldr:const"] += 1      # ring pages built from a DRAM constant, per core
                 if self.kfold is not None and m.kfolds(u):
                     # --kfold: where the fold table codes page coff + t the device fills the slot from the palette and
                     # no page comes. Read from the table words the device gets, so a wrong table shows here
@@ -401,10 +404,7 @@ class MachineEmu:
                     code = kfold_codes(self.kfold, np.full((m.P, 1), m.phys[u[2]] - KBASE + t))[:, 0]
                     sel = code > 0
                     D[u[1]][sel] = self.kfold[sel, code[sel] - 1].view(np.float32).astype(F)[:, None]
-                    if t == 0:
-                        self.counts["kfold:streams"] += 1
-                    self.counts["kfold:pages"] += 1
-                    self.counts["kfold:folded"] += sel.sum() / m.P
+                    self.kcoded += sel                    # of those, the pages this core never streams
             elif k == "lds":
                 D[u[1]] = self._shifted(u[2], t, u[3])
             elif k == "fill":

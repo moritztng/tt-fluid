@@ -90,6 +90,13 @@ stays bit-identical. Both are off by default.
   vector. The gather is then served by the dense tables, with no window read and no gather-cache miss. `--span 2`
   also turns such a gather into a single reader page when its destination is in SRAM.
 
+The fields a run never changes (geometry, coefficients, masks) are DRAM constants, streamed like any DRAM-homed vector.
+Many of their 4 KB pages hold one value in every lane: zero where a stencil slot has no neighbour, one or a half
+elsewhere. `--kfold 1` never streams such a page. Each core gets a fold table in one SRAM tile: a 2-bit code per
+constant page and a palette of the three uniform values that cover the most pages on that core. The reader sends
+nothing for a coded page and the compute kernel fills the register from the palette, the same bits the page holds.
+Off by default; the state stays bit-identical.
+
 `ttfluid.resident.encode` packs the result into three uint32 streams per core, one for each kernel:
 
 - `vm_brisc.cpp` (BRISC) loads the core's arena and code, then runs the B stream: signals and waits, halo pushes with

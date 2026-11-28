@@ -169,6 +169,16 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* go = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(1));
     uint32_t pc = 0;
     const uint32_t arena = get_write_ptr(cb_v);
+#ifdef CFD_KFOLD
+    // run_mesh --kfold: the core's fold table in arena tile CFD_KFOLD (encode.kfold_words): a 2-bit code per constant
+    // page from word 4. A page with a non-zero code is filled by compute (vm_compute.cpp C_LDK): N_STREAM sends
+    // nothing for it. Descriptor bit 26 (encode.FOLD) marks the entries the table serves; BRISC loads the arena
+    // before `go`
+    const uint32_t* KF = reinterpret_cast<const uint32_t*>(arena + CFD_KFOLD * 4096);
+    constexpr uint32_t DV = 0x3ffffff;
+#else
+    constexpr uint32_t DV = 0x7ffffff;
+#endif
 #ifdef CFD_TRID
     // run_vm --trid 1: STREAM tags ring slot k's reads with NOC transaction id 1 + k and pushes each slot, in order, as
     // soon as its own reads landed (the id's outstanding count is 0) while later slots stay in flight; without it a
@@ -265,7 +275,7 @@ void kernel_main() {
 
     // DRAM page of tile t of a kind-1/2 source
     auto dpage = [&](uint32_t d, uint32_t t) -> uint64_t {
-        const uint32_t v = d & 0x7ffffff;   // bit 27: a bf16 page (encode.NARROW)
+        const uint32_t v = d & DV;   // bit 27: a bf16 page (encode.NARROW); bit 26: encode.FOLD
         return (d >> 28) == 1 ? t_home.get_noc_addr(core * HP + v + t, 0) : t_const.get_noc_addr(core * CP + v + t, 0);
     };
     // one value of a source at lane i: L1 now, DRAM through the batch (flush() before using the destination)
@@ -986,6 +996,15 @@ void kernel_main() {
                     for (uint32_t e = 0; e < ne && run; ++e) {
                         const uint32_t d = N[p];
                         const int32_t sh = static_cast<int32_t>(N[p + 1]) >> SS;
+#ifdef CFD_KFOLD
+                        if (d >> 26 & 1) {   // a FOLD entry: a page the table codes takes no ring slot and no read
+                            const uint32_t i = (d & DV) + t;
+                            if (KF[4 + (i >> 4)] >> (2 * (i & 15)) & 3) {
+                                p += 2 + 2 * (N[p + 1] & 0xf);
+                                continue;
+                            }
+                        }
+#endif
 #ifdef CFD_TRID
                         if (pend && !cb_pages_reservable_at_back(cb_in, pend + 1)) retire(true);
 #else

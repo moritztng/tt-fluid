@@ -28,7 +28,7 @@ enum : uint32_t {
     C_END = 0, C_ACQ, C_COMMIT, C_REL, C_LD, C_ST, C_FILL, C_RVF,
     C_ADD, C_SUB, C_MUL, C_DIV, C_MAX, C_MIN, C_WHERE, C_CPD,
     C_NEG, C_ABS, C_SQRT, C_TANH, C_LOG, C_EXP, C_GTZ, C_GEZ, C_LTZ, C_LEZ, C_EQZ, C_NEZ,
-    C_FOLD, C_TOK, C_SIGB, C_SIGN, C_WAITB, C_WAITN, C_JMP, C_BRT, C_LDS, C_TBEG, C_TEND, C_LDR, C_STW, C_MAD, C_MSB, C_LDRH, C_STWH, C_PH
+    C_FOLD, C_TOK, C_SIGB, C_SIGN, C_WAITB, C_WAITN, C_JMP, C_BRT, C_LDS, C_TBEG, C_TEND, C_LDR, C_STW, C_MAD, C_MSB, C_LDRH, C_STWH, C_PH, C_LDK
 };
 constexpr uint32_t TILE = 0x80;   // op bit: the tile operand is offset by the tile loop counter
 
@@ -64,6 +64,11 @@ void kernel_main() {
     uint32_t hi = 0, rel = 0;   // paged: pages acquired (virtual pc below hi * PW is readable), pages released
     volatile uint32_t* hw = reinterpret_cast<volatile uint32_t*>(get_tile_address(cb_hdr, 0));
     uint32_t pc = 0, nops = 0, taken = 0;
+#ifdef CFD_KFOLD
+    // run_mesh --kfold: the core's fold table in arena tile CFD_KFOLD (encode.kfold_words): three palette words, a
+    // spare, then a 2-bit code per constant page. Static, so every thread reads it directly
+    const uint32_t* KF = reinterpret_cast<const uint32_t*>(get_tile_address(cb_v, CFD_KFOLD));
+#endif
 #ifdef CFD_TGTS
     // T-gather mailbox (vm_ncrisc.cpp, the 256 B of cb_sync before the B-patch one): NCRISC posts the top CFD_TGTS / 8
     // of each L1-source and halo section of a GATHER tile (src, entries, n, page) and bumps SEQ; UNPACK copies them from
@@ -223,15 +228,32 @@ void kernel_main() {
                 break;
             }
             case C_ST: pack_tile<true>(a, cb_v, (w >> 16) + to); break;
-            case C_LDR:   // next reader page; the tile starts b 16-B units in (the DRAM source's 32-B phase)
+#ifdef CFD_KFOLD
+            case C_LDK: {   // C_LDR (phase 0) of constant page (w >> 12) + tile, unless the table codes it: then MATH fills
+                const uint32_t i = (w >> 12) + tl, k = KF[4 + (i >> 4)] >> (2 * (i & 15)) & 3;
+                if (k) {   // the reader sent no page (vm_ncrisc.cpp N_STREAM)
+                    SFI(C_FILL, fill_tile_init());
+                    fill_tile_bitcast(a, KF[k - 1]);
+                    break;
+                }
+            }
+            [[fallthrough]];
+#endif
+            case C_LDR: {   // next reader page; the tile starts ph 16-B units in (the DRAM source's 32-B phase)
+                const uint32_t ph =
+#ifdef CFD_KFOLD
+                    op == C_LDK ? 0 :
+#endif
+                    b;
                 TWAIT(cb_in);
                 cb_wait_front(cb_in, 1);
                 LDI(cb_in);
-                UNPACK((get_local_cb_interface(cb_in).fifo_rd_ptr += b));
+                UNPACK((get_local_cb_interface(cb_in).fifo_rd_ptr += ph));
                 copy_tile(cb_in, 0, a);
-                UNPACK((get_local_cb_interface(cb_in).fifo_rd_ptr -= b));
+                UNPACK((get_local_cb_interface(cb_in).fifo_rd_ptr -= ph));
                 cb_pop_front(cb_in, 1);
                 break;
+            }
 #ifdef CFD_NARROW
             case C_LDRH:   // C_LDR of a bf16 page: CB CFD_NARROW (bfloat16) views cb_in's front page, srcA widens it to fp32
                 TWAIT(cb_in);

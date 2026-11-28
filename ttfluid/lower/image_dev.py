@@ -63,7 +63,7 @@ def setup(d, LOWER, K, P, R, C):
     assert "cpages" in s, "images written before packed DRAM constants/homes (page core * pages + offset + t): lower again"
     m = SimpleNamespace(ntiles=s["ntiles"], ndram=s["ndram"], hpages=s["hpages"], cpages=s["cpages"], T=s["T"], red2=s["red2"], redm=s["redm"], nhalo=s["nhalo"],
                         maps=SimpleNamespace(hmax=s["hmax"], plans=[None] * s.get("nplans", 1)),
-                        hwords=s.get("hwords", max(s["nhalo"] * s["hmax"], 1)))
+                        hwords=s.get("hwords", max(s["nhalo"] * s["hmax"], 1)), kfold_tile=s.get("kfold_tile"))
     tab_halo = np.concatenate([np.asarray(img.chip(k)["tab_halo"]) for k in range(K)])
     sizes = dict(sh["sizes"])
     c = sh["c"] if flags.get("n") == LOWER["n"] else set_outer(sh["c"], flags["n"], LOWER["n"])

@@ -147,7 +147,7 @@ ap.add_argument("--lsplit", type=int, default=0, help="1: a vector that holds an
 ap.add_argument("--kfold", type=int, default=0, help="1: a DRAM constant page that holds one bit pattern (zeros, ones, ...) is not streamed: a per-core "
                 "table in one more arena tile tells the reader to skip it and compute to fill the slot (Machine(kfold)). Same values. Needs a lowering")
 ap.add_argument("--kfold-broken", type=int, default=0, help="test arms of --kfold on core 0, the result has to differ: 1 a page that is not uniform "
-                "is coded as uniform, 2 one palette value is one ulp off")
+                "is coded as uniform, 2 every non-zero palette value is one ulp off")
 ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3, 4 need --tabstream (mesh has no trid). Default 0 keeps the built images unchanged")
 ap.add_argument("--os", type=int, default=0, help="1: BRISC built for size (#pragma GCC optimize Os), 2: NCRISC too, for a program over the kernel config buffer")
 ap.add_argument("--prof", action="store_true", help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores")
@@ -466,6 +466,9 @@ elif not a.noemu:
     print("executed tile ops %d, load tiles %d (per core)" % (me.optiles["op"], me.optiles["ld"]), flush=True)
     for ph_, c_ in me.phtiles.items():   # per SIMPLE phase over the whole run (build(phase=True) markers)
         print("emu phase %-12s %s" % (ph_, " ".join("%s %d" % kv for kv in sorted(c_.items()))), flush=True)
+    if me.counts["ldr:const"]:   # the census --kfold is judged by: ring pages built from DRAM constants, and the ones it serves
+        print("constant pages a core in %d rows: %d read%s" % (len(me.history), me.counts["ldr:const"], "; kfold serves per core min %d mean %.0f max %d, core 0 %d, so core 0 streams %d" % (
+            me.kcoded.min(), me.kcoded.mean(), me.kcoded.max(), me.kcoded[0], me.counts["ldr:const"] - me.kcoded[0]) if me.kfold is not None else ""), flush=True)
     if a.emuonly:
         for k_, r_ in enumerate(me.history[:5] + me.history[5:][-1:]):
             print("emu row", k_ if k_ < 5 else len(me.history) - 1, " ".join(f"{n} {v:.6g}" for n, v in sorted(r_.items())), flush=True)
@@ -677,7 +680,8 @@ else:
         blob.reshape(K * P, TBP * 1024)[:, :E.tab_blob.shape[1]] = E.tab_blob
     t_blob = to_dev(blob)
 defs = [("CFD_PROF", "1")] * a.prof + [("CFD_STOP", str(a.stop))] * bool(a.stop) + [("CFD_CP", str(m.cpages)), ("CFD_MESH", str(K)), ("CFD_NSH", str(NSH)), ("CFD_SYNCB", str(SYNCB)), ("CFD_GB", str(GB)), ("CFD_RB", str(RB)), ("CFD_CONS", str(E0 + 512))] + ([("CFD_RED2", "1")] if m.red2 else []) + \
-       ([("CFD_TABSTREAM", str(CB_TS))] if a.tabstream else []) + ([("CFD_WIDE", "1")] if ttfluid.resident.encode.WIDE else []) + ([("CFD_BSCAL", "1")] if a.bscal else []) + ([("CFD_OS", str(a.os))] if a.os else [])
+       ([("CFD_TABSTREAM", str(CB_TS))] if a.tabstream else []) + ([("CFD_WIDE", "1")] if ttfluid.resident.encode.WIDE else []) + ([("CFD_BSCAL", "1")] if a.bscal else []) + ([("CFD_OS", str(a.os))] if a.os else []) + \
+       ([("CFD_KFOLD", str(m.kfold_tile))] if getattr(m, "kfold_tile", None) is not None else [])
 
 
 def kd(src, ct, cfg, rt=None, crt=None):
