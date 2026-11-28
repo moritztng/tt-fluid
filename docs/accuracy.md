@@ -200,9 +200,11 @@ there on; the same solve carried out in double precision stays finite.
 
 The floor was OpenFOAM's double-precision `SMALL` in single-precision arithmetic. OpenFOAM's single-precision `SMALL`
 is 1e-6 (ESI `floatScalarSMALL`), and tt-fluid now floors omega there when it computes in fp32 (1e-15 in fp64;
-`omegaMin` and `kMin` in the RAS dictionary override the defaults). A run whose residuals still become non-finite ends in that iteration: the device
-program leaves its outer loop, and `run_mesh` prints `DIVERGED` with the iteration, saves the state and exits with
-code 4. `tests/test_diverge.py` reproduces the chain on pitzDaily, from the pocket to the NaN.
+`omegaMin` and `kMin` in the RAS dictionary override the defaults). A run whose residuals still become non-finite
+ends in that iteration: the device program leaves its outer loop, and `run_mesh` prints `DIVERGED` with the
+iteration, saves the state and exits with code 4. On a Blackhole 2x2 block a Small run started with one NaN cell
+stopped after its first iteration, 1.5 s of device time. `tests/test_diverge.py` reproduces the chain on pitzDaily,
+from the pocket to the NaN.
 
 ## 4. Drag and lift against OpenFOAM (occDrivAer, coarse mesh)
 
