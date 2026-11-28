@@ -134,6 +134,7 @@ ap.add_argument("--cap", type=int, default=32, help="as run_vm.py: scratch cap, 
 ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3, 4 need --tabstream (mesh has no trid). Default 0 keeps the built images unchanged")
 ap.add_argument("--os", type=int, default=0, help="1: BRISC built for size (#pragma GCC optimize Os), 2: NCRISC too, for a program over the kernel config buffer")
 ap.add_argument("--prof", action="store_true", help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores")
+ap.add_argument("--knockin", choices=("a", "b", "c", "d"), help="one class of work is done TWICE in a kernel and the values are kept, so the state stays bitwise with the plain run and the added time is what the run pays for that class: a = the reader reads every constant page from DRAM twice, b = a gather-cache miss fetches its page twice (one fetch after the other), c = the writer sends every store page to its DRAM home twice, d = compute runs the body of every elementwise SFPU op twice when its destination is none of its sources (in-place and accumulating ops run once). Read the slope against the plain run; the digest must be the plain run's")
 ap.add_argument("--knock", choices=("a", "b", "c", "d"), help="TIMING ONLY, the numbers of the run are wrong by design: one class of work is removed "
                 "in a kernel and nothing else changes. a = an fp32 constant page comes from the reader's zero tile (no DRAM read), b = a gather-cache miss skips "
                 "its DRAM read, c = compute's store pages are popped and not written to DRAM, d = the elementwise SFPU op words of the assembly phases "
@@ -629,6 +630,10 @@ else:
     if E.tab_stream:
         blob.reshape(K * P, TBP * 1024)[:, :E.tab_blob.shape[1]] = E.tab_blob
     t_blob = to_dev(blob)
+if a.knockin:
+    assert not a.knock, "--knockin (bitwise, a class done twice) and --knock (timing only, a class removed) are separate arms"
+    assert a.knockin != "b" or (a.gcache and not a.bpatch), "--knockin b doubles the gather-cache miss fetch of the reader: it needs --gcache and no --bpatch"
+    print("KNOCK-IN ARM %s: one class of work is done twice, the state must be bitwise with the plain run" % a.knockin, flush=True)
 if a.knock:
     from ttfluid.resident.program import PHASES
     KNOCK_D = sum(1 << PHASES.index(p) for p in ("mom", "p_asm", "flux", "turb_asm"))
@@ -653,6 +658,10 @@ def kd(src, ct, cfg, rt=None, crt=None):
         ([("CFD_BGTS", str(a.bgts))] if a.bgts and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_TGTS", str(a.tgts))] if a.tgts and src in ("vm_ncrisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_GTILE", "1")] if a.gtile and src == "vm_ncrisc.cpp" else []) + \
+        ([("CFD_KIN_A", "1")] if a.knockin == "a" and src == "vm_ncrisc.cpp" else []) + \
+        ([("CFD_KIN_B", "1")] if a.knockin == "b" and src == "vm_ncrisc.cpp" else []) + \
+        ([("CFD_KIN_C", "1")] if a.knockin == "c" and src == "vm_brisc.cpp" else []) + \
+        ([("CFD_KIN_D", "1")] if a.knockin == "d" and src == "vm_compute.cpp" else []) + \
         ([("CFD_KNOCK_A", "1")] if a.knock == "a" and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_KNOCK_B", "1")] if a.knock == "b" and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_KNOCK_C", "1")] if a.knock == "c" and src == "vm_brisc.cpp" else []) + \
@@ -959,7 +968,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         h[:, w] += h[:, w + 400] << 32
     root = [k * P for k in range(K)]
     gws = sorted(gtab)
-    res = dict(knock=a.knock, jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
+    res = dict(knock=a.knock, knockin=a.knockin, jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
                plan=info, sizes=E.sizes(), l1=l1, rows=nrow, walls=walls, ticks=ticks,
                ms_device=[max(t) / amax / 1e3 for t in ticks], aiclk=clks,
                same_history_all_chips=bool(all(np.array_equal(hist_all[0, :nrow], hist_all[k, :nrow]) for k in range(K))),
@@ -971,7 +980,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
                           chips={k: [dict(sorted(collections.Counter(int(x) for x in hdr[k * P:(k + 1) * P, c] if x).items()))
                                      for c in (30, 32)] for k in range(K)},
                           gw={int(g): int(hdr[g, 30]) for g in gws}),
-               counts=dict(red=int(hdr[0, 13]), halo=int(hdr[0, 17]), rows=nrow),
+               counts=dict(red=int(hdr[0, 13]), halo=int(hdr[0, 17]), rows=nrow, nops=int(hdr[:, 5].astype(np.int64).sum())),
                stage=dict(root=[int(h[q, 57]) for q in root], gw={int(g): int(h[g, 57]) for g in gws}),
                mesh_cyc=dict(barrier=[int(h[q, 56]) for q in root], xred=[int(h[q, 48]) for q in root],
                              xred_n=[int(h[q, 49]) for q in root],

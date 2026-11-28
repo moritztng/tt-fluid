@@ -946,6 +946,10 @@ void kernel_main() {
                         const uint32_t dd = dsc[i % n];
                         noc_async_write(rp, t_home.get_noc_addr(core * HP + (dd & 0x7ffffff) + i / n, 0),
                                         (dd >> 27) & 1 ? 2048 : 4096);
+#ifdef CFD_KIN_C   // run_mesh --knockin c: every store page goes to its DRAM home twice (bitwise)
+                        noc_async_write(rp, t_home.get_noc_addr(core * HP + (dd & 0x7ffffff) + i / n, 0),
+                                        (dd >> 27) & 1 ? 2048 : 4096);
+#endif
 #endif
                         rp += 4096;
                     }

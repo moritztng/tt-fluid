@@ -198,6 +198,17 @@ void kernel_main() {
 #ifdef CFD_KNOCK_D
         if (((CFD_KNOCK_D >> kph) & 1) && ((op >= C_ADD && op < C_FOLD) || op == C_MAD || op == C_MSB)) continue;
 #endif
+#ifdef CFD_KIN_D
+        // run_mesh --knockin d: an elementwise SFPU op whose destination a is none of its sources runs its body twice
+        // (same sources, same destination: bitwise). In-place ops (the unary ones, an accumulating add or addcmul) run
+        // once: a second pass would change the value. nops counts the second bodies, so counts.nops of the run
+        // against the plain run's is the number of op-tile bodies this arm added.
+        uint32_t krep = 0;
+        if (op >= C_ADD && op <= C_MIN) krep = a != b && a != c;
+        else if (op == C_WHERE || op == C_MAD || op == C_MSB) krep = a != b && a != c && a != d;
+        else if (op == C_CPD) krep = a != b;
+    kin_again:
+#endif
         switch (op) {
             case C_END: run = false; break;
             case C_ACQ: tile_regs_acquire(); break;
@@ -335,6 +346,13 @@ void kernel_main() {
                 run = false;
                 break;
         }
+#ifdef CFD_KIN_D
+        if (krep) {
+            krep = 0;
+            ++nops;
+            goto kin_again;
+        }
+#endif
 #ifdef CFD_PROF
         {
             const uint32_t t = static_cast<uint32_t>(ckernel::read_wall_clock());

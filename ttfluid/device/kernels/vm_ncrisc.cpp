@@ -299,6 +299,10 @@ void kernel_main() {
                 gcn = gcn + 1 == NGC ? 0 : gcn + 1;
 #ifndef CFD_KNOCK_B   // timing only (run_mesh --knock b): a gather-cache miss keeps its bookkeeping and skips the DRAM
                       // read, so the values patched in are the slot's old bytes
+#ifdef CFD_KIN_B   // run_mesh --knockin b: a gather-cache miss fetches its page twice, one fetch after the other, into the
+                   // same slot (bitwise; the run pays the miss round trip twice)
+                for (uint32_t rep = 0; rep < 2; ++rep) {
+#endif
 #ifdef CFD_TRID
                 noc_async_read_set_trid(TID_GC);
                 noc_async_read(dpage(d, t), get_write_ptr(cb_gc) + j * 4096, 4096);
@@ -307,6 +311,9 @@ void kernel_main() {
 #else
                 noc_async_read(dpage(d, t), get_write_ptr(cb_gc) + j * 4096, 4096);
                 noc_async_read_barrier();
+#endif
+#ifdef CFD_KIN_B
+                }
 #endif
 #endif
                 gcd[j] = d;
@@ -471,7 +478,11 @@ void kernel_main() {
         }
     };
     // tile t of source d read at lane shift sh into dst (dst + phase: see encode.phase)
+#ifdef CFD_KIN_A
+    auto window1 = [&](uint32_t d, uint32_t t, int32_t sh, uint32_t dst) {
+#else
     auto window = [&](uint32_t d, uint32_t t, int32_t sh, uint32_t dst) {
+#endif
         const uint32_t k = d >> 28;
         if ((k == 1 || k == 2) && (d & (1u << 27))) {   // bf16 constant or home page: 2 B a lane, the first 2048 B of its 4096-B page
             const int32_t o = static_cast<int32_t>(t * 2048) + 2 * sh;
@@ -501,6 +512,13 @@ void kernel_main() {
                 noc_async_read(dpage(d, pi + 1), dst + 4096 - w, w);
         }
     };
+#ifdef CFD_KIN_A   // run_mesh --knockin a: every constant page (kind 2, fp32 and bf16) is read from DRAM twice into the
+                   // same place, so the state stays bitwise and the run pays this class of reads twice
+    auto window = [&](uint32_t d, uint32_t t, int32_t sh, uint32_t dst) {
+        window1(d, t, sh, dst);
+        if ((d >> 28) == 2) window1(d, t, sh, dst);
+    };
+#endif
 
     auto fail = [&](uint32_t why) {
         if (hdr[32] == 0) {
