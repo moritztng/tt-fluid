@@ -279,7 +279,7 @@ class Encoded:
             for u in uops:
                 k = u[0]
                 if k == "body":
-                    ws = blockgen.program(u[1], **gen)
+                    ws = blockgen.program(u[1], brk=BLOCKS.get("brk", 0), **gen)
                     assert len(ws) < PW, "a body program must fit a code page"
                     BLK_STAT["bodies"] += 1
                     BLK_STAT["words"] += len(ws)
