@@ -50,8 +50,9 @@ ap.add_argument("--tiles", type=int, default=None)
 ap.add_argument("--solve-census", help="CPU: after lowering, write tools/solve_census.py's per-core pages of every Krylov loop pass "
                 "and outer phase to this JSON (cores from --sc-cores) and exit")
 ap.add_argument("--sc-cores", default="0", help="--solve-census: comma list of global cores")
-ap.add_argument("--cores", type=int, default=None, help="CPU only (--plan / --emuonly): lower for this many cores per chip instead of "
-                "the --arch grid's, so a small case reaches a big case's cells per core (and its T)")
+ap.add_argument("--cores", type=int, default=None, help="lower for this many cores per chip instead of the --arch grid's, so a small "
+                "case reaches a big case's cells per core (and its T). On a device: one chip only, and the count must fill a "
+                "sub-rectangle of the grid (15 on Blackhole runs on its 5 x 3 corner)")
 ap.add_argument("--l1", default=None)
 ap.add_argument("--ring", type=int, default=4, help="as run_vm.py: pages in the DRAM reader and writer rings")
 ap.add_argument("--l1-bytes", type=int, default=None, help="CB bytes per core the auto placement may use (default: per --arch)")
@@ -131,6 +132,8 @@ ap.add_argument("--hre", type=int, default=0, help="G > 0: a halo whose last gat
 ap.add_argument("--forces", default=None, metavar="FUNC", help="Cd/Cl of each outer iteration's incoming state in the history (result keys Cd_in, Cl_in), from the controlDict function FUNC (ttfluid.solver.forces.coeff_hook)")
 ap.add_argument("--phase", action="store_true", help="per-SIMPLE-phase device cycles (program.PHASES markers, CFD_PHASE): result key phase")
 ap.add_argument("--cap", type=int, default=32, help="as run_vm.py: scratch cap, live one-tile values per fused run")
+ap.add_argument("--lsplit", type=int, default=0, help="1: a vector that holds an L1 colour across a Krylov loop it is not used in is parked in DRAM "
+                "for the loop, so the loop's own vectors take the colour (Machine(lsplit)). Data movement only: same values. Needs a lowering")
 ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3, 4 need --tabstream (mesh has no trid). Default 0 keeps the built images unchanged")
 ap.add_argument("--os", type=int, default=0, help="1: BRISC built for size (#pragma GCC optimize Os), 2: NCRISC too, for a program over the kernel config buffer")
 ap.add_argument("--prof", action="store_true", help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores")
@@ -164,7 +167,12 @@ assert min(R, C) == 1 or a.block2d or a.plan or a.emuonly, "2D mesh %dx%d needs 
 GRID, l1_default, NCB, DA = ARCH[a.arch]
 a.l1_bytes = a.l1_bytes or l1_default
 K, P = R * C, GRID[0] * GRID[1]
-assert not a.cores or a.plan or a.emuonly or a.solve_census, "--cores: a CPU lowering only (the device grid is --arch's)"
+if a.cores:
+    # the widest sub-rectangle of the arch grid that holds exactly --cores: the device launches its kernels on that corner
+    w = max((w for w in range(1, GRID[0] + 1) if a.cores % w == 0 and a.cores // w <= GRID[1]), default=0)
+    assert (w and K == 1) or a.plan or a.emuonly or a.solve_census or a.images, \
+        "--cores %d on a device: one chip, and a sub-rectangle of its %dx%d grid" % (a.cores, GRID[0], GRID[1])
+    GRID = (w, a.cores // w) if w else GRID
 P = a.cores or P
 PP = -(-P // 4) * 4   # one chip's partials padded to 16 B (vm_brisc.cpp PP): P = 110 on BH, 72 on WH (unchanged)
 import ttfluid.resident.encode  # noqa: E402
@@ -203,7 +211,7 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
@@ -287,7 +295,7 @@ else:
                     l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
                     joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
                     bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg)
+                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, lsplit=bool(a.lsplit))
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))
