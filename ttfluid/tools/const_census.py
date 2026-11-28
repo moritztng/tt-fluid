@@ -1,8 +1,11 @@
 """What the constant pages of the outer body hold, by content.
 
-    python -m ttfluid.tools.const_census MCACHE [--core 0,7] [--json out.json]
+    python -m ttfluid.tools.const_census MCACHE [--core 0,7] [--json out.json] [--slim out.cx.zst]
+    python -m ttfluid.tools.const_census out.cx.zst [--core 0,7] [--json out.json]
 
-MCACHE is run_mesh's --mcache (LOWER, prog, m). A streamed constant lives in DRAM as its own tiles per core (page
+MCACHE is run_mesh's --mcache (LOWER, prog, m). --slim writes the extract the census works from (the outer body's
+blocks with their tile counts, and the constant pages of the cores asked for), so a Small k2 cache (56 GB on disk,
+over 100 GB loaded) is read once and every later census takes the extract (*.cx.zst). A streamed constant lives in DRAM as its own tiles per core (page
 core * cpages + coff + t) and a block reads it in place (an ldr uop), one 4 KB page per tile pass. This tool classes
 every such page of a core by its bits and weighs each class by the page reads of one outer iteration.
 
@@ -19,15 +22,15 @@ Classes, first match wins:
 A shifted read (a split gather's offset load) is counted under `shifted` and classed by its source page.
 """
 import argparse
+import gc
+import io
 import json
+import pickle
 from collections import Counter, defaultdict
 
 import numpy as np
 
-from ttfluid.resident.census import region_of
-from ttfluid.resident.machine import KBASE, LANES
-from ttfluid.resident.program import PHASES
-from ttfluid.tools.solve_census import load
+LANES = 1024
 
 CLASSES = ("zero", "uniform", "two", "copy", "derived", "few", "bf16", "fp32")
 UNARY = {"neg": np.negative, "0-a": lambda a: np.float32(0) - a, "abs": np.abs, "1-a": lambda a: np.float32(1) - a,
@@ -35,28 +38,108 @@ UNARY = {"neg": np.negative, "0-a": lambda a: np.float32(0) - a, "abs": np.abs, 
 BINARY = {"mul": (np.multiply, True), "add": (np.add, True), "sub": (np.subtract, False), "div": (np.divide, False)}
 
 
-def reads(prog, m):
-    """Constant reads of the outer body: [(const register, shift, patched, tile passes, phase, MIR index, in a run)],
-    plus the outer body's B_FETCH copies [(const register, tiles, phase)]."""
+def extract(LOWER, prog, m, cores, log=print):
+    """Plain data for the censuses: every block and fused run of the program in order as (kind, MIR index, phase,
+    tile passes, [(uops, stores) per block], region), the other instructions as (MIR index, phase, region, ins or a
+    stub when it is big), what every register in a block is, and the constant pages of `cores` as the encoder writes
+    them (page coff + tile, padding lanes zero)."""
+    from ttfluid.resident.census import region_of
+    from ttfluid.resident.machine import DBASE, KBASE
+    from ttfluid.resident.program import PHASES
     mir, reg = m.mir, region_of(m.mir)
     labels_ph = {L: PHASES[i] for L, i in getattr(prog, "phase_at", {}).items()}
-    ph, out, fetch = "top", [], []
+    ph, body, rest, fetch, other, info = "top", [], [], [], Counter(), {}
+
+    def stub(ins):
+        try:
+            n = len(pickle.dumps(ins, protocol=4))
+        except Exception:
+            return (ins[0], "unpicklable")
+        return ins if n < 4096 else (ins[0], f"{n} B")
+
+    def note(r):
+        if r is None or r in info:
+            return
+        t = m.phys.get(r)
+        info[r] = dict(phys=None if t is None else int(t), size=int(m.size(r)), vec=bool(m.is_vec(r)),
+                       space=m.space[r].name if isinstance(r, int) else None, const=m.fetched_from.get(r))
+
     for j, ins in enumerate(mir):
         if ins[0] == "label" and ins[1] in labels_ph:
             ph = labels_ph[ins[1]]
-        if reg[j] != "outer":
-            continue
-        if ins[0] == "fetch":
-            fetch.append((m.fetched_from[ins[1]], m.size(ins[1]), ph))
+        outer = reg[j] == "outer"
+        if ins[0] == "fetch" and outer:
+            fetch.append((m.fetched_from[ins[1]], int(m.size(ins[1])), ph))
         if ins[0] not in ("blk", "seg"):
+            other[ins[0]] += outer
+            rest.append((j, ph, reg[j], stub(ins)))
             continue
-        blks = [ins] if ins[0] == "blk" else [x for x in ins[1] if x[0] == "blk"]
-        bt = m.tiles(blks)
+        blks = [ins] if ins[0] == "blk" else [b for b in ins[1] if b[0] == "blk"]
+        if ins[0] == "seg":
+            for b in ins[1]:
+                if b[0] != "blk":
+                    other["seg:" + str(b[0])] += outer
         for b in blks:
             for u in b[1]:
-                if u[0] == "ldr" and u[2] is not None and m.phys[u[2]] >= KBASE:
-                    out.append((m.fetched_from[u[2]], u[3], u[4] is not None, bt, ph, j, ins[0] == "seg"))
-    return out, fetch
+                if u[0] in ("ld", "lds", "ldr", "rvf"):
+                    note(u[2])
+                if u[0] == "ldr":
+                    for y, _ in u[5]:
+                        note(y)
+            for _, r in b[2]:
+                note(r)
+        body.append((ins[0], j, ph, int(m.tiles(blks)), [(list(b[1]), list(b[2])) for b in blks], reg[j]))
+    order = sorted(m.coff, key=m.coff.get)
+    pages, cells = {}, {}
+    for core in cores:
+        P = np.zeros((max(int(m.cpages), 1), LANES), np.uint32)
+        sel = {}
+        for r in order:
+            sp = m.space[r]
+            if sp.name not in sel:
+                k = np.nonzero(m.lay.owner[sp.name] == core)[0]
+                sel[sp.name] = (k, m.lay.lane[sp.name][k])
+            k, ln = sel[sp.name]
+            n = m.size(r)
+            a = np.zeros(n * LANES, np.float32)
+            keep = ln < n * LANES
+            a[ln[keep]] = np.asarray(m.pre[r], np.float32)[k[keep]]
+            P[m.coff[r]:m.coff[r] + n] = a.view(np.uint32).reshape(n, LANES)
+        pages[core] = P
+        cells[core] = int(m.lay.count[prog.cells.name][core])
+        log(f"extract: core {core}: {cells[core]} cells, {len(order)} constants, {m.cpages} pages")
+    return dict(lower={k: v for k, v in LOWER.items() if isinstance(v, (int, float, str, bool, type(None)))},
+                T=int(m.T), cpages=int(m.cpages), KBASE=int(KBASE), DBASE=int(DBASE), streamed=len(m.streamed),
+                coff={r: int(o) for r, o in m.coff.items()}, csize={r: int(m.size(r)) for r in m.coff},
+                cspace={r: m.space[r].name for r in m.coff}, body=body, rest=rest, fetch=fetch, other=dict(other),
+                info=info, pages=pages, cells=cells, ntiles=int(getattr(m, "ntiles", 0)),
+                hpages=int(getattr(m, "hpages", 0)), nsmall=int(getattr(m, "nsmall", 0)),
+                sliced=bool(getattr(m, "sliced", False)), P=int(getattr(m, "P", 0)))
+
+
+def save_x(x, path):
+    import zstandard
+    with open(path, "wb") as f, zstandard.ZstdCompressor(level=3, threads=8).stream_writer(f) as z:
+        pickle.dump(x, z, protocol=4)
+
+
+def load_x(path):
+    import zstandard
+    with open(path, "rb") as f:
+        return pickle.load(io.BufferedReader(zstandard.ZstdDecompressor().stream_reader(f, read_across_frames=True), 1 << 24))
+
+
+def reads(x):
+    """Constant reads of the outer body: [(const register, shift, patched, tile passes, phase, MIR index, in a run)]."""
+    info, out = x["info"], []
+    for kind, j, ph, bt, blks, region in x["body"]:
+        if region != "outer":
+            continue
+        for uops, _ in blks:
+            for u in uops:
+                if u[0] == "ldr" and u[2] is not None and (info[u[2]]["phys"] or 0) >= x["KBASE"]:
+                    out.append((info[u[2]]["const"], u[3], u[4] is not None, bt, ph, j, kind == "seg"))
+    return out
 
 
 def derivations(m, regs, sample=8192, seed=0, log=print):
@@ -100,25 +183,19 @@ def derivations(m, regs, sample=8192, seed=0, log=print):
     return found
 
 
-def census(prog, m, core, derived, log=print):
-    rd, fetch = reads(prog, m)
-    consts = sorted({r for r, *_ in rd}, key=lambda r: m.coff[r])
-    cells = int(m.lay.count[prog.cells.name][core])
-    sel = {}
-    pages, seen = {}, {}
+def census(x, core, derived=None, log=print):
+    derived = derived or {}
+    rd, fetch = reads(x), x["fetch"]
+    coff, csize, cspace, P = x["coff"], x["csize"], x["cspace"], x["pages"][core]
+    bt_of = {e[1]: e[3] for e in x["body"]}
+    consts = sorted({r for r, *_ in rd}, key=coff.get)
+    cells = x["cells"][core]
+    seen = {}
     cls, two_vals, nvals, pagekey = {}, {}, {}, {}
     at, uni = {}, {}     # page of the core's constant array -> (constant, tile); uniform page -> its bit pattern
-    for r in sorted(m.coff, key=m.coff.get):     # every stored constant: a read may land on a neighbour's page
-        sp = m.space[r]
-        if sp.name not in sel:
-            k = np.nonzero(m.lay.owner[sp.name] == core)[0]
-            sel[sp.name] = (k, m.lay.lane[sp.name][k])
-        k, ln = sel[sp.name]
-        n = m.size(r)
-        a = np.zeros(n * LANES, np.float32)
-        keep = ln < n * LANES
-        a[ln[keep]] = np.asarray(m.pre[r], np.float32)[k[keep]]
-        bits = a.view(np.uint32).reshape(n, LANES)
+    for r in sorted(coff, key=coff.get):     # every stored constant: a read may land on a neighbour's page
+        n = csize[r]
+        bits = P[coff[r]:coff[r] + n]
         for t in range(n):
             p = bits[t]
             key = p.tobytes()
@@ -145,20 +222,23 @@ def census(prog, m, core, derived, log=print):
             seen.setdefault(key, (r, t))
             pagekey[(r, t)] = seen[key]
             cls[(r, t)] = c
-            at[m.coff[r] + t] = (r, t)
+            at[coff[r] + t] = (r, t)
     # page reads per outer iteration: a read in a tile loop of bt passes reads the constant's first bt tiles (a
     # --sliced block loops over its narrowest vector)
     # A one-tile constant in a tile loop is read every pass.
     nread, nreg = Counter(), Counter()
     by_phase, cls_phase = Counter(), defaultdict(Counter)
     shifted = patched = overrun = beyond = 0
+    over = Counter()     # reads that run past the constant's own tiles: (space, own tiles, tile passes) -> pages
     for r, shift, pat, bt, ph, j, inseg in rd:
         nreg[r] += 1
-        n = m.size(r)
+        n = csize[r]
+        if bt > n:
+            over[(cspace[r], n, bt)] += bt - n
         for t in range(bt):
             # the reader fetches page coff + t whatever the constant's own tile count (vm_ncrisc.cpp dpage), so a
             # pass beyond it lands on the pages stored behind it: classed as what is fetched
-            k = at.get(m.coff[r] + t)
+            k = at.get(coff[r] + t)
             if k is None:
                 beyond += 1      # past the core's last constant page
                 continue
@@ -187,7 +267,7 @@ def census(prog, m, core, derived, log=print):
             per_run[j][(r, shift, pat)] += bt
     for j, c in per_run.items():
         for key, v in c.items():
-            n1 = m.tiles([x for x in m.mir[j][1] if x[0] == "blk"])
+            n1 = bt_of[j]
             run_dup += v - n1
     pairs = Counter(v for v in two_vals.values())
     reg_cls, reg_w = defaultdict(Counter), defaultdict(Counter)
@@ -202,7 +282,7 @@ def census(prog, m, core, derived, log=print):
     pal = [(float(np.uint32(v).view(np.float32)), f"{v:08x}", int(n)) for v, n in pal.most_common() if n]
     # read pages that are distinct by content (zero and uniform pages aside): what a shared home would store
     homes = len({pagekey[k] for k, c in cls.items() if nread[k] and c not in ("zero", "uniform")})
-    out = dict(core=core, cells=cells, T=int(m.T), consts=len(consts), streamed=len(m.streamed), cpages=int(m.cpages),
+    out = dict(core=core, cells=cells, T=x["T"], consts=len(consts), streamed=x["streamed"], cpages=x["cpages"],
                reads=len(rd), page_reads=int(total), kb_cell_it=kb(total),
                by_class={c: dict(pages=int(distinct[c]), page_reads=int(weighted[c]), kb_cell_it=kb(weighted[c]),
                                  share=weighted[c] / max(total, 1)) for c in CLASSES},
@@ -216,13 +296,16 @@ def census(prog, m, core, derived, log=print):
                derived={str(r): [d[0]] + [int(x) for x in d[1:]] for r, d in derived.items() if r in set(consts)},
                pages_never_read=int(never), distinct_content_pages=int(homes), overrun_page_reads=int(overrun),
                beyond_page_reads=int(beyond), uniform_values=pal[:64], uniform_distinct=len(pal),
+               overrun_by=[[list(k), int(v)] for k, v in over.most_common(12)],
                by_class_phase={p: {c: int(v) for c, v in d.items()} for p, d in cls_phase.items()},
                l1_home_page_reads=hot_cum,
-               regs={str(r): dict(space=m.space[r].name, tiles=int(m.size(r)), reads=int(nreg[r]),
+               regs={str(r): dict(space=cspace[r], tiles=csize[r], reads=int(nreg[r]),
                                   cls={c: int(v) for c, v in reg_cls[r].items()},
                                   page_reads={c: int(v) for c, v in reg_w[r].items()}) for r in consts})
-    log(f"core {core}: {cells} cells, T {m.T}, {len(consts)} constants read in the outer body ({len(m.streamed)} "
-        f"streamed, {m.cpages} pages per core), {len(rd)} reads = {total} page reads per it = {kb(total):.2f} KB/cell-it")
+    log(f"core {core}: {cells} cells, T {x['T']}, {len(consts)} constants read in the outer body ({x['streamed']} "
+        f"streamed, {x['cpages']} pages per core), {len(rd)} reads = {total} page reads per it = {kb(total):.2f} KB/cell-it")
+    log("  threads: NCRISC streams every one of these pages (N_STREAM), TRISC0 unpacks it from the ring (C_LDR); "
+        f"BRISC fetches {out['fetch_pages']} constant pages per it (B_FETCH)")
     log("  class     pages   page reads  KB/cell-it  share")
     for c in CLASSES:
         log(f"  {c:8s} {distinct[c]:6d} {weighted[c]:11d} {kb(weighted[c]):10.2f}  {100 * weighted[c] / max(total, 1):5.1f} %")
@@ -233,6 +316,7 @@ def census(prog, m, core, derived, log=print):
         f"non-zero, non-uniform pages: {homes}")
     log(f"  page reads the N most-read stored pages take (L1 homes): {hot_cum}; reads past a constant's own tiles "
         f"{overrun} (classed as the page fetched), past the core's pages {beyond}")
+    log(f"  reads past a constant's own tiles by (space, own tiles, tile passes): {over.most_common(6)}")
     log(f"  uniform pages: {len(pal)} distinct values; page reads by value: {[(v, n) for v, _, n in pal[:16]]}")
     for p, d in cls_phase.items():
         if sum(d.values()) > 1000:
@@ -245,21 +329,27 @@ def census(prog, m, core, derived, log=print):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mcache")
+    ap.add_argument("src", help="run_mesh --mcache file, or an extract written by --slim (*.cx.zst)")
     ap.add_argument("--core", default="0")
     ap.add_argument("--json")
-    ap.add_argument("--derive", type=int, default=1)
+    ap.add_argument("--slim", help="write the extract here (*.cx.zst), before any census runs")
     a = ap.parse_args()
-    LOWER, prog, m = load(a.mcache)
-    rd, _ = reads(prog, m)
-    regs = sorted({r for r, *_ in rd})
-    derived = derivations(m, sorted(m.streamed)) if a.derive else {}
-    derived = {r: d for r, d in derived.items() if r in set(regs)}
-    res = [census(prog, m, c, derived) for c in map(int, a.core.split(","))]
+    cores = [int(c) for c in a.core.split(",")]
+    if a.src.endswith(".cx.zst"):
+        x = load_x(a.src)
+    else:
+        from ttfluid.tools.solve_census import load
+        LOWER, prog, m = load(a.src)
+        x = extract(LOWER, prog, m, cores)
+        del LOWER, prog, m
+        gc.collect()
+        if a.slim:
+            save_x(x, a.slim)
+            print(f"extract written: {a.slim}", flush=True)
+    res = [census(x, c) for c in cores if c in x["pages"]]
     if a.json:
         with open(a.json, "w") as f:
-            json.dump(dict(mcache=a.mcache, lower={k: v for k, v in LOWER.items() if isinstance(v, (int, float, str, bool, type(None)))},
-                           cores=res), f)
+            json.dump(dict(src=a.src, lower=x["lower"], other=x["other"], cores=res), f)
 
 
 if __name__ == "__main__":
