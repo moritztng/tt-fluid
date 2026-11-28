@@ -32,6 +32,12 @@ C_MAD, C_MSB = 41, 42   # a = d + b c, a = d - b c
 C_LDRH = 43             # C_LDR of a bf16 page (Machine narrow), widened to fp32 in Dest
 C_STWH = 44             # C_STW packed to bf16 (Machine narrow 2)
 C_PH = 45               # phase marker (Encoded(phase=...)): phase id in the top 16 bits; vm_compute CFD_PHASE
+C_BLK = 46              # a generated SFPU body (BLOCKS): n << 16, then its n-word program inline (blockgen.program)
+# BLOCKS (run_mesh --blocks, tools): None = every op its stock word. Else dict(plan=..., gen=...): each block is lowered
+# by blklower.lower_block(**plan) and its bodies by blockgen.program(**gen); the kernel needs CFD_BLK. The arithmetic
+# and its order are the uop list's, so memu stays the reference and the state digest must not move.
+BLOCKS = None
+BLK_STAT = {"blocks": 0, "bodies": 0, "words": 0, "fallback": 0}
 NARROW = 1 << 27        # desc bit: a bf16 constant page (vm_ncrisc window)
 TILE = 0x80     # op bit: tile operand += loop counter
 # BRISC
@@ -260,10 +266,27 @@ class Encoded:
             return loop, lds, sts
 
         def body(ins):
+            uops, stores = ins[1], ins[2]
+            if BLOCKS:
+                from . import blklower, blockgen
+                gen = BLOCKS.get("gen", {})
+                low = blklower.lower_block(uops, stores, m.nslot, accept=lambda sp: blockgen.program(sp, **gen) is not None,
+                                           **BLOCKS.get("plan", {}))
+                BLK_STAT["blocks"] += 1
+                if low is None or not any(u[0] == "body" for u in low[0]):
+                    BLK_STAT["fallback"] += low is None
+                else:
+                    uops, stores = low
             c(W(C_ACQ))
-            for u in ins[1]:
+            for u in uops:
                 k = u[0]
-                if k == "ld":
+                if k == "body":
+                    ws = blockgen.program(u[1], **gen)
+                    assert len(ws) < PW, "a body program must fit a code page"
+                    BLK_STAT["bodies"] += 1
+                    BLK_STAT["words"] += len(ws)
+                    c(W(C_BLK) | len(ws) << 16, *ws)
+                elif k == "ld":
                     c(W(C_LD, u[1]) | tf(u[2]) | phys[u[2]] << 16)
                 elif k == "lds":      # offset load: lane l reads lane l + u[3] (a multiple of 4 = 16 B)
                     assert u[3] % 4 == 0
@@ -294,7 +317,7 @@ class Encoded:
                 else:
                     raise NotImplementedError(k)
             c(W(C_COMMIT))
-            for s, r in ins[2]:
+            for s, r in stores:
                 if phys[r] >= DBASE:
                     c(W(C_STWH if r in m.narrow_home else C_STW, s))
                 else:

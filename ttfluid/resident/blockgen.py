@@ -232,3 +232,286 @@ def stock_cost(uops):
         elif u[0] in ("fill", "cpd", "fold"):
             c += STOCK[u[0]]
     return c
+
+
+# ---- body programs --------------------------------------------------------------------------------------------------
+# program(spec) turns one planned body (blklower: ins / outs with Dest slots, ops over values, constants) into the
+# inline words the VM's C_BLK executes: [ncfg | L << 8 | nrep << 16 | nfl << 24, config words, row words]. The kernel
+# pushes the config words once per tile, records the row words into the replay buffer and replays them nrep times
+# (device/kernels/blk_exec.h). Instructions are kept symbolic, (mnemonic, TT_OP_ arguments...), until the last step;
+# sim() executes the symbolic row on numpy with the pipeline's read latencies and check() compares it with the ops
+# evaluated one by one, so a schedule is replayed against the plain evaluation before it may run on a chip.
+import numpy as np
+
+FP32, AM_STAY, AM_STEP = 3, 3, 2    # SFPLOAD / SFPSTORE mode; ADDR_MOD_7 (no step) and ADDR_MOD_6 (dest += 2) under base 4
+C0, C1 = 9, 10                      # LCONST_0, LCONST_1
+EQ0 = 6                             # SFPSETCC_MOD1_LREG_EQ0
+MADS = ("sfpmad", "sfpadd", "sfpmul")
+NLANE = 32
+
+
+class Reject(Exception):
+    pass
+
+
+def _f32bits(x):
+    return int(np.float32(x).view(np.uint32))
+
+
+def _plain(spec, lregs=8):
+    """One instruction per cycle: (cfg, row). Operands are loaded when first needed (or a cycle early, into the
+    wait for a multiply-add), every op is its stock instruction sequence, results are stored when they are ready."""
+    ins, outs, const, ops = dict(spec["ins"]), dict(spec["outs"]), spec["const"], spec["ops"]
+    last, first = {}, {}
+    for i, o in enumerate(ops):
+        for v in o[2:]:
+            last[v] = i
+            first.setdefault(v, i)
+    cfg, row = [], []
+    free, reg, ready = list(range(lregs)), {}, {}
+    for v, x in const.items():
+        b = _f32bits(x)
+        if b == 0:
+            reg[v] = C0
+        elif b == 0x3f800000:
+            reg[v] = C1
+        else:
+            if not free:
+                raise Reject("lregs")
+            reg[v] = r = free.pop(0)
+            cfg += [("sfploadi", r, 0, b >> 16)] if b & 0xffff == 0 else [("sfploadi", r, 8, b >> 16), ("sfploadi", r, 10, b & 0xffff)]
+    unloaded = sorted((v for v in ins if v in first), key=lambda v: first[v])
+    pend, stored = [], set()
+    cur = [0]
+
+    def alloc():
+        if not free:
+            raise Reject("lregs")
+        return free.pop(0)
+
+    def emit(*x):
+        row.append(tuple(x))
+        return len(row)
+
+    def load(v, r=None):
+        reg[v] = r = alloc() if r is None else r
+        ready[r] = emit("sfpload", r, FP32, AM_STAY, ins[v] * 64)
+        unloaded.remove(v)
+
+    def storable(v):
+        return ready[reg[v]] <= len(row) and not any(ins[u] == outs[v] for u in unloaded)
+
+    def store(v):
+        emit("sfpstore", reg[v], FP32, AM_STAY, outs[v] * 64)
+        pend.remove(v)
+        stored.add(v)
+        if last.get(v, -1) < cur[0]:
+            free.append(reg.pop(v))
+
+    def wait(rs):
+        while any(ready.get(r, 0) > len(row) for r in rs):
+            v = next((v for v in pend if storable(v)), None)
+            if v is not None:
+                store(v)
+            elif unloaded and len(free) > 2:
+                load(unloaded[0])
+            else:
+                emit("sfpnop")
+
+    def need(v):
+        if v not in reg:
+            load(v)
+        return reg[v]
+
+    def dies(v, i):
+        return v not in const and last[v] == i and (v not in outs or v in stored)
+
+    def own(v, i, others=()):
+        """A register holding v that this op may overwrite: v's own when v dies here, else a copy."""
+        if dies(v, i) and v not in others:
+            return reg.pop(v)
+        r = alloc()
+        wait([reg[v]])
+        ready[r] = emit("sfpmov", 0, reg[v], r, 0)
+        return r
+
+    for i, (name, out, *a) in enumerate(ops):
+        cur[0] = i
+        if name in ("add", "mul"):
+            ra, rb = need(a[0]), need(a[1])
+            wait([ra, rb])
+            r = reg.pop(a[0]) if dies(a[0], i) else reg.pop(a[1]) if dies(a[1], i) and a[1] != a[0] else alloc()
+            ready[r] = (emit("sfpadd", C1, ra, rb, r, 0) if name == "add" else emit("sfpmul", ra, rb, C0, r, 0)) + 1
+        elif name in ("neg", "abs"):
+            ra = need(a[0])
+            wait([ra])
+            r = reg.pop(a[0]) if dies(a[0], i) else alloc()
+            ready[r] = emit("sfpmov", 0, ra, r, 1) if name == "neg" else emit("sfpabs", 0, ra, r, 1)
+        elif name == "where":
+            c, x, y = a
+            rc = need(c)
+            need(x)
+            late = y in unloaded and last[y] == i and first[y] == i and y != c and y != x and a.count(y) == 1
+            if not late:
+                need(y)
+            r = own(x, i, others=(c, y))
+            wait([rc, r] + ([] if late else [reg[y]]))
+            emit("sfpsetcc", 0, rc, 0, EQ0)
+            if late:    # the false value comes straight from Dest, under the lane mask
+                emit("sfpload", r, FP32, AM_STAY, ins[y] * 64)
+                unloaded.remove(y)
+            else:
+                emit("sfpmov", 0, reg[y], r, 0)
+            ready[r] = emit("sfpencc", 0, 0, 0, 0)
+        elif name in ("max", "min"):
+            need(a[0])
+            need(a[1])
+            if a[0] == a[1]:
+                r = own(a[0], i)
+            else:
+                rd, rc = own(a[0], i, others=(a[1],)), own(a[1], i, others=(a[0],))
+                wait([rd, rc])
+                emit("sfpswap", 0, rc, rd, 1)       # rd = min, rc = max, two cycles
+                ready[rd] = ready[rc] = emit("sfpnop")
+                r = rc if name == "max" else rd
+                free.append(rd if name == "max" else rc)
+        else:
+            raise Reject(name)
+        for v in set(a):
+            if v in reg and dies(v, i):
+                free.append(reg.pop(v))
+        reg[out] = r
+        if out in outs:
+            pend.append(out)
+        elif out not in last:
+            raise Reject("dead op")
+    cur[0] = len(ops)
+    while pend:
+        v = pend[0]
+        wait([reg[v]])
+        if v in pend:
+            store(v)
+    k = max(j for j, x in enumerate(row) if x[0] in ("sfpload", "sfpstore"))
+    row[k] = row[k][:3] + (AM_STEP,) + row[k][4:]
+    return cfg, row
+
+
+def program(spec, form="plain", lregs=8, sym=False):
+    """The inline words of one body, or None when this form cannot run it (the block then keeps its stock words)."""
+    try:
+        cfg, row = _plain(spec, lregs)
+    except Reject:
+        return None
+    u = 1 if len(row) >= 4 else 2
+    if len(row) * u > 32:
+        return None
+    if sym:
+        return cfg, row
+    from . import tensix
+    enc = lambda x: getattr(tensix, x[0])(*x[1:])
+    return [len(cfg) | (len(row) * u) << 8 | (NLANE // u) << 16 | 2 << 24] + [enc(x) for x in cfg] + [enc(x) for x in row] * u
+
+
+def _ord(x):        # the SFPU's total order on fp32 bit patterns: sign-magnitude, -NaN < -inf < -0 < +0 < +inf < +NaN
+    b = x.view(np.uint32).astype(np.int64)
+    return np.where(b >> 31, -(b & 0x7fffffff) - 1, b)
+
+
+PRIM = {
+    "add": lambda a, b: (a.astype(np.float64) + b).astype(np.float32),
+    "mul": lambda a, b: (a.astype(np.float64) * b + 0.0).astype(np.float32),
+    "neg": lambda a: (a.view(np.uint32) ^ np.uint32(0x80000000)).view(np.float32),
+    "abs": lambda a: np.where(np.isnan(a), a, (a.view(np.uint32) & np.uint32(0x7fffffff)).view(np.float32)),
+    "eq0": lambda a: (a.view(np.uint32) & np.uint32(0x7fffffff)) == 0,
+    "max": lambda a, b: np.where(_ord(a) >= _ord(b), a, b),
+    "min": lambda a, b: np.where(_ord(a) >= _ord(b), b, a),
+}
+
+
+def sim(cfg, row, slots, nrow=2, strict=True):
+    """Run the symbolic program on numpy: slots {slot: array (nrow, lanes)} -> the slots after. Every read of a
+    register before its value has landed (a multiply-add lands two cycles after its issue, a swap likewise) and every
+    Dest access inside a lane-mask window but the conditional load raises."""
+    slots = {s: a.copy() for s, a in slots.items()}
+    n = next(iter(slots.values())).shape[1]
+    R = {C0: np.zeros(n, np.float32), C1: np.ones(n, np.float32)}
+    on = np.ones(n, bool)
+    ready = {}
+
+    def rd(r, t):
+        if strict and ready.get(r, 0) > t:
+            raise AssertionError("register %d read at cycle %d, lands at %d" % (r, t, ready[r]))
+        return R[r]
+
+    def wr(r, x, t, lat=1):
+        assert r not in (C0, C1) and not (strict and ready.get(r, 0) > t + lat)
+        R[r] = np.where(on, x, R[r]) if r in R else np.where(on, x, np.float32(np.nan))
+        ready[r] = t + lat
+
+    for x in cfg:
+        assert x[0] == "sfploadi"
+        b = R[x[1]].view(np.uint32).copy() if x[1] in R else np.zeros(n, np.uint32)
+        b = np.full(n, x[3] << 16, np.uint32) if x[2] == 0 else (b & 0xffff) | np.uint32(x[3] << 16) if x[2] == 8 else (b & 0xffff0000) | np.uint32(x[3])
+        R[x[1]] = b.view(np.float32)
+    keep = set(R)
+    t = 0
+    for k in range(nrow):
+        for r in list(R):       # nothing but the constants survives a row by contract: poison the rest
+            if r not in keep:
+                R[r] = np.full(n, np.nan, np.float32)
+        for x in row:
+            op = x[0]
+            if op == "sfpload":
+                wr(x[1], slots[x[4] // 64][k], t)
+            elif op == "sfpstore":
+                assert on.all(), "store under a lane mask"
+                slots[x[4] // 64][k] = rd(x[1], t)
+            elif op in ("sfpadd", "sfpmul"):
+                wr(x[4], PRIM[op[3:]](rd(x[2], t), rd(x[3], t)) if op == "sfpadd" else PRIM["mul"](rd(x[1], t), rd(x[2], t)), t, 2)
+            elif op == "sfpmov":
+                wr(x[3], PRIM["neg"](rd(x[2], t)) if x[4] == 1 else rd(x[2], t), t)
+            elif op == "sfpabs":
+                wr(x[3], PRIM["abs"](rd(x[2], t)), t)
+            elif op == "sfpsetcc":
+                assert x[4] == EQ0
+                on = on & PRIM["eq0"](rd(x[2], t))
+            elif op == "sfpencc":
+                on = np.ones(n, bool)
+            elif op == "sfpswap":
+                c, d = rd(x[2], t), rd(x[3], t)
+                wr(x[3], PRIM["min"](c, d), t, 2)
+                wr(x[2], PRIM["max"](c, d), t, 2)
+            elif op != "sfpnop":
+                raise NotImplementedError(op)
+            t += 1
+        assert on.all(), "a row must end with every lane enabled"
+    return slots
+
+
+def ref(spec, slots, nrow=2):
+    """The body's ops evaluated one by one on the same primitives: {slot: array} of the outputs."""
+    env = {v: slots[s] for v, s in spec["ins"]}
+    n = next(iter(slots.values())).shape
+    env.update({v: np.full(n, x, np.float32) for v, x in spec["const"].items()})
+    for name, out, *a in spec["ops"]:
+        x = [env[v] for v in a]
+        env[out] = np.where(PRIM["eq0"](x[0]), x[2], x[1]) if name == "where" else PRIM[name](*x)
+    return {s: env[v] for v, s in spec["outs"]}
+
+
+def check(spec, seed=0, **kw):
+    """True when the generated program computes the body bitwise as its ops do, on random data with zeros of both
+    signs, infinities and NaN mixed in; None when no program is generated."""
+    p = program(spec, sym=True, **kw)
+    if p is None:
+        return None
+    rng = np.random.default_rng(seed)
+    special = np.array([0.0, -0.0, 1.0, -1.0, np.inf, -np.inf, np.nan, 1e-30, -3.5], np.float32)
+    slots = {}
+    for s in {s for _, s in spec["ins"]} | {s for _, s in spec["outs"]}:
+        a = rng.standard_normal((2, 64)).astype(np.float32)
+        m = rng.random((2, 64)) < 0.4
+        a[m] = special[rng.integers(0, len(special), m.sum())]
+        slots[s] = a
+    got, want = sim(*p, slots), ref(spec, slots)
+    return all(np.array_equal(got[s].view(np.uint32), want[s].view(np.uint32)) for s in want)
