@@ -762,6 +762,18 @@ class EllMatrix:
         bsrc = self.source + self._rs(self.bsrc)
         comps = [None] if psi.width == 1 else [c for c in range(psi.width) if self.ops.mesh.solutionD[c]]
         perfs = []
+        fused = getattr(self.ops, "krylov_fused", None)
+        if fused is not None and len(comps) > 1 and not symmetric and self.ops.device is None:
+            # one matrix, a diagonal and a right-hand side per component: the solves are independent, so a traced
+            # program may run them in lockstep (resident.krylov.pbicgstab_fused); None means one by one, below
+            As = [_EllOp(self.diag + self.bdiag_c(c), self.off, self.ops.cnbr, self.ops.rowsum, self.ops.rowdot)
+                  for c in comps]
+            xcs = [x[:, c].copy() for c in comps]
+            done = fused(As, xcs, [bsrc[:, c] for c in comps], controls)
+            if done is not None:
+                for c, xc in zip(comps, xcs):
+                    x[:, c] = xc
+                perfs, comps = list(done), []
         for c in comps:
             diag = self.diag + self.bdiag_c(0 if c is None else c)
             b = bsrc if c is None else bsrc[:, c]

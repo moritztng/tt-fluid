@@ -57,6 +57,8 @@ def _norm_factor(A, x, b, Ax):
 JOINT = False   # pcg, amg_pcg: the residual norm and the next iteration's rho leave in one cross-core reduction
 CG1 = False     # pcg, amg_pcg as _pcg_cg1 (one reduction per iteration; needs Machine(joint_red=True) to pay)
 BJOINT = False  # pbicgstab as _pbicgstab_joint (three cross-core reductions per iteration, not five)
+UFUSE = False   # a vector solve's components in one lockstep loop (pbicgstab_fused), not one loop after another
+UFUSE_NOFREEZE = False   # self-test only (--ufuse 2): a component that has left keeps updating x, so the comparison with the one-by-one solve must fail
 
 
 def pcg(A, x, b, c):
@@ -468,3 +470,114 @@ def _pbicgstab_joint(A, x, b, c):
     tr.label(END)
     x[...] = X.t
     return Perf(r0n, RES.t, IT.t)
+
+
+def pbicgstab_fused(As, xs, bs, c):
+    """The BiCGStab solves of the components of one vector equation in lockstep: one loop, one pass over the matrix
+    for all of them. The components share the off-diagonal coefficients and the gather tables (As[k] differ in the
+    diagonal only) and their solves are independent, so each keeps its own scalars, its own exit test and its own
+    exit iteration, and does the floating-point operations of pbicgstab in pbicgstab's order: the result is bitwise
+    the one-after-another solve.
+
+    A component that has left (converged on s or on r, maxIter, rho == 0) is frozen: its x, iteration count and
+    residual are held by selects on its `active` flag, never by a zero scale (x + 0 turns -0 into +0, 0 * inf is NaN).
+    Its r, p, v keep running until the slowest component leaves; they are not results and their values (possibly
+    non-finite after a breakdown) reach no other component: every sum is per component.
+
+    Sums are grouped as in _pbicgstab_joint, each group adjacent over all components so the lowering can send it as
+    one reduction: r0.v; |s|, t.t, t.s with t = A(rD s) computed before the test on s; |r| and the next rho.
+    The setup sums are grouped the same way (the means of x; the two halves of normFactor and |r|; rho)."""
+    tr = xs[0].tr
+    K = range(len(As))
+    Ax = [As[k](xs[k]) for k in K]
+    xm = [xs[k].mean() for k in K]
+    tv = [As[k].sumA() * xm[k] for k in K]
+    r = [bs[k] - Ax[k] for k in K]
+    e = [(np.abs(Ax[k] - tv[k]), np.abs(bs[k] - tv[k]), np.abs(r[k])) for k in K]
+    e = [tuple(v.sum() for v in e[k]) for k in K]
+    nf = [e[k][0] + e[k][1] + SMALL for k in K]
+    r0n = [e[k][2] / nf[k] for k in K]
+    END, LOOP = tr.new_label(), tr.new_label()
+    X, R = [Var(x) for x in xs], [Var(v) for v in r]
+    zero = np.zeros_like(xs[0])
+    P, V = [Var(zero) for k in K], [Var(zero) for k in K]
+    one, nil = _scalar(tr, 1.0), _scalar(tr, 0.0)
+    RHO_OLD, ALPHA, OMEGA = ([Var(one) for k in K] for _ in range(3))
+    IT, RES = [Var(nil) for k in K], [Var(v) for v in r0n]
+    rD = [1.0 / As[k].d for k in K]
+    r0 = [r[k].copy() for k in K]
+    g = [r0[k] * r[k] for k in K]
+    RHO = [Var(v.sum()) for v in g]
+    act = []
+    for k in K:   # pbicgstab leaves before its loop when converged at entry, at maxIter 0 and at rho == 0
+        a = 1.0 - (np.abs(RHO[k].t) < 1e-300)
+        if c.minIter <= 0:
+            a = a * (1.0 - _converged(r0n[k], r0n[k], c))
+        act.append(a * (1.0 if c.maxIter > 0 else 0.0))
+    ACT = [Var(a) for a in act]
+
+    def live():
+        n = ACT[0].t
+        for k in K[1:]:
+            n = n + ACT[k].t
+        return n
+
+    tr.jumpif((live() < 0.5).c[()], END)
+    tr.trips[LOOP] = 5
+    tr.label(LOOP)
+    y = []
+    for k in K:
+        rho = RHO[k].t
+        beta = (rho / RHO_OLD[k].t) * (ALPHA[k].t / OMEGA[k].t)
+        RHO_OLD[k].set(rho)
+        p = R[k].t + beta * (P[k].t - OMEGA[k].t * V[k].t)
+        P[k].set(p)
+        y.append(rD[k] * p)
+    v = [As[k](y[k]) for k in K]
+    for k in K:
+        V[k].set(v[k])
+    g = [r0[k] * v[k] for k in K]
+    rv = [w.sum() for w in g]
+    alpha, s, it, z = [], [], [], []
+    for k in K:
+        alpha.append(RHO[k].t / rv[k])
+        ALPHA[k].set(alpha[k])
+        s.append(R[k].t - alpha[k] * v[k])
+        it.append(IT[k].t + 1.0)
+        z.append(rD[k] * s[k])
+    t = [As[k](z[k]) for k in K]
+    e = [(np.abs(s[k]), t[k] * t[k], t[k] * s[k]) for k in K]
+    e = [tuple(w.sum() for w in e[k]) for k in K]
+    gate = [(it[k] >= float(c.minIter)) if c.minIter > 0 else None for k in K]
+    res_s, sdone, omega = [], [], []
+    for k in K:
+        sa, tt, ts = e[k]
+        res_s.append(sa / nf[k])
+        d = _converged(res_s[k], r0n[k], c)
+        sdone.append(d if gate[k] is None else d * gate[k])
+        omega.append(np.where(tt > 0, ts / tt, 0.0))
+        OMEGA[k].set(omega[k])
+        ay = alpha[k] * y[k]
+        # leaving on s: x += alpha y; otherwise x += alpha y + omega z; a frozen component keeps its x
+        xn = X[k].t + np.where(sdone[k], ay, ay + omega[k] * z[k])
+        X[k].set(xn if UFUSE_NOFREEZE else np.where(ACT[k].t, xn, X[k].t))
+        R[k].set(s[k] - omega[k] * t[k])
+    e = [(np.abs(R[k].t), r0[k] * R[k].t) for k in K]
+    e = [tuple(w.sum() for w in e[k]) for k in K]
+    for k in K:
+        sa, rho_n = e[k]
+        res_r = sa / nf[k]
+        d = _converged(res_r, r0n[k], c)
+        d = d if gate[k] is None else d * gate[k]
+        a = ACT[k].t
+        RES[k].set(np.where(a, np.where(sdone[k], res_s[k], res_r), RES[k].t))
+        IT[k].set(np.where(a, it[k], IT[k].t))
+        RHO[k].set(rho_n)
+        stop = np.maximum(np.maximum(sdone[k], d), np.maximum(it[k] >= float(c.maxIter), np.abs(rho_n) < 1e-300))
+        ACT[k].set(a * (1.0 - stop))
+    tr.jumpif((live() < 0.5).c[()], END)
+    tr.jump(LOOP)
+    tr.label(END)
+    for k in K:
+        xs[k][...] = X[k].t
+    return [Perf(r0n[k], RES[k].t, IT[k].t) for k in K]
