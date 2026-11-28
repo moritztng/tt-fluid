@@ -212,9 +212,14 @@ class Staged:
 
 
 def _bg_drop(items):
-    """Release large numpy buffers off the critical path so munmap TLB shootdowns do not stall upload."""
+    """Release large numpy buffers off the critical path so munmap TLB shootdowns do not stall upload.
+    Clears the caller's list before spawning so the background thread holds the sole remaining reference."""
     if items:
-        threading.Thread(target=lambda x: x.clear(), args=(list(items),), daemon=True).start()
+        held = list(items)
+        items.clear()
+        t = threading.Thread(target=list.clear, args=(held,), daemon=True)
+        del held
+        t.start()
 
 
 class Ahead:
@@ -239,9 +244,11 @@ class Ahead:
                     slot = self._free.get()
                     if reuse:
                         if slot is None:
-                            slot = np.empty((K * max_rows, words), np.uint32)
+                            slot = np.zeros((K * max_rows, words), np.uint32)
                             self._pool.append(slot)
-                        view = host_buffer(K, sg.DEVBLK, p.shape, p.fill, buf=slot)
+                            view = host_buffer(K, sg.DEVBLK, p.shape, p.fill, buf=slot, zeroed=True)
+                        else:
+                            view = host_buffer(K, sg.DEVBLK, p.shape, p.fill, buf=slot, zeroed=False)
                     else:
                         view = host_buffer(K, sg.DEVBLK, p.shape, p.fill)
                         slot = view
@@ -268,8 +275,8 @@ class Ahead:
                     self._free.get_nowait()
                 except queue.Empty:
                     break
-            pool, self._pool = self._pool, []
-            _bg_drop(pool)
+            del slot
+            _bg_drop(self._pool)
         elif slot is not None:
             self._free.put(slot)
 
@@ -403,14 +410,14 @@ def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, ahead=None, out
     parts = sg.pieces()
 
     def write(p, label, dst=None):
-        return upload(md, K, DEVBLK, p.shape, p.fill, label,
-                      lambda: host_shards(md, K, DEVBLK, p.shape, p.fill, ahead.next()), out=dst)
-    if not sg.sparse:
-        t = write(parts[0], name, dst=out)
+        t = upload(md, K, DEVBLK, p.shape, p.fill, label,
+                   lambda: host_shards(md, K, DEVBLK, p.shape, p.fill, ahead.next()), out=dst)
         if not prof:
             ttnn.synchronize_device(md)
         ahead.done()
         return t
+    if not sg.sparse:
+        return write(parts[0], name, dst=out)
     t = out if out is not None else ttnn.allocate_tensor_on_device(
         ttnn.Shape(list(sg.full)), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
     t0 = time.time()
@@ -443,7 +450,6 @@ def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, ahead=None, out
                 lambda k, w_=work, pf=p.first: [(w, pf + first, count, start) for w, first, count, start in w_[k][1]],
                 4 * mw + 4096 * (NB + 1))
         ttnn.deallocate(t_stage)
-        ahead.done()
         maps, laid = maps + t1 - t0, laid + time.time() - t1
     ttnn.deallocate(t_map)
     if prof:
@@ -453,18 +459,19 @@ def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, ahead=None, out
     return t
 
 
-def host_buffer(K, DEVBLK, shape, fill, buf=None):
+def host_buffer(K, DEVBLK, shape, fill, buf=None, zeroed=False):
     """The K shards of an array in one zeroed (K * rows, words) uint32 buffer, shard d filled by fill(DEVBLK[d], out)
     on a thread of its own. The zeros cost RAM only where fill writes. When buf is supplied (a pooled buffer from
-    Ahead), its first K * rows rows are zeroed in parallel and reused without reallocating. numpy and file reads only:
-    a launch builds its arrays with this while ttnn loads and the mesh opens."""
+    Ahead), its first K * rows rows are zeroed in parallel and reused without reallocating unless already zeroed.
+    numpy and file reads only: a launch builds its arrays with this while ttnn loads and the mesh opens."""
     from concurrent.futures import ThreadPoolExecutor
     rows, words = shape
     if buf is None:
         view = np.zeros((K * rows, words), np.uint32)
     else:
         view = buf[:K * rows]
-        par_zero(view)
+        if not zeroed:
+            par_zero(view)
     with ThreadPoolExecutor(K) as ex:
         list(ex.map(lambda d: fill(DEVBLK[d], view[d * rows:(d + 1) * rows]), range(K)))
     return view
