@@ -611,9 +611,10 @@ elif IMG is not None:   # chip by chip: chip k's arrays are built from its image
             STATE = {k: z[k] for k in z.files if k != "hist"}
         print("state from %s" % a.state_in, flush=True)
         stamp("state read")
-    up = lambda name: image_dev.upload(md, K, DEVBLK, lambda k: image_dev.chip_arrays(IMG, k, P, STATE, name)[name], to_dev, name)
+    filled = lambda name: (image_dev.chip_shape(IMG, P, name), lambda k, out: image_dev.chip_fill(IMG, k, P, name, out, STATE))
+    up = lambda name: image_dev.upload(md, K, DEVBLK, *filled(name), name)
     t_arena, t_const, t_home, t_blob = up("arena"), up("consts"), up("home"), up("blob")
-    t_tab = image_dev.upload(md, K, DEVBLK, chip_tab, to_dev, "tab")
+    t_tab = image_dev.upload(md, K, DEVBLK, (P, L), lambda k, out: np.copyto(out, chip_tab(k)), "tab")
     stamp("images uploaded (arena, consts, home, blob, tab)")
     t_c, t_b, t_n = (to_dev(np.tile(code[k], (K, 1))) for k in "cbn")
     t_hist = to_dev(np.zeros((K * H, 16), np.uint32))
@@ -775,8 +776,8 @@ def main():
             stamp("case %d: homes written" % rr)
         elif rr and a.legs:   # the next leg continues: homes stay on the device, the arena's state registers from the dump
             ttnn.deallocate(t_arena)
-            t_arena = image_dev.upload(md, K, DEVBLK, lambda k: image_dev.carry_arena(
-                IMG, k, P, o[k * P:(k + 1) * P, 1024:].reshape(P, nv, 1024)), to_dev)
+            t_arena = image_dev.upload(md, K, DEVBLK, image_dev.chip_shape(IMG, P, "arena"), lambda k, out: np.copyto(
+                out, image_dev.carry_arena(IMG, k, P, o[k * P:(k + 1) * P, 1024:].reshape(P, nv, 1024))))
             io[0] = t_arena
             common[0] = t_arena.buffer_address()
             stamp("leg %d: arena carried" % rr)
@@ -843,7 +844,7 @@ def mesh_program():
 
 
 def next_homes():   # the next case's homes as one multi-device host tensor (the image's start or --state-in)
-    return image_dev.host_shards(md, K, DEVBLK, lambda k: image_dev.chip_arrays(IMG, k, P, STATE, "home")["home"])[0]
+    return image_dev.host_shards(md, K, DEVBLK, *filled("home"))[0]
 
 
 def core0_ticks(o):
