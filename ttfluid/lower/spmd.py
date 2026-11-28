@@ -266,7 +266,7 @@ def install_machine(C, sub, own_of, state):
             if mk not in memo:
                 d_, p_ = np.asarray(d, np.int64), np.asarray(p, np.int64)
                 sel = o[d_]
-                memo[mk] = (d, p, self.prog.space[sr].name.encode() + b"|%d|" % int(sel.sum())
+                memo[mk] = (d, p, self.space[sr].name.encode() + b"|%d|" % int(sel.sum())
                             + hashlib.blake2b(d_[sel].tobytes() + p_[sel].tobytes(), digest_size=32).digest())
             h.update(memo[mk][2])
         okey = self.__dict__.setdefault("_okey", {})
@@ -277,7 +277,7 @@ def install_machine(C, sub, own_of, state):
         if got in cmap:
             return cmap[got]
         cmap[C.n] = len(self.maps)
-        self.maps.append((dst_space, [(self.prog.space[sr], np.asarray(d), np.asarray(p)) for sr, d, p in parts]))
+        self.maps.append((dst_space, [(self.space[sr], np.asarray(d), np.asarray(p)) for sr, d, p in parts]))
         self.lanes.append(lanes)
         return len(self.maps) - 1
 
