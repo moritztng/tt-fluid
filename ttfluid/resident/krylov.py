@@ -251,6 +251,8 @@ def amg_pcg(A, x, b, c, levels):
     else:
         ops = amg.Ops(levels, A.d, A.off, A.nbr, tr.dtype.type)
     maxit = min(c.maxIter, int(os.environ.get("CFD_AMG_MAXIT", 10 ** 9)))
+    if isinstance(getattr(ops, "shape", None), dict) and ops.shape.get("outer") == "fcg1":
+        return _amg_fcg1(A, x, b, c, ops.vcycle, maxit)
     if CG1:
         return _pcg_cg1(A, x, b, c, ops.vcycle, maxit)
     if JOINT:
@@ -331,6 +333,57 @@ def _amg_joint(A, x, b, c, M, maxit):
     W.set(wn)
     RHO.set(sg)
     done = _converged(sa / nf, r0, c)
+    if c.minIter > 0:
+        done = done * (it >= float(c.minIter))
+    tr.jumpif((done + (it >= float(maxit))).c[()], END)
+    tr.jump(LOOP)
+    tr.label(END)
+    x[...] = X.t
+    return Perf(r0, RES.t, IT.t)
+
+
+def _amg_fcg1(A, x, b, c, M, maxit):
+    """Notay FCG(1) (truncated flexible CG, m=1) for nonsymmetric cycles (fine=post, l1=post, coarse=post):
+    A-orthogonalises each preconditioned direction against the previous search direction using only 4 loop-carried
+    vectors (X, R, P, W — q is consumed in the same iteration before M finishes) and 2 joint reductions per iteration
+    ((p.q, p.r) and (|r|, w.q), fused as red2 under Machine(joint_red=True)). Exact for SPD M and avoids orthogonality
+    loss when M is nonsymmetric."""
+    tr = x.tr
+    Ax = A(x)
+    nf = _norm_factor(A, x, b, Ax)
+    r = b - Ax
+    r0 = np.abs(r).sum() / nf
+    END, LOOP = tr.new_label(), tr.new_label()
+    X, R = Var(x), Var(r)
+    P, D_OLD, IT, RES = Var(np.zeros_like(x)), Var(_scalar(tr, 1.0)), Var(_scalar(tr, 0.0)), Var(r0)
+    if c.minIter <= 0:
+        tr.jumpif(_converged(r0, r0, c).c[()], END)
+    if maxit <= 0:
+        tr.jump(END)
+    w0 = M(r)
+    W, WQ = Var(w0), Var(_scalar(tr, 0.0))
+    tr.trips[LOOP] = 10
+    tr.label(LOOP)
+    p = W.t - (WQ.t / D_OLD.t) * P.t
+    q = A(p)
+    a_pq, a_pr = p * q, p * R.t
+    pq, pr = a_pq.sum(), a_pr.sum()
+    alpha = pr / pq
+    X.set(X.t + alpha * p)
+    rn = R.t - alpha * q
+    R.set(rn)
+    P.set(p)
+    D_OLD.set(pq)
+    it = IT.t + 1.0
+    IT.set(it)
+    wn = M(rn)
+    a_abs, a_wq = np.abs(rn), wn * q
+    sa, swq = a_abs.sum(), a_wq.sum()
+    res = sa / nf
+    RES.set(res)
+    W.set(wn)
+    WQ.set(swq)
+    done = _converged(res, r0, c)
     if c.minIter > 0:
         done = done * (it >= float(c.minIter))
     tr.jumpif((done + (it >= float(maxit))).c[()], END)

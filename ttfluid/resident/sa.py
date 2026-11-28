@@ -12,6 +12,7 @@ prolongation and restriction are one SpMV with frozen coefficients on the level'
 gather / member sum the pairwise build already has. Chebyshev bounds are frozen at setup (no max-reduction on device).
 """
 import functools
+import os
 
 import numpy as np
 import scipy.sparse as sp
@@ -24,6 +25,7 @@ COARSE_DEG = 8
 # max / sum over the chips, GUNION a sorted union of hashable items over the chips.
 OWN = None
 GMAX = lambda v: v
+CHUNK = float(os.environ.get("CFD_AMG_CHUNK", 0))   # tiles a stacked chunk may span (0: the fine cells' tile count)
 GSUM = lambda v: v
 GUNION = lambda xs: sorted(set(xs))
 
@@ -355,13 +357,16 @@ def _chunks(name, base, leader, owner, I, k, pos):
     rows = GMAX(int(np.bincount(owner[leader][own]).max(initial=0)))
     w = -(-rows // 4) * 4 if rows <= LANES else -(-rows // LANES) * LANES
     C = max(1, -(-GMAX(int(np.bincount(owner[_own(owner, len(owner))]).max(initial=0))) // LANES) * LANES // w)
+    if CHUNK:   # a chunk of at most CHUNK tiles: its gather target and products fit the one-tile pool (wplace 2 overlays)
+        C = max(1, min(C, int(CHUNK * LANES) // w))
     kmax = GMAX(int(k[own[I]].max(initial=0)))
     out = []
     for j, k0 in enumerate(range(0, kmax + 1, C)):
         sel = np.nonzero((k >= k0) & (k < k0 + C))[0]
         c = min(C, kmax + 1 - k0)
-        out.append((Space(f"{name}{j}", base.n * c, cells=np.tile(leader, c), stack=(base, c, w)),
-                    (k[sel] - k0) * base.n + I[sel], pos[sel], sel))
+        # a one-slot chunk under CFD_AMG_CHUNK is the base space itself: no stacked space and no block sum
+        g = base if CHUNK and c == 1 else Space(f"{name}{j}", base.n * c, cells=np.tile(leader, c), stack=(base, c, w))
+        out.append((g, (k[sel] - k0) * base.n + I[sel], pos[sel], sel))
     return out, C
 
 
@@ -437,7 +442,7 @@ def _ssum(x, chunks, base, weights):
             full[dst] = wt
             wt = full
         xg = gather(g, g.n, [(x, dst, pos)], None, x.tr)
-        t = T(x.tr, base, np.array(x.tr.bsum((xg * wt).c[()]), object))
+        t = xg * wt if g is base else T(x.tr, base, np.array(x.tr.bsum((xg * wt).c[()]), object))
         y = t if y is None else y + t
     return y
 
