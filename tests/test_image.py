@@ -1,4 +1,6 @@
 """Per-chip images: the sparse read of a chip array and the state round trip (host only, no device)."""
+import time
+
 import numpy as np
 
 from ttfluid.lower import image_dev
@@ -82,6 +84,17 @@ def test_staged_upload_lays_the_array_a_full_upload_writes(tmp_path):
             assert sg.parts == 1 if cap is None else sg.parts > 1 and (sg.parts == 64 or sg.rows.max() * 4096 <= cap)
             for W in (2 * P, 7, 1):
                 assert np.array_equal(lay(sg, 0, W), full)
+            ahead = image_dev.Ahead(sg)                  # the parts' host buffers, in order, two in hand at most
+            for j, p in enumerate(sg.pieces()):
+                stage = np.zeros(p.shape, np.uint32)
+                p.fill(0, stage)
+                assert np.array_equal(ahead.next(), stage)
+                if j + 2 < sg.parts:                     # part j + 1 is built, part j + 2 waits for done()
+                    while not ahead.built.qsize():
+                        time.sleep(0.001)
+                    time.sleep(0.02)
+                    assert ahead.built.qsize() == 1
+                ahead.done()
             sg.on[0][1] = False                          # the gate can fail: a page that holds values marked zero
             assert not np.array_equal(lay(sg, 0, 2 * P), full)
 

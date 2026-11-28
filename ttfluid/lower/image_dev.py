@@ -13,6 +13,8 @@ arrays themselves (upload_placed). CFD_IMG_VERIFY=1 reads every uploaded tensor 
 with the image.
 """
 import os
+import queue
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -164,31 +166,32 @@ class Staged:
     """An array of 4 KB pages as upload_placed sends it: only the pages that hold a value, in page order, in one part
     or several. mark() reads the page marks of every chip (on[k], pages(k) on a thread per chip) and decides: sparse
     when the host would write less than half of the array, and as many equal runs of pages (parts) as it takes for
-    the staged pages of one run, over all chips, to fit in cap bytes: the host holds a part while it is written and
-    the next one while it is built, never the array. part(j): its first page, the pages of a full part, its staging
-    shape and fill, and on(k), chip k's marks inside it. src(): (shape, fill) of the first thing upload_placed
-    writes, part 0 when sparse, else the array itself."""
+    the staged pages of one run, over all chips, to fit in cap bytes, so that the host holds parts and never the
+    array (Ahead). part(j): its first page, the pages of a full part, its staging shape and fill, and on(k), chip
+    k's marks inside it. pieces(): what the host writes, in order: the parts when sparse, else the array itself."""
 
     def __init__(self, DEVBLK, shape, fill, pages, cap=None):
         self.DEVBLK, self.full, self.fill_full, self.pages, self.cap, self.on = DEVBLK, shape, fill, pages, cap, None
+        self.lock = threading.Lock()
 
     def mark(self):
-        if self.on is None:
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(len(self.DEVBLK)) as ex:
-                self.on = dict(zip(self.DEVBLK, ex.map(self.pages, self.DEVBLK)))
-            c = [np.concatenate([[0], np.cumsum(o)]) for o in self.on.values()]
-            self.shape = (max(1, max(int(x[-1]) for x in c)), self.full[1])
-            self.sparse = 2 * self.shape[0] < self.full[0]
-            n = 1
-            while True:
-                self.size = -(-self.full[0] // n)
-                e = np.minimum(np.arange(n + 1) * self.size, self.full[0])
-                self.rows = np.maximum(1, np.max([x[e[1:]] - x[e[:-1]] for x in c], axis=0))
-                if self.cap is None or not self.sparse or n == 64 or int(self.rows.max()) * len(c) * 4 * self.full[1] <= self.cap:
-                    break
-                n += 1
-            self.parts = n
+        with self.lock:
+            if self.on is None:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(len(self.DEVBLK)) as ex:
+                    self.on = dict(zip(self.DEVBLK, ex.map(self.pages, self.DEVBLK)))
+                c = [np.concatenate([[0], np.cumsum(o)]) for o in self.on.values()]
+                self.shape = (max(1, max(int(x[-1]) for x in c)), self.full[1])
+                self.sparse = 2 * self.shape[0] < self.full[0]
+                n = 1
+                while True:
+                    self.size = -(-self.full[0] // n)
+                    e = np.minimum(np.arange(n + 1) * self.size, self.full[0])
+                    self.rows = np.maximum(1, np.max([x[e[1:]] - x[e[:-1]] for x in c], axis=0))
+                    if self.cap is None or not self.sparse or n == 64 or int(self.rows.max()) * len(c) * 4 * self.full[1] <= self.cap:
+                        break
+                    n += 1
+                self.parts = n
         return self
 
     def part(self, j):
@@ -200,9 +203,36 @@ class Staged:
             self.fill_full(k, out, row)
         return SimpleNamespace(first=a, size=self.size, shape=(int(self.rows[j]), self.full[1]), fill=fill, on=lambda k: self.on[k][a:b])
 
-    def src(self):
+    def pieces(self):
         self.mark()
-        return (self.part(0).shape, self.part(0).fill) if self.sparse else (self.full, self.fill_full)
+        return [self.part(j) for j in range(self.parts)] if self.sparse else [SimpleNamespace(shape=self.full, fill=self.fill_full)]
+
+
+class Ahead:
+    """The host buffers of a Staged array's pieces, built in order on a thread of their own from the moment this is
+    made: a launch makes it before ttnn is loaded. next() hands out the next buffer, done() says it is written and
+    dropped. `alive` buffers at most are built and not yet done, which is all of the array the host ever holds."""
+
+    def __init__(self, sg, alive=2):
+        self.built, self.room = queue.Queue(), threading.Semaphore(alive)
+
+        def build():
+            try:
+                for p in sg.pieces():
+                    self.room.acquire()
+                    self.built.put(host_buffer(len(sg.DEVBLK), sg.DEVBLK, p.shape, p.fill))
+            except BaseException as e:     # next() raises it where the buffer was expected
+                self.built.put(e)
+        threading.Thread(target=build, daemon=True).start()
+
+    def next(self):
+        buf = self.built.get()
+        if isinstance(buf, BaseException):
+            raise buf
+        return buf
+
+    def done(self):
+        self.room.release()
 
 
 def page_map(on, W, size=None):
@@ -249,14 +279,14 @@ def carry_arena(img, k, P, a_out):
 
 def upload(md, K, DEVBLK, shape, fill, name=None, host=None):
     """A (K * rows, words) uint32 mesh tensor whose device d holds the array fill(DEVBLK[d], out) writes into its zeroed
-    (rows, words) buffer out, all shards written in one copy. host: a future of host_shards(...) for this array, built
-    ahead while another array was written. With CFD_UPLOAD_PROFILE set and a name, prints where the upload's wall clock
+    (rows, words) buffer out, all shards written in one copy. host: a call that gives host_shards(...) of this array,
+    built ahead (a future's result, or a buffer of Ahead). With CFD_UPLOAD_PROFILE set and a name, prints where the upload's wall clock
     went: waiting for the host buffer (image read, state overlay) against the write to the chips, which is
     synchronized so the split is the device's."""
     import ttnn
     prof = name and os.environ.get("CFD_UPLOAD_PROFILE")
     t0 = time.time()
-    box = host.result() if host is not None else host_shards(md, K, DEVBLK, shape, fill)
+    box = host() if host is not None else host_shards(md, K, DEVBLK, shape, fill)
     h, shard = box
     box.clear()   # a future keeps its result: without this the host buffer would outlive the write
     t1 = time.time()
@@ -318,39 +348,38 @@ def workers(md, cells, grid, cores, DEVBLK, source, ct, tensors, out, common, ar
 NB = 16   # pages a worker keeps in flight
 
 
-def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, host=None):
+def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, ahead=None):
     """upload for a Staged array. Sparse: part by part the host writes the staged pages and a page map, and every
     core of a chip lays its share of the part with both its data movement processors (kernels/place.cpp), copying the
     staged pages to their places and writing the rest as zeros. The array ends up as upload leaves it; the PCIe write
-    carries a fifth of the bytes (zeros cost it what data costs) and the host never holds the zero pages, nor more
-    than two parts. Not sparse: a plain upload. cells[d]: device d's mesh coordinate; host: a future of
-    host_shards(md, K, DEVBLK, *sg.src()), part 0 built ahead."""
+    carries a fifth of the bytes (zeros cost it what data costs) and the host never holds the zero pages. Not
+    sparse: a plain upload. cells[d]: device d's mesh coordinate; ahead: the Ahead of sg, started earlier."""
     import ttnn
-    from concurrent.futures import ThreadPoolExecutor
     K, W = len(DEVBLK), 2 * len(cores)
     prof = name and os.environ.get("CFD_UPLOAD_PROFILE")
-    if host is not None:
-        host.result()        # it marked the pages
-    if not sg.mark().sparse:
-        return upload(md, K, DEVBLK, *sg.src(), name, host)
+    ahead = ahead or Ahead(sg)
+    parts = sg.pieces()
+
+    def write(p, label):
+        t = upload(md, K, DEVBLK, p.shape, p.fill, label, lambda: host_shards(md, K, DEVBLK, p.shape, p.fill, ahead.next()))
+        ahead.done()
+        return t
+    if not sg.sparse:
+        return write(parts[0], name)
     t = ttnn.allocate_tensor_on_device(ttnn.Shape(list(sg.full)), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
-    parts = [sg.part(j) for j in range(sg.parts)]
     maps = laid = 0.0
-    with ThreadPoolExecutor(1) as ahead:      # the next part is built while this one is written and laid
-        for j, p in enumerate(parts):
-            nxt = ahead.submit(host_shards, md, K, DEVBLK, parts[j + 1].shape, parts[j + 1].fill) if j + 1 < len(parts) else None
-            t_stage = upload(md, K, DEVBLK, p.shape, p.fill, name and "%s staged %d/%d" % (name, j + 1, len(parts)), host)
-            host = nxt
-            t0 = time.time()
-            work = {k: page_map(p.on(k), W, p.size) for k in DEVBLK}
-            mw = work[DEVBLK[0]][0].shape[1]
-            t_map = upload(md, K, DEVBLK, (W, mw), lambda k, out: np.copyto(out, work[k][0]))
-            t1 = time.time()
-            workers(md, cells, grid, cores, DEVBLK, "place.cpp", [4 * mw, NB, 0], [t, t_stage, t_map], t, [0],
-                    lambda k: [(w, p.first + first, count, start) for w, first, count, start in work[k][1]], 4 * mw + 4096 * (NB + 1))
-            ttnn.deallocate(t_stage)
-            ttnn.deallocate(t_map)
-            maps, laid = maps + t1 - t0, laid + time.time() - t1
+    for j, p in enumerate(parts):
+        t_stage = write(p, name and "%s staged %d/%d" % (name, j + 1, len(parts)))
+        t0 = time.time()
+        work = {k: page_map(p.on(k), W, p.size) for k in DEVBLK}
+        mw = work[DEVBLK[0]][0].shape[1]
+        t_map = upload(md, K, DEVBLK, (W, mw), lambda k, out: np.copyto(out, work[k][0]))
+        t1 = time.time()
+        workers(md, cells, grid, cores, DEVBLK, "place.cpp", [4 * mw, NB, 0], [t, t_stage, t_map], t, [0],
+                lambda k: [(w, p.first + first, count, start) for w, first, count, start in work[k][1]], 4 * mw + 4096 * (NB + 1))
+        ttnn.deallocate(t_stage)
+        ttnn.deallocate(t_map)
+        maps, laid = maps + t1 - t0, laid + time.time() - t1
     if prof:
         print("place %s: %d of %d pages per chip staged in %d part(s), maps %.2f s, laid on the chips in %.2f s (compile included)"
               % (name, sg.shape[0], sg.full[0], len(parts), maps, laid), flush=True)
