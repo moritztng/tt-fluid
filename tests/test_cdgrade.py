@@ -40,3 +40,20 @@ def test_nan_and_gaps():
     assert cdgrade.grade({**run, 500: (float("nan"), 0.0)}, REF)["grade"] == "FAIL"
     with pytest.raises(SystemExit):
         cdgrade.grade({i: v for i, v in run.items() if i != 500}, REF)
+
+
+def test_state_file_reads_like_its_history(tmp_path):
+    """run_mesh saves the history inside the final-state file; the gate reads it there."""
+    np = pytest.importorskip("numpy")
+    hist = QB2 / "qb2k2_D1A.hist.json"
+    np.savez(tmp_path / "leg_state.npz", p=np.zeros(1, np.float32), hist=hist.read_text())
+    assert cdgrade.series([f"{tmp_path}/leg_state.npz:300"]) == cdgrade.series([f"{hist}:300"])
+
+
+def test_reordered_runs_track_and_other_changes_do_not():
+    """Same binary on two GPUs differs only in reduction order; fp64 against mixed precision is a different solve."""
+    a, b, dp = (cdgrade.series([str(H100 / d / "coefficient.dat")]) for d in ("A_SPDP_g1", "A_SPDP_g2", "A_DP_g2"))
+    assert cdgrade.grade(a, REF, base=b)["reordered"] and not cdgrade.grade(a, REF, base=dp)["reordered"]
+    wrong = {i: (cd * 1.001, cl) for i, (cd, cl) in b.items()}   # a 0.1 % force error is seen in the first iterations
+    assert not cdgrade.grade(wrong, REF, base=b)["reordered"]
+    assert "early" not in cdgrade.grade(a, REF, base={i: v for i, v in b.items() if i > 100})

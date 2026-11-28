@@ -119,8 +119,11 @@ final states against two earlier builds.
 python3 bench/cdgrade.py --run results/tenstorrent/quietbox2-p300x4/qb2k2_D1A.hist.json:0 \
     results/tenstorrent/quietbox2-p300x4/qb2k2_D2A.hist.json:800
 python3 bench/cdgrade.py --run results/nvidia/dgx-h100/A_SPDP_g1/coefficient.dat
-python3 bench/cdgrade.py --run new.hist.json:0 --base old.hist.json:0     # did a change move the answer?
+python3 bench/cdgrade.py --run new_case_1x2_state.npz:0 --base old.hist.json:0     # did a change move the answer?
 ```
+
+A device run is given as the state file `run_mesh --forces` writes (it holds the history) or as a history exported from
+it, followed by the iteration the leg started from.
 
 It compares the mean Cd of a window with OpenFOAM's long-run mean (iterations 501-3372, Cd 0.42226 +- 3.5 counts) and
 passes the run if the difference is inside a band. The band is 12.5 counts, or two standard deviations of the
@@ -155,6 +158,12 @@ Three choices behind it:
 With `--base` the tool also reports the shift against a baseline run over the same window. Two correct runs that differ
 only in the order of their floating-point sums sit 11.5 counts apart (one standard deviation) on 201-800: the 28 pairs
 of identical SPUMA SPDP runs measure 16.1, the 28 double-precision pairs 8.8. A shift inside twice that is no change; about 1 pair in 20 of correct runs lies outside.
+
+A change that only reorders the same arithmetic (another partition, another gather or reduction order) has a sharper
+check, printed with `--base` when both runs start from the same state. Such runs still track each other early on:
+across the 28 pairs of SPUMA SPDP runs Cd differs by at most 0.3 counts through iteration 40 and 5.2 through iteration
+100. Double precision against mixed precision is 58 counts apart by then, and a 0.1 % error in the force shows in the
+first iterations. A run that tracks its base is a reorder of it; anything else is graded on the window.
 
 What the runs in `results/` grade as:
 

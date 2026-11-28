@@ -3,8 +3,9 @@ OpenFOAM/SPUMA coefficient files.
 
     python3 bench/cdgrade.py --run RUN [RUN ...] [--base RUN ...] [--ref coefficient.dat ...] [--from 201] [--to N]
 
-RUN is `X.hist.json:IT0` (run_mesh --forces history; row k holds Cd_in/Cl_in of the state iteration IT0 + k starts
-from, which is OpenFOAM's row for that iteration) or an OpenFOAM coefficient.dat. Several RUNs chain legs of one run.
+RUN is `X_state.npz:IT0` or `X.hist.json:IT0` (the history run_mesh --forces saves with the final state; row k holds
+Cd_in/Cl_in of the state iteration IT0 + k starts from, which is OpenFOAM's row for that iteration) or an OpenFOAM
+coefficient.dat. Several RUNs chain legs of one run.
 
 The case never settles under SIMPLE: Cd swings about 40 counts from iteration to iteration (1 count = 1e-4), and two
 runs from the same start are unrelated after about 300 iterations. So a run is graded on the mean over a window, and
@@ -19,14 +20,19 @@ S100 / sqrt(n).
 The window starts at 201 because iterations 101-200 still carry a start-up transient that depends on the linear
 solvers. With --base the same window of a baseline run is compared too: two correct runs that differ only in the order
 of their floating-point sums sit sqrt(2) S100 / sqrt(n) apart (the floor); 1 such pair in 20 is over twice that apart.
+
+A change that only reorders the same arithmetic has a much sharper check, also printed with --base when both runs
+start from the same state: such runs still track each other through iteration 100 (TRACK), long before the window.
 """
 import argparse
 import json
 import math
+import re
 import sys
 
 BAND = 12.5                       # counts, the accuracy bar on a window long enough to resolve it
 S100 = {"Cd": 20.0, "Cl": 18.0}   # counts, sd of a 100-iteration mean (OpenFOAM, SPUMA x18, two device builds)
+TRACK = {40: 0.3, 100: 5.2}       # counts, largest |Cd difference| through that iteration between reordered runs
 BLOCK, START, REF_FROM = 100, 201, 501
 REF = ["results/openfoam/of1k.dat", "results/openfoam/of4k.dat"]
 
@@ -35,10 +41,15 @@ def series(specs):
     """{iteration: (Cd, Cl)} from history legs and/or coefficient.dat files."""
     s = {}
     for spec in specs:
-        if ".json" in spec:
-            path, _, it0 = spec.partition(".json")
-            for k, r in enumerate(json.load(open(path + ".json"))):
-                s[int(it0.lstrip(":") or 0) + k] = (r["Cd_in"], r["Cl_in"])
+        leg = re.fullmatch(r"(.+\.(json|npz))(:(\d+))?", spec)
+        if leg and leg[2] == "npz":
+            import numpy as np
+            rows = json.loads(str(np.load(leg[1])["hist"]))
+        elif leg:
+            rows = json.load(open(leg[1]))
+        if leg:
+            for k, r in enumerate(rows):
+                s[int(leg[4] or 0) + k] = (r["Cd_in"], r["Cl_in"])
         else:
             for line in open(spec):
                 if line.startswith("# Time"):
@@ -56,6 +67,13 @@ def window(s, lo, hi, q):
     m, n = sum(x) / len(x), len(bm)
     sd = math.sqrt(sum((b - sum(bm) / n) ** 2 for b in bm) / (n - 1)) if n > 1 else float("nan")
     return m, sd / math.sqrt(n), sd
+
+
+def tracks(run, base):
+    """Largest |Cd difference| in counts through each TRACK iteration, or None unless both runs hold iterations 1-100."""
+    if not all(i in run and i in base for i in range(1, max(TRACK) + 1)):
+        return None
+    return {h: max(abs(run[i][0] - base[i][0]) for i in range(1, h + 1)) * 1e4 for h in TRACK}
 
 
 def grade(run, ref, base=None, lo=START, hi=None):
@@ -80,6 +98,8 @@ def grade(run, ref, base=None, lo=START, hi=None):
         c["ok"] = abs(c["diff"]) <= c["band"]   # a NaN in the window fails
         out[name] = c
     out["grade"] = "PASS" if out["Cd"]["ok"] else "FAIL"
+    if base is not None and (t := tracks(run, base)):
+        out["early"], out["reordered"] = t, all(not t[h] > TRACK[h] for h in TRACK)   # a NaN does not track
     return out
 
 
@@ -107,6 +127,10 @@ def main():
         if "shift" in c:
             print(f"   vs base {c['shift']:+.1f} counts, floor {c['floor']:.1f} (1 sigma): "
                   f"{'inside' if abs(c['shift']) <= 2 * c['floor'] else 'OUTSIDE'} 2 sigma")
+    if "early" in g:
+        print("first 100 its vs base: Cd within " + ", ".join(f"{v:.2f} counts through it {h}" for h, v in g["early"].items())
+              + f" | the same arithmetic in another order stays within {' / '.join(f'{v:g}' for v in TRACK.values())}: "
+              + ("it tracks the base" if g["reordered"] else "this is NOT a reorder of the base"))
     c = g["Cd"]
     print(f"GRADE: {g['grade']}  Cd {c['diff']:+.1f} counts against a band of {c['band']:.1f} on {lo}-{hi}; a bias of "
           f"{c['detects']:.0f} counts fails 9 times in 10")
