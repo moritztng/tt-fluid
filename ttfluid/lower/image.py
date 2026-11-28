@@ -22,7 +22,6 @@ import mmap
 import os
 import shutil
 import struct
-import subprocess
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
