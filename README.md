@@ -150,7 +150,7 @@ with `ruff` and a full-history `gitleaks` scan.
   the order of fp32 sums. Each partition is deterministic.
 - On pitzDaily the first SST iteration agrees with OpenFOAM v2412 to about 1e-2 in k and omega (the next steps,
   started from OpenFOAM's own state, agree to better than 1e-9 and are tested); see [docs/accuracy.md](docs/accuracy.md).
-- Lowering a case of several million cells takes host RAM: about 220 GB for HPC_motorbike Small.
+- Lowering a case of several million cells takes host RAM: about 90 GB for HPC_motorbike Small.
 - Tested with the ttnn 0.68.0 wheel. This release was verified on a Blackhole p300 board; the same device program ran
   on Blackhole p150 cards and a Wormhole Galaxy during development.
 
