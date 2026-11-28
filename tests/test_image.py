@@ -8,7 +8,7 @@ from ttfluid.resident.machine import DBASE
 def test_read_into_reads_what_the_file_stores(tmp_path):
     rng = np.random.default_rng(0)
     a = np.zeros((2048, LANES), np.float32)            # 8 MB: holes far wider than GAP between the data
-    for row in (0, 1, 2, 1000, 1001 + GAP // 4096, 2047):
+    for row in (0, 1, 2, 5, 40, 1000, 1001 + GAP // 4096, 2047):   # neighbours, gaps under GAP, one over it
         a[row] = rng.standard_normal(LANES)
     Image({"scalars": {"K": 1}}, {0: {"home": a}}).write_chip(tmp_path, 0)
     out = np.zeros(a.shape, np.uint32)

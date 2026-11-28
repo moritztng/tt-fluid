@@ -228,7 +228,8 @@ class Image:
             j.result()
 
 
-GAP, CHUNK = 1 << 18, 1 << 26      # read_into: stored ranges closer than GAP are one read; a read is at most CHUNK
+GAP, CHUNK, IOV = 1 << 18, 1 << 26, 1024   # read_into: stored ranges closer than GAP share a read of at most CHUNK bytes
+_SCRATCH = memoryview(bytearray(GAP))      # where the zeros between them go (never read; shared by all readers)
 _READERS = ThreadPoolExecutor(int(os.environ.get("CFD_IMG_THREADS", 8)))   # preadv and numpy indexing release the GIL
 
 
@@ -248,9 +249,9 @@ class _ChipFiles(dict):
     def read_into(self, name, out):
         """Array `name` read into out, a zeroed C-contiguous buffer of its byte size, from the byte ranges the file
         stores. write_chip left the zero pages as holes and a hole is not read, so its pages of out stay untouched:
-        they take no time and no RAM (Small k2: 5.3 of 27.3 GB is stored). Ranges closer than GAP are read as one,
-        because the zero rows of the constants sit between data every ~60 KB and one read per range is slower than
-        reading the zeros between them."""
+        they take no time and no RAM (Small k2: 5.3 of 27.3 GB is stored). The zero rows of the constants sit between
+        data every ~60 KB and one read per stored range is slow, so ranges closer than GAP share one vectored read
+        whose zeros between them land in a scratch buffer, not in out."""
         buf = memoryview(out).cast("B")
         with open(dict.__getitem__(self, name), "rb") as f:
             major, _ = np.lib.format.read_magic(f)
@@ -258,30 +259,29 @@ class _ChipFiles(dict):
             off, fd = f.tell(), f.fileno()
             end = os.fstat(fd).st_size
             assert end - off == len(buf), (name, end - off, len(buf))
-            runs, p = [], off
+            reads, p, last = [], off, None      # a read: [file offset, bytes, [memoryview, ...]], contiguous in the file
             while p < end:
                 try:
                     a = os.lseek(fd, p, os.SEEK_DATA)
                 except OSError:      # ENXIO: a hole to the end of the file
                     break
                 p = os.lseek(fd, a, os.SEEK_HOLE)
-                if runs and a - runs[-1][1] <= GAP:
-                    runs[-1][1] = p
-                else:
-                    runs.append([a, p])
+                for lo in range(a, p, CHUNK):
+                    hi = min(lo + CHUNK, p)
+                    r = reads[-1] if reads else None
+                    if r is not None and lo - last <= GAP and len(r[2]) + 2 <= IOV and r[1] + hi - last <= CHUNK:
+                        if lo > last:
+                            r[2].append(_SCRATCH[:lo - last])
+                        r[2].append(buf[lo - off:hi - off])
+                        r[1] += hi - last
+                    else:
+                        reads.append([lo, hi - lo, [buf[lo - off:hi - off]]])
+                    last = hi
 
-            def read(lo, hi):
-                while lo < hi:
-                    n = os.preadv(fd, [buf[lo - off:hi - off]], lo)
-                    assert n > 0, (name, lo, hi)
-                    lo += n
-            list(_READERS.map(lambda r: read(*r), [(a, min(a + CHUNK, hi)) for lo, hi in runs for a in range(lo, hi, CHUNK)]))
-
-    def values(self):
-        return [self[n] for n in self]
-
-    def items(self):
-        return [(n, self[n]) for n in self]
+            def read(lo, size, views):
+                n = os.preadv(fd, views, lo)
+                assert n == size, (name, lo, size, n)
+            list(_READERS.map(lambda r: read(*r), reads))
 
 
 def _disk_bytes(arr, page=4096):
