@@ -7,7 +7,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 - `--lsplit 1` at lowering: a vector that holds an L1 slot across a solver loop that does not use it is parked in DRAM
-  for the loop.
+  for the loop. `--lsplit 2` also parks the solution of a solve, which its loop touches once a pass.
+- `--cse 2` at lowering: gathers whose index arrays have the same content are computed once. `--cse 1` compares the
+  arrays by identity, so every caller of an interpolation or a gradient of one field gathered it again.
 - `--tabdense N` at lowering: gathers that read one L1 vector use a dense 16-bit index table (6.4 cycles a value on
   Blackhole against 12.1). `--span 1|2`: a gather from a DRAM-homed vector reads an L1 copy of it through those tables.
   Both keep the state bit-identical and are off by default; `--tscheck` decodes every dense table back to its map
@@ -20,12 +22,31 @@ All notable changes to this project are documented here. The format follows
   `bench/per_dollar.py` prices them.
 
 ### Changed
-- HPC_motorbike Small on two Blackhole chips: 800 iterations take about 1030 s of device time with `--l1 2 --lsplit 1`
-  and the automatic cache and patch settings, 1.18 times faster on the device than `--l1 1 --gcache 14`, with a
-  bit-identical state after 100 iterations. The tutorial's Part 2 carries the new lowering and run lines.
+- HPC_motorbike Small on two Blackhole chips: the first 100 iterations take 108 s of device time with the tutorial's
+  new line (`--l1 1 --lsplit 2 --cse 2 --tabdense 530 --span 2` and the settings the run chooses itself), 1.49 times
+  faster than v0.1.0's `--l1 1 --gcache 14` (161 s), with a bit-identical state. The line in between
+  (`--l1 2 --lsplit 1`) took 136 s, and 1030 s for 800 iterations.
+- On Blackhole with streamed tables a run shares the copies of a gather tile among the three processors of a core by
+  default (`--bgts 6 --tgts 3`). The tutorial's line gave `--bgts 5 --tgts 2` before, which is 2 % slower on the
+  device on the case above, and gives neither option now. `--bgts 0 --tgts 0` turns the sharing off.
 - Image upload and the state transfer read only the bytes an image stores. Host time around a Small run fell from
   65 s to 18 s and its peak host memory from 29 GB to 11 GB.
 - Lowering HPC_motorbike Small needs about 90 GB of host RAM (the docs said 220 GB).
+- A run whose residuals become NaN or infinite ends in that iteration: `run_mesh` prints `DIVERGED` with the
+  iteration and the fields, saves the state and exits with status 4 (with `--cases`, after the last case). Before,
+  every linear solve of the remaining iterations ran to its cap.
+
+### Fixed
+- HPC_motorbike Small could go NaN in single precision: in iteration 337 of one of nine start states on four
+  Blackhole chips, and after about 2,200 iterations on two. omega was floored at OpenFOAM's double-precision `SMALL`
+  (1e-15). In fp32 it is now floored at 1e-6, the value OpenFOAM's own single-precision build uses; `omegaMin` and
+  `kMin` in the RAS dictionary override the defaults. The new floor moves the rounding of every fp32 run from its
+  first iterations, so earlier final states are not reproduced bit for bit
+  ([accuracy](docs/accuracy.md#a-known-behaviour-of-the-case)). Eight runs on the new floor, the start that went NaN
+  included, all end and pool to -5.7 +- 4.9 drag counts against OpenFOAM fp64 (bar 12.5); seven runs on the old floor
+  read -3.3 +- 4.9.
+- PBiCGStab's breakdown test compared against 1e-300, which is zero in fp32, so it could never stop a solve. It now
+  uses the smallest magnitude of the precision.
 
 ## [0.1.0] - 2026-10-19
 
