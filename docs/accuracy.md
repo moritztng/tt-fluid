@@ -160,10 +160,13 @@ only in the order of their floating-point sums sit 11.5 counts apart (one standa
 of identical SPUMA SPDP runs measure 16.1, the 28 double-precision pairs 8.8. A shift inside twice that is no change; about 1 pair in 20 of correct runs lies outside.
 
 A change that only reorders the same arithmetic (another partition, another gather or reduction order) has a sharper
-check, printed with `--base` when both runs start from the same state. Such runs still track each other early on:
-across the 28 pairs of SPUMA SPDP runs Cd differs by at most 0.3 counts through iteration 40 and 5.2 through iteration
-100. Double precision against mixed precision is 58 counts apart by then, and a 0.1 % error in the force shows in the
-first iterations. A run that tracks its base is a reorder of it; anything else is graded on the window.
+check, printed with `--base` when both runs start from the same state. Such runs still track each other through
+iteration 10: two partitions of the same device program differ by at most 0.5 counts of Cd there, the 28 pairs of
+SPUMA SPDP runs by 0.01. The limit is 1 count. Double precision against mixed precision is 58 counts apart by then, and
+a 0.1 % error in the force is 17 counts at iteration 1. The check stops at iteration 10 because the device pair
+separates soon after: at iteration 12 one velocity solve takes 14 iterations on one partition and 13 on the other, and
+three iterations later the two drag values are 44 counts apart. A run that tracks its base is a reorder of it; anything
+else is graded on the window.
 
 What the runs in `results/` grade as:
 

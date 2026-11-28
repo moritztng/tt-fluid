@@ -56,4 +56,4 @@ def test_reordered_runs_track_and_other_changes_do_not():
     assert cdgrade.grade(a, REF, base=b)["reordered"] and not cdgrade.grade(a, REF, base=dp)["reordered"]
     wrong = {i: (cd * 1.001, cl) for i, (cd, cl) in b.items()}   # a 0.1 % force error is seen in the first iterations
     assert not cdgrade.grade(wrong, REF, base=b)["reordered"]
-    assert "early" not in cdgrade.grade(a, REF, base={i: v for i, v in b.items() if i > 100})
+    assert "early" not in cdgrade.grade(a, REF, base={i: v for i, v in b.items() if i > cdgrade.TRACK_ITS})

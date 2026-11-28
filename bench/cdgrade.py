@@ -22,7 +22,8 @@ solvers. With --base the same window of a baseline run is compared too: two corr
 of their floating-point sums sit sqrt(2) S100 / sqrt(n) apart (the floor); 1 such pair in 20 is over twice that apart.
 
 A change that only reorders the same arithmetic has a much sharper check, also printed with --base when both runs
-start from the same state: such runs still track each other through iteration 100 (TRACK), long before the window.
+start from the same state: such runs still track each other through iteration 10 (TRACK), long before the window.
+After that one linear solve taking one iteration more or fewer separates them for good.
 """
 import argparse
 import json
@@ -33,7 +34,7 @@ from pathlib import Path
 
 BAND = 12.5                       # counts, the accuracy bar on a window long enough to resolve it
 S100 = {"Cd": 20.0, "Cl": 18.0}   # counts, sd of a 100-iteration mean (OpenFOAM, SPUMA x18, two device builds)
-TRACK = {40: 0.3, 100: 5.2}       # counts, largest |Cd difference| through that iteration between reordered runs
+TRACK_ITS, TRACK = 10, 1.0        # reordered runs stay within TRACK counts of Cd through iteration TRACK_ITS
 BLOCK, START, REF_FROM = 100, 201, 501
 REF = [str(Path(__file__).resolve().parent.parent / "results/openfoam" / f) for f in ("of1k.dat", "of4k.dat")]
 
@@ -71,10 +72,9 @@ def window(s, lo, hi, q):
 
 
 def tracks(run, base):
-    """Largest |Cd difference| in counts through each TRACK iteration, or None unless both runs hold iterations 1-100."""
-    if not all(i in run and i in base for i in range(1, max(TRACK) + 1)):
-        return None
-    return {h: max(abs(run[i][0] - base[i][0]) for i in range(1, h + 1)) * 1e4 for h in TRACK}
+    """Largest |Cd difference| in counts through iteration TRACK_ITS, or None unless both runs hold those iterations."""
+    its = range(1, TRACK_ITS + 1)
+    return max(abs(run[i][0] - base[i][0]) for i in its) * 1e4 if all(i in run and i in base for i in its) else None
 
 
 def grade(run, ref, base=None, lo=START, hi=None):
@@ -99,8 +99,8 @@ def grade(run, ref, base=None, lo=START, hi=None):
         c["ok"] = abs(c["diff"]) <= c["band"]   # a NaN in the window fails
         out[name] = c
     out["grade"] = "PASS" if out["Cd"]["ok"] else "FAIL"
-    if base is not None and (t := tracks(run, base)):
-        out["early"], out["reordered"] = t, all(not t[h] > TRACK[h] for h in TRACK)   # a NaN does not track
+    if base is not None and (t := tracks(run, base)) is not None:
+        out["early"], out["reordered"] = t, t <= TRACK   # a NaN does not track
     return out
 
 
@@ -129,9 +129,8 @@ def main():
             print(f"   vs base {c['shift']:+.1f} counts, floor {c['floor']:.1f} (1 sigma): "
                   f"{'inside' if abs(c['shift']) <= 2 * c['floor'] else 'OUTSIDE'} 2 sigma")
     if "early" in g:
-        print("first 100 its vs base: Cd within " + ", ".join(f"{v:.2f} counts through it {h}" for h, v in g["early"].items())
-              + f" | the same arithmetic in another order stays within {' / '.join(f'{v:g}' for v in TRACK.values())}: "
-              + ("it tracks the base" if g["reordered"] else "this is NOT a reorder of the base"))
+        print(f"its 1-{TRACK_ITS} vs base: Cd within {g['early']:.2f} counts | the same arithmetic in another order stays "
+              f"within {TRACK:g}: " + ("it tracks the base" if g["reordered"] else "this is NOT a reorder of the base"))
     c = g["Cd"]
     print(f"GRADE: {g['grade']}  Cd {c['diff']:+.1f} counts against a band of {c['band']:.1f} on {lo}-{hi}; a bias of "
           f"{c['detects']:.0f} counts fails 9 times in 10")
