@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- A run from per-chip images (`run_mesh --from-images`) reads only the bytes the image files store and hands ttnn one
+  host buffer without a copy. HPC_motorbike Small on two chips: 12 GB of host RAM per run instead of 32 GB, and 17 s
+  around the iterations (start, upload, state download, save) instead of 39 s. The end state is bit for bit the same.
+  `CFD_IMG_THREADS` sets the number of reader threads (default 8).
+
 ## [0.1.0] - 2026-10-19
 
 First public release.
