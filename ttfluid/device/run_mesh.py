@@ -465,9 +465,9 @@ BLKB = 0    # --blktab: bytes of the body table in the MATH kernel's text. The k
 if a.blocks and a.blktab:
     BLKB = 4 * (len(json.loads(Path(a.from_images, "blk_tab.json").read_text())) if IMG is not None else sum(len(p) for p in ttfluid.resident.encode.BLOCKS["tab"]))
     BLKB = -(-BLKB // 4096) * 4096
-    print("blktab: worker L1 %d - %d B for the kernel config buffer" % (ttnn.device.get_max_worker_l1_unreserved_size(), BLKB), flush=True)
+    print("blktab: kernel config buffer 69 KB + %d B, worker L1 %d B" % (BLKB, ttnn.device.get_max_worker_l1_unreserved_size() - 69 * 1024 - BLKB), flush=True)
 md = ttnn.open_mesh_device(ttnn.MeshShape(R, C), num_command_queues=2 if OVL else 1,
-                           **({"worker_l1_size": ttnn.device.get_max_worker_l1_unreserved_size() - BLKB} if BLKB else {}))
+                           **({"worker_l1_size": ttnn.device.get_max_worker_l1_unreserved_size() - 69 * 1024 - BLKB} if BLKB else {}))   # all of L1 but the buffer
 stamp("mesh + fabric up")
 # the CB region runs from the allocator's L1 base to the top of L1. Metal sets that base when it opens the device, above a
 # kernel config buffer whose size depends on the board and its fabric, so it is the device's L1 + L1 small banks, not a
