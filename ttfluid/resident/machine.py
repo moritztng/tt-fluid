@@ -2234,8 +2234,9 @@ class Machine:
     # front of the gather fills it through the reader ring (T pages, what the gather's window read cost) unless the
     # span already holds that vector. The gather is then the single-L1-vector case the dense tables serve
     # (--tabdense), with no window read and no gather-cache miss. The span is dropped at every label and jump and by
-    # a store to its vector. Halo parts, in-place constants (narrow would start to round them) and gathers with no
-    # window keep today's path. Values are unchanged: the same lanes are read, from a copy.
+    # a store to its vector. A part's halo entries still read the halo page; gathers that mix vectors, in-place
+    # constants (narrow would start to round them) and gathers with no window keep today's path. Values are
+    # unchanged: the same lanes are read, from a copy.
     def _span_fill(self, mir, D, base):
         out, cur, held, nfill, npage, skipped = [], None, None, 0, 0, Counter()
         i = 0
@@ -2249,7 +2250,7 @@ class Machine:
                     nxt[1] == ins[2][0][1] and nxt[2] in self.base:
                 u = ins[1][-1]
                 if u[0] == "lds" and u[2] in D and (len(ins[1]) == 1 or (len(ins[1]) == 2 and ins[1][0][2] == "__anchor__")):
-                    why = "constant" if u[2] in self.alias else "parts" if any(x != u[2] or h is not None for x, h in nxt[3]) \
+                    why = "constant" if u[2] in self.alias else "parts" if any(x != u[2] for x, h in nxt[3]) \
                         else "self" if nxt[1] == u[2] else None
                     if why is None:
                         src = u[2]
