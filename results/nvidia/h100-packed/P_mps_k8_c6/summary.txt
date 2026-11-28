@@ -1,0 +1,1 @@
+/root/s/P_mps_k8_c6 iters=800 wall=2081.8s first_it=66.2s s/iter median=2.4900 mean=2.4651 min=1.7800 max=2.7600

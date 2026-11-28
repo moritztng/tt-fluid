@@ -57,21 +57,26 @@ def bar_path(x0, y, w, h, r=4):
 
 
 def svg(rows, cd):
-    W, H = 1040, 330
+    # left: $/case, one bar per system named here (per_dollar.py prices more rows than the figure shows)
+    names = {"Tenstorrent QuietBox 2 (2x p300c, 4 Blackhole chips)": "QuietBox 2 (4 Blackhole chips)",
+             "8x H100 SXM (HGX)": "8x H100 SXM, 1 case per GPU",
+             "8x H100 SXM (HGX), 8 cases per GPU, Richardson smoother": "8x H100, 8 cases/GPU (derived)",
+             "8x B200 (HGX)": "8x B200 (derived)"}
+    bars = [(s, names[s["name"]]) for s in rows if s["name"] in names]
+    assert len(bars) == len(names), [s["name"] for s in rows]
+    W, H = 1040, 162 + 56 * len(bars)
     o = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" '
          'aria-label="Cost per case and drag coefficient versus OpenFOAM">', STYLE, '<g class="s">',
          f'<rect width="{W}" height="{H}" rx="8" fill="var(--bg)"/>']
-    # left: $/case
-    names = ["QuietBox 2 (4 Blackhole chips)", "8x H100 SXM", "8x B200 (derived)"]
     x0, x1, top = 210, 450, 92
     vmax = 0.40
     o.append('<text class="h" x="24" y="34">Cost per case, HPC_motorbike Small (8.66 M cells)</text>')
     o.append('<text class="sub" x="24" y="54">US$ per 800-iteration case, 3-year TCO; lower is better</text>')
     for t in (0, 0.1, 0.2, 0.3, 0.4):
         x = x0 + (x1 - x0) * t / vmax
-        o.append(f'<line x1="{x:.1f}" y1="{top - 14}" x2="{x:.1f}" y2="{top + 3 * 56 - 26}" stroke="var(--grid)"/>')
-        o.append(f'<text class="ax" x="{x:.1f}" y="{top + 3 * 56 - 10}" text-anchor="middle">{t:.1f}</text>')
-    for i, (s, n) in enumerate(zip(rows, names)):
+        o.append(f'<line x1="{x:.1f}" y1="{top - 14}" x2="{x:.1f}" y2="{top + len(bars) * 56 - 26}" stroke="var(--grid)"/>')
+        o.append(f'<text class="ax" x="{x:.1f}" y="{top + len(bars) * 56 - 10}" text-anchor="middle">{t:.1f}</text>')
+    for i, (s, n) in enumerate(bars):
         y = top + i * 56
         w = (x1 - x0) * s["usd_case"] / vmax
         o.append(f'<text class="l" x="{x0 - 10}" y="{y + 15}" text-anchor="end">{n}</text>')
