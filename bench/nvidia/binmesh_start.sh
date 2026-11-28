@@ -1,9 +1,11 @@
 #!/bin/bash
-# What does an ASCII mesh cost the GPU case at start? Usage: binmesh_start.sh <case-dir> <work-dir> Stock OpenFOAM v2412 simpleFoam (the code SPUMA
-# forks; mesh and field read run on the host on both), one core, endTime 0: start, read mesh and fields, build the
-# turbulence model and wall distance, exit before SIMPLE it 1. Arm A = the staged case as shipped (ASCII),
-# arm B = the same case after `foamFormatConvert -constant` with writeFormat binary. Each arm twice (second = warm
-# page cache, which is the state on a rented box right after unpacking). Real copies: the source files are hardlinked.
+# What does an ASCII mesh cost the GPU case at start?   Usage: binmesh_start.sh <case-dir> <work-dir>
+# Stock OpenFOAM v2412 simpleFoam (the code SPUMA forks; mesh and field read run on the host in both), one core,
+# endTime 0: start, read mesh and fields, build the turbulence model and the wall distance, exit before SIMPLE it 1.
+# Arm A = the case as shipped (ASCII), arm B = the same case after `foamFormatConvert -constant` with writeFormat
+# binary. Each arm twice; the second has a warm page cache, the state on a rented box right after unpacking. The
+# arms are real copies because the source files may be hardlinked. Results: <work-dir>/status, log_<arm>_<rep>.txt
+# (every line stamped with its epoch) and time_<arm>_<rep>.txt.
 set +u
 SRC=${1:?case dir} W=${2:?work dir}; mkdir -p $W; cd $W
 source ${FOAM_BASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
