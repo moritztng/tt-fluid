@@ -178,6 +178,7 @@ if a.owner:
     ttfluid.resident.machine.rcb = lambda xyz, P, chips=None: _parts
 from ttfluid.resident.memu import MachineEmu  # noqa: E402
 from ttfluid.resident.encode import Encoded  # noqa: E402
+from ttfluid.resident.tabstream import bpatch_auto  # noqa: E402
 from ttfluid.resident.program import build  # noqa: E402
 import ttfluid.resident.krylov  # noqa: E402
 
@@ -545,8 +546,7 @@ RB = 4096 if GB == 1024 else GB + 32 * P       # reduction broadcast
 E0 = RB + 2 * BW    # mesh words to E0 + 1616
 if a.bpatch is None or a.bpatch < 0:
     loc = E.tab_stream["loc"] if isinstance(E.tab_stream, dict) else None   # None: no streamed tables, or images lowered before they recorded it
-    lm = loc[0] / max(loc[1], 1) if loc else 0.0
-    a.bpatch = 4 if lm >= a.bpatch_min else 0
+    a.bpatch, lm = bpatch_auto(loc, a.bpatch_min)
     print("--bpatch auto: %.1f local residue entries per patched map tile (min %.0f) -> %d" % (lm, a.bpatch_min, a.bpatch)
           + (" (these images do not record the entries: lower again, or pass --bpatch 4)" if E.tab_stream and not loc else ""), flush=True)
 assert 0 <= a.bpatch < 8 and not (a.bpatch and not a.tabstream), "--bpatch K: 1..7 with --tabstream"

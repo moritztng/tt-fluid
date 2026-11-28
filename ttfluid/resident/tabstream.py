@@ -85,6 +85,14 @@ def _by_src_tile(ent, bounds):
     return ent
 
 
+def bpatch_auto(loc, bpatch_min):
+    """--bpatch auto: (K, local residue entries per patched map tile). K is 4 when the lowering counted at least
+    `bpatch_min` entries per patched (map, tile), else 0. `loc` is stream()'s pair of sums; None when there are no
+    streamed tables or the images were lowered before they recorded it."""
+    lm = loc[0] / max(loc[1], 1) if loc else 0.0
+    return (4 if lm >= bpatch_min else 0), lm
+
+
 def stream(E, sort=False):
     m = E.m
     P, T, nm = len(E.tab), m.T, len(m.maps.tab)      # E's rows: every core, or the cores of Encoded(cores=)
