@@ -378,8 +378,13 @@ def gershgorin(d, off):
 class Ops:
     """The per-outer-iteration operator set of every level."""
 
-    def __init__(self, levels, d, off, nbr, dtype=np.float32):
+    def __init__(self, levels, d, off, nbr, dtype=np.float32, shape=None):
+        """shape: None for the V(3,3) cycle with Chebyshev(COARSE_DEG) on the last level, or the cycle of
+        tools/mgmodel.py as a dict: fine / coarse = "add" (smoother and coarse correction from the same residual),
+        "post" or "sym"; k / ck smoothing steps on [lmax / a, lmax] / [lmax / ca, lmax]; kc steps on [lmax / ac,
+        lmax] on the last level."""
         self.dtype = dtype
+        self.shape = shape if shape is not None else getattr(levels, "shape", None)
         self.A = [(d, off, nbr)]
         for L in levels:
             d, off = galerkin(L, d, off, dtype)
@@ -398,8 +403,10 @@ class Ops:
         d, off, nbr = self.A[l]
         return d * x + (off * x[nbr]).sum(axis=1)   # a coarse level reads other cores through its own halo plan
 
-    def smooth(self, l, b, x, deg):
+    def smooth(self, l, b, x, deg, ratio=None):
         th, de, dinv = self.cheb[l]
+        if ratio is not None:                       # [lmax / ratio, lmax] with lmax = 2
+            th, de = 1.0 + 1.0 / ratio, 1.0 - 1.0 / ratio
         r = b if x is None else b - self.spmv(l, x)
         dd = dinv * r / th
         s1 = th / de
@@ -413,7 +420,27 @@ class Ops:
             rho = rn
         return x
 
+    def cycle(self, r, l=0):
+        """The shaped cycle: the correction of level l for the residual r."""
+        c = self.shape
+        if l == len(self.levels):
+            return self.smooth(l, r, None, c["kc"], c["ac"])
+        L = self.levels[l]
+        mode, k, a = (c["fine"], c["k"], c["a"]) if l == 0 else (c["coarse"], c["ck"], c["ca"])
+
+        def corr(res):
+            return self.cycle((L.Mw.astype(self.dtype) * res[L.M]).sum(axis=1), l + 1)[L.agg]
+        if mode == "add":
+            return self.smooth(l, r, None, k, a) + corr(r)
+        if mode == "post":
+            return self.smooth(l, r, corr(r), k, a)
+        assert mode == "sym", mode
+        z = self.smooth(l, r, None, k, a)
+        return self.smooth(l, r, z + corr(r - self.spmv(l, z)), k, a)
+
     def vcycle(self, r, l=0):
+        if self.shape is not None:
+            return self.cycle(r)
         if l == min(len(self.levels), DEPTH):
             return self.smooth(l, r, None, COARSE_DEG)
         L = self.levels[l]
