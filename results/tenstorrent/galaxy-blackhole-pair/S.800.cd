@@ -1,0 +1,4 @@
+window 201-799 (599 its), reference OpenFOAM its 501-3372
+Cd 0.42323 +- 8.2 counts (own batch error 8.6) | OpenFOAM 0.42226 +- 3.5 | diff +9.6 counts, same its +15.7 | band 17.8 inside
+Cl 0.07660 +- 7.4 counts (own batch error 6.1) | OpenFOAM 0.07714 +- 3.5 | diff -5.4 counts, same its +0.1 | band 16.3 inside
+GRADE: PASS  Cd +9.6 counts against a band of 17.8 on 201-799; a bias of 29 counts fails 9 times in 10

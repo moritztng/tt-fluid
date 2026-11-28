@@ -93,7 +93,8 @@ than an aggregation V-cycle: it needs about six times as many iterations, but ea
 `--l1 2` keeps two solver vectors in each core's L1 memory and `--lsplit 1` moves a vector out to DRAM for the
 duration of a solver loop that does not use it. With the cache and patch settings the run now chooses itself
 (step 4), that is 1.18 times faster on the device than the line before it (`--l1 1 --gcache 14`), and the state
-after 100 iterations is bit for bit the same.
+after 100 iterations is bit for bit the same. The raw logs of these legs are in
+`results/tenstorrent/galaxy-blackhole-pair/`.
 
 ### 3. Starting state from potentialFoam
 

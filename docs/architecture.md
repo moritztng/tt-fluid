@@ -114,7 +114,9 @@ the device run never holds the whole program in memory and reads only its chips'
 1. `run_mesh case N ... --images DIR` lowers and writes the images, then exits. For HPC_motorbike Small this takes about
    90 GB of RAM.
 2. `lower/of_state.py` turns an OpenFOAM time directory (for example the potentialFoam result) into a starting state.
-3. `run_mesh case N ... --from-images DIR --state-in STATE.npz` runs on the device.
+3. `run_mesh case N ... --from-images DIR --state-in STATE.npz` runs on the device. The launch reads only the bytes
+   the images store: four fifths of a Small image are zero pages, and they never reach host memory. HPC_motorbike
+   Small on two chips takes about 11 GB of host RAM per run.
 
 `lower/prep.py` and `lower/spmd.py` split the lowering into one process per chip for cases too large for one host
 process. That path is experimental in v0.1.0.
