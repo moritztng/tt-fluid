@@ -1,0 +1,1 @@
+/root/s/P_mps_k12_it300_c11 iters=300 wall=1130.9s first_it=84.7s s/iter median=3.4300 mean=3.3883 min=2.2100 max=3.7600

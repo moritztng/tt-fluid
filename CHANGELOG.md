@@ -3,6 +3,30 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `--lsplit 1` at lowering: a vector that holds an L1 slot across a solver loop that does not use it is parked in DRAM
+  for the loop.
+- `--tabdense N` at lowering: gathers that read one L1 vector use a dense 16-bit index table (6.4 cycles a value on
+  Blackhole against 12.1). `--span 1|2`: a gather from a DRAM-homed vector reads an L1 copy of it through those tables.
+  Both keep the state bit-identical and are off by default; `--tscheck` decodes every dense table back to its map
+  (`tests/test_dense_span.py`). `ttfluid.tools.gbench`, `spancensus` and `regcensus` measure the gather loop forms and
+  count what the tables reach.
+- Images record the residue counts `--bpatch` needs, so a run from images chooses it by itself, as it already sized
+  the gather cache.
+- Packed GPU baseline: `bench/nvidia/pack_plan.sh` runs several SPUMA cases at once on one GPU under MPS. The measured
+  H100 cells (1, 2, 4 and 8 cases per GPU) and their raw data are in `results/nvidia/h100-packed/`, and
+  `bench/per_dollar.py` prices them.
+
+### Changed
+- HPC_motorbike Small on two Blackhole chips: 800 iterations take about 1030 s of device time with `--l1 2 --lsplit 1`
+  and the automatic cache and patch settings, 1.18 times faster on the device than `--l1 1 --gcache 14`, with a
+  bit-identical state after 100 iterations. The tutorial's Part 2 carries the new lowering and run lines.
+- Image upload and the state transfer read only the bytes an image stores. Host time around a Small run fell from
+  65 s to 18 s and its peak host memory from 29 GB to 11 GB.
+- Lowering HPC_motorbike Small needs about 90 GB of host RAM (the docs said 220 GB).
+
 ## [0.1.0] - 2026-10-19
 
 First public release.
