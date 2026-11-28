@@ -216,7 +216,8 @@ def build(solver, max_outer=2000, amg_owner=None, amg_kind="pairwise", amg_smoot
             for sp_ in ([L.space] + L.apc + L.acc + L.gspaces + [c[0] for c in L.mchunks] if L.gspaces else [L.space, L.apspace, L.acspace]):
                 pspace[sp_.name] = sp_
     elif amg_owner is not None:
-        assert amg_chip_cores is None, "chip-local multigrid: --amg-kind sa only"
+        # on one chip the chip-local hierarchy is the global one; across chips the coarse levels are not cut yet
+        assert amg_chip_cores is None or int(np.max(amg_owner)) < amg_chip_cores, "multigrid cut at the chip boundary: --amg-kind sa only"
         from . import amg
         tops.amg_levels = amg.attach(tr, amg_setup(ops, np.asarray(amg_owner), kind=amg_kind,
                                                    shape=amg_vshape if amg_kind == "matched" else None), cells)
