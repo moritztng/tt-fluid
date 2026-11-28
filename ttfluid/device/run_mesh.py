@@ -95,7 +95,8 @@ ap.add_argument("--dedup", type=int, default=0, help="as run_vm.py: a fused run 
 ap.add_argument("--span", type=int, default=0, help="1 with --l1 N: a split gather whose window and whole residue read one "
                 "DRAM-homed vector reads an L1 copy of it (one reserved L1 slot of T tiles, filled by a copy block when the vector "
                 "changes), which --tabdense then serves like any L1 vector (Machine(span=1)); 2: a served gather with an L1 destination is "
-                "one reader page too, not a block and a gather op; values unchanged")
+                "one reader page too, not a block and a gather op; 3: the span shares colour 0 with the Krylov loops (no extra L1 slot; "
+                "copies inserted only outside innermost loops and coloured first); values unchanged")
 ap.add_argument("--tabdense", type=int, default=0, help="N > 0 with --tabstream: a reader-patched map with at least N local residue entries "
                 "per tile on a core is streamed as a dense destination-ordered uint16 index table (512 words a tile) and the reader "
                 "gathers the page in one pass with no window read (CFD_DENSE; encode.py tab_dense). The same page values. "
@@ -121,7 +122,12 @@ ap.add_argument("--pshare", default="", help="N,B,U,M,P (five non-negative ints 
                 "STREAM tiles (CFD_PSHARE). Empty: same as --dshare when --dshare is set, else --bpatch/--tpat. Bit-exact")
 ap.add_argument("--amg", action="store_true", help="p PCG preconditioned by smoothed aggregation (ttfluid.resident.sa), aggregates on the K x 72 global cores; "
                 "the coarse levels are chip-local (sa.setup chip_cores): only the fine level exchanges between chips")
-ap.add_argument("--amg-kind", default="sa", choices=["sa"])
+ap.add_argument("--amg-kind", default="sa", choices=["sa", "matched"])
+ap.add_argument("--amg-shape", default="fine=add,k=1,a=4,coarse=sym,ck=1,ca=4,kc=8,ac=30",
+                help="--amg-kind matched: the cycle amg.Ops runs (agg=3|4 matching passes; fine/coarse/l1 add|post|sym, "
+                     "Chebyshev steps k/ck on [2/a, 2] and [2/ca, 2], kc steps on [2/ac, 2] on the last level; w/wf weights "
+                     "coarse/fine prolongation, g=2,gf=2 W-cycle, ktype=amli,kf=1,r1=1.15,r2=2.4 SPD polynomial W-cycle, "
+                     "outer=fcg1 Notay FCG(1) for nonsymmetric cycles)")
 ap.add_argument("--amg-stack", action="store_true", help="as run_vm.py: stacked coarse SpMV")
 ap.add_argument("--amg-vec", action="store_true", help="as run_vm.py: coarse values are vector registers (--l1 auto may home them in DRAM)")
 ap.add_argument("--sliced", action="store_true", help="sorted rcb lanes; report what sliced ELL slots would save (machine.slot_extents)")
@@ -164,7 +170,7 @@ ap.add_argument("--gsmin", type=float, default=0.0, help="F > 0: a gather map is
                 "0: the split from 24 covered values a core. Needs a lowering. Same values: bit-exact")
 ap.add_argument("--hpack", type=int, default=0, help="1 (with --sliced): a core's cells that other cores read sort behind its interior cells inside each face-count class, grouped by receiver set, "
                 "so a halo send list is a few long runs (Machine(hpack=True)). Changes the lane order, so reductions sum in another order: not bitwise against 0")
-ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3, 4 need --tabstream (mesh has no trid). Default 0 keeps the built images unchanged")
+ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3..5 need --tabstream (mesh has no trid); 5 applies inside Krylov loops only (plus non-split 1-part gathers), leaving outer-body gathers open for --span 3. Default 0 keeps the built images unchanged")
 ap.add_argument("--os", type=int, default=0, help="1: BRISC built for size (#pragma GCC optimize Os), 2: NCRISC too, for a program over the kernel config buffer")
 ap.add_argument("--prof", action="store_true", help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores")
 ap.add_argument("--plan", action="store_true", help="CPU only: lower, place the chips, print the plan")
@@ -244,6 +250,10 @@ ttfluid.resident.krylov.JOINT = bool(a.jointred)
 VSHAPE = None                     # sa.Ops cycle shape; None = today's 3/3/8 V (the default build is unchanged)
 if (a.vpre, a.vpost, a.vcoarse, a.vgamma) != (3, 3, 8, ""):
     VSHAPE = dict(pre=a.vpre, post=a.vpost, coarse_deg=a.vcoarse, gamma={int(v): 2 for v in a.vgamma.split(",") if v})
+if a.amg_kind == "matched":
+    VSHAPE = {k: v if k in ("fine", "coarse", "l1", "ktype", "outer") else
+              float(v) if k in ("a", "ca", "ac", "a1", "w", "wf", "r1", "r2") else int(v)
+              for k, v in (kv.split("=") for kv in a.amg_shape.split(","))}
 import ttfluid.resident.trace  # noqa: E402
 ttfluid.resident.trace.FIELD_MAJOR = bool(a.hlate)
 ttfluid.resident.krylov.CG1 = bool(a.cg1)
@@ -260,7 +270,7 @@ if a.phase:
 if a.tsort:   # images and --save files from before the flag have unsorted tables, so 0 stays out of LOWER
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
-LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
+LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_shape", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
                                          "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit", "span", "hpack", "gsmin") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
@@ -367,7 +377,7 @@ else:
         import ttfluid.resident.machine
         if a.cache:   # the stage's key: every flag, file, environment variable and source file the trace reads (lower/cache.py)
             from ttfluid.lower import cache as lcache
-            TRACE_FLAGS = ("what", "n", "layout", "mesh", "strips", "arch", "cores", "phase", "amg", "amg_kind", "amg_smoothed", "amg_stack", "amg_lag", "amg_lag_warm",
+            TRACE_FLAGS = ("what", "n", "layout", "mesh", "strips", "arch", "cores", "phase", "amg", "amg_kind", "amg_shape", "amg_smoothed", "amg_stack", "amg_lag", "amg_lag_warm",
                            "amg_global", "amg_depth", "amg_min_core", "vpre", "vpost", "vcoarse", "vgamma", "jointred", "cg1", "bjoint", "hlate")
             with ST("cache key"):
                 key = dict({k: getattr(a, k) for k in TRACE_FLAGS}, case=lcache.tree_digest(a.case),
@@ -1253,7 +1263,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         h[:, w] += h[:, w + 400] << 32
     root = [k * P for k in range(K)]
     gws = sorted(gtab)
-    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, tpat=a.tpat, dshare=a.dshare, pshare=a.pshare, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
+    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, tpat=a.tpat, dshare=a.dshare, pshare=a.pshare, gtile=a.gtile, amg=a.amg, amg_kind=a.amg_kind, amg_shape=a.amg_shape, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
                plan=info, sizes=E.sizes(), l1=l1, rows=nrow, walls=walls, ticks=ticks,
                ms_device=[max(t) / amax / 1e3 for t in ticks], aiclk=clks,
                same_history_all_chips=bool(all(np.array_equal(hist_all[0, :nrow], hist_all[k, :nrow]) for k in range(K))),

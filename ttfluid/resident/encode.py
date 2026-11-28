@@ -261,10 +261,13 @@ class Encoded:
                     assert len(u[5]) <= 8      # the reader keeps 8 part cursors (vm_ncrisc.cpp)
                     ss = 14 if WIDE else 16     # WIDE: 18-bit shift, 10-bit map (vm_ncrisc SS, SM)
                     mid = u[4]
-                    if (tab_dense and mid is not None and u[2] is not None and phys[u[2]] < DBASE
-                            and [x for x, _ in u[5]] == [u[2]]):
-                        # window and residue from one L1 vector: this page reads the map's dense twin
-                        mid = twin.setdefault((mid, u[3]), len(m.maps.tab) + len(twin))
+                    if tab_dense and mid is not None:
+                        if u[2] is not None and phys[u[2]] < DBASE and [x for x, _ in u[5]] == [u[2]]:
+                            # window and residue from one L1 vector: this page reads the map's dense twin
+                            mid = twin.setdefault((mid, u[3]), len(m.maps.tab) + len(twin))
+                        elif u[2] is None and (mid not in m.base or m.base[mid] is None) and len(u[5]) == 1 and phys[u[5][0][0]] < DBASE:
+                            # non-split (or zero-fill base) 1-part L1 gather to a DRAM destination
+                            mid = twin.setdefault((mid, "zero" if mid in m.base else None), len(m.maps.tab) + len(twin))
                     if u[4] is not None:
                         xs = [y for y, _ in u[5]]
                         self.gops.append(("page %d-part %s, window %s" % (len(xs), gsrc(xs), "none" if u[2] is None else
@@ -400,10 +403,15 @@ class Encoded:
                 split = (len(ins[3]) == 1 and not (len(ins) > 4 and ins[4]) and xb[0] == "blk"
                          and [r for _, r in xb[2]] == [ins[1]] and xb[1][-1][0] == "lds"
                          and xb[1][-1][2] == ins[3][0][0] and all(u[2] == "__anchor__" for u in xb[1][:-1]))
-                if tab_dense and split and phys[ins[3][0][0]] < DBASE:
-                    # from one L1 vector both halves are one dense table: the op reads the twin and writes every
-                    # lane of its tiles (the block's copy stays, overwritten)
-                    mid = twin.setdefault((mid, xb[1][-1][3]), len(m.maps.tab) + len(twin))
+                if tab_dense and len(ins[3]) == 1 and not (len(ins) > 4 and ins[4]) and phys[ins[3][0][0]] < DBASE:
+                    if split:
+                        # from one L1 vector both halves are one dense table: the op reads the twin and writes every
+                        # lane of its tiles (the block's copy stays, overwritten)
+                        mid = twin.setdefault((mid, xb[1][-1][3]), len(m.maps.tab) + len(twin))
+                    elif mid not in m.base or m.base[mid] is None:
+                        # non-split (or zero-fill base) 1-part L1 gather (multigrid coarse SpMV, restrict, prolong):
+                        # dense twin with default index 0; halo and zero sections overwrite non-local lanes after gather16
+                        mid = twin.setdefault((mid, "zero" if mid in m.base else None), len(m.maps.tab) + len(twin))
                 xs = [y for y, _ in ins[3]]
                 self.gops.append(("gather %d-part %s%s%s" % (len(xs), gsrc(xs), ", split" if split else "",
                                   ", mode %d" % ins[4] if len(ins) > 4 and ins[4] else ""), ins[2], mid if mid != ins[2] else None, len(xs), cur_ph[0]))

@@ -41,3 +41,43 @@ def test_a_broken_dense_table_fails_the_check():
     r = run("--mesh", "1,1", *DENSE, "--tabdense-break", "8")
     assert r.returncode != 0
     assert "dense index differs" in r.stderr
+
+
+def test_amg_nonsplit_dense_tables_and_broken_arm():
+    amg = "--amg --amg-kind matched --amg-stack".split()
+    ref = last_row(run("--mesh", "1,1", *amg))
+    r = run("--mesh", "1,1", *amg, *DENSE, "--emu-check")
+    assert last_row(r) == ref
+    assert "tabstream check: streamed walk == cursor walk" in r.stdout
+    # confirm non-split and zero-fill 1-part L1 gathers in p_solve went through dense tables
+    m = re.search(r"gcensus p_solve\s+gather 1-part l1\s+ops\s+\d+\s+local entries a core\s+(\d+)\s+through a dense table\s+(\d+)", r.stdout)
+    assert m and int(m.group(2)) > 0, r.stdout[-2000:]
+    # confirm --span 2 also serves multi-gather DRAM sources in AMG (l1=0 forces DRAM fine vectors)
+    r0 = run("--mesh", "1,1", "--l1", "0", *amg, *DENSE, "--emu-check")
+    assert last_row(r0) == ref
+    assert "tabstream check: streamed walk == cursor walk" in r0.stdout
+    bad = run("--mesh", "1,1", *amg, *DENSE, "--tabdense-break", "8")
+    assert bad.returncode != 0
+    assert "dense index differs" in bad.stderr
+
+
+@pytest.mark.parametrize("mesh", ["1,1", "1,2"])
+def test_amg_span3_pseg5_and_broken_arm(mesh):
+    amg = "--l1 2 --lsplit 2 --cse 2 --amg --amg-kind matched --amg-stack".split()
+    ref = last_row(run("--mesh", mesh, *amg))
+    extra = "--span 3 --pseg 5 --bpatch 6 --tpat 3 --tabdense 1 --tscheck --devsim --emu-check".split()
+    r = run("--mesh", mesh, *amg, *extra)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    got = [ln for ln in r.stdout.splitlines() if ln.startswith("red2 ")]
+    assert got and got[-1] == ref
+    assert "tabstream check: streamed walk == cursor walk" in r.stdout
+    assert "devsim ok" in r.stdout
+    sp = re.search(r"span 3: (\d+) gathers read colour 0", r.stdout)
+    assert sp and int(sp.group(1)) > 0, r.stdout[-2000:]
+    up = re.search(r"gcensus U_solve\s+page 1-part l1, window same l1\s+ops\s+\d+\s+local entries a core\s+\d+\s+through a dense table\s+(\d+)", r.stdout)
+    assert up and int(up.group(1)) > 0, r.stdout[-2000:]
+    if mesh == "1,1":
+        bad = run("--mesh", mesh, *amg, *extra, "--tabdense-break", "8")
+        assert bad.returncode != 0
+        assert "dense index differs" in bad.stderr
+

@@ -98,11 +98,15 @@ DENSE = 1 << 31   # header word 1 of a map (the halo mask): its local section is
 
 def dense_index(ent, tm, shift):
     """The source word index of every lane of tiles [0, tm): the local residue entry's source where the lane has
-    one, lane + shift elsewhere (what the window read; its own lane where that falls outside the 16-bit span of the
-    source: a lane no consumer reads, memu._shifted)."""
-    lane = np.arange(tm * 1024, dtype=np.int64)
-    idx = lane + shift
-    idx = np.where((idx >= 0) & (idx < 1 << 16), idx, lane)
+    one, lane + shift elsewhere when shift is an int (what the window read; its own lane where that falls outside the
+    16-bit span of the source: a lane no consumer reads, memu._shifted), or 0 when shift is None or "zero" (a non-split
+    or zero-fill 1-part gather: every non-local lane is in the halo or zero section and is overwritten after gather16)."""
+    if shift is None or shift == "zero":
+        idx = np.zeros(tm * 1024, dtype=np.int64)
+    else:
+        lane = np.arange(tm * 1024, dtype=np.int64)
+        idx = lane + shift
+        idx = np.where((idx >= 0) & (idx < 1 << 16), idx, lane)
     e = np.asarray(ent, np.int64)
     idx[e >> 16] = e & 0xFFFF
     return idx
@@ -146,7 +150,25 @@ def stream(E, sort=False, dense=None, brk=0):
             per_tile = np.zeros(tm, np.int64)
             loc_tile = np.zeros(tm, np.int64)
             dn = mid >= nm and len(secs[0][1]) >= dmin * tm
-            for si, (kind, ent) in enumerate(secs):
+            secs_eff = secs
+            if dn:
+                if dsh == "zero":
+                    # _split_gathers dropped the map's zero list (relying on the preceding fill(0) block),
+                    # which gather16 overwrites; restore every unwritten lane in [0, tm * 1024) as the zero section
+                    occ = np.zeros(tm * 1024, dtype=bool)
+                    occ[_lane("l", secs[0][1].astype(np.int64))] = True
+                    occ[_lane("h", secs[1][1].astype(np.int64))] = True
+                    secs_eff = [secs[0], secs[1], ("z", np.flatnonzero(~occ).astype(np.uint32))]
+                # guard CB_TS staging (TSB = 4096 + 64 * 32 = 6144 B = 1536 words; 512 dense + max 3 * 32 align words
+                # leaves 928 words for halo + zero per tile; also keep total map blob under 16-bit offset limit)
+                nonloc = np.zeros(tm, np.int64)
+                for kind_, ent_ in secs_eff[1:]:
+                    b_ = np.searchsorted(_lane(kind_, ent_.astype(np.int64)), np.arange(tm + 1) * 1024)
+                    nonloc += np.diff(b_)
+                dn = int(nonloc.max()) <= 920 and (512 * tm + int(nonloc.sum())) < 65000
+                if not dn:
+                    secs_eff = secs
+            for si, (kind, ent) in enumerate(secs_eff):
                 lanes = _lane(kind, ent.astype(np.int64))
                 bounds = np.searchsorted(lanes, np.arange(tm + 1) * 1024)
                 assert bounds[-1] == len(ent)
@@ -294,14 +316,25 @@ def check(E, S, tab=None):
                         assert not ta
                         continue
                     idx = _undense(tb, t, sh)
-                    lane = t * 1024 + np.arange(1024)
-                    want = np.where((lane + sh >= 0) & (lane + sh < 1 << 16), lane + sh, lane)
+                    if sh is None or sh == "zero":
+                        want = np.zeros(1024, dtype=np.int64)
+                    else:
+                        lane = t * 1024 + np.arange(1024)
+                        want = np.where((lane + sh >= 0) & (lane + sh < 1 << 16), lane + sh, lane)
                     for k, x in ta:
                         if k == "l":
                             want[(x >> 16) - t * 1024] = x & 0xFFFF
                     assert (idx == want).all(), f"core {i} map {mid} tile {t}: dense index differs"
-                    assert sorted(e for e in ta if e[0] != "l") == sorted(e for e in tb if e[0] != "d"), \
-                        f"core {i} map {mid}: streamed walk differs"
+                    if sh == "zero":
+                        assert sorted(e for e in ta if e[0] == "h") == sorted(e for e in tb if e[0] == "h"), \
+                            f"core {i} map {mid}: halo walk differs"
+                        occ = {x >> 16 for k, x in ta if k in ("l", "h")}
+                        want_z = [l for l in range(t * 1024, (t + 1) * 1024) if l not in occ]
+                        assert sorted(x for k, x in tb if k == "z") == want_z, \
+                            f"core {i} map {mid} tile {t}: zero complement differs"
+                    else:
+                        assert sorted(e for e in ta if e[0] != "l") == sorted(e for e in tb if e[0] != "d"), \
+                            f"core {i} map {mid}: streamed walk differs"
                 continue
             assert a == b, f"core {i} map {mid}: streamed walk differs"
         h0, h1 = int(E.tab_halo_cursor[i] if hasattr(E, "tab_halo_cursor") else E.tab_halo[i]), S["halo_off"][i]
