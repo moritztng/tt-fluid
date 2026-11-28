@@ -14,6 +14,8 @@ output names and the state layout. Per chip k (cores k*P .. k*P+P-1): arena rows
 residue/halo tables (padded to the global width L0), table blob pages, the halo table offsets, and for every state
 space the global ids of the elements it owns with their (core, lane), so results are collected chip by chip.
 """
+import bisect
+import fcntl
 import functools
 import hashlib
 import json
@@ -530,26 +532,40 @@ class _ChipFiles(dict):
         is slow, so ranges closer than GAP share one vectored read whose zeros between them land in a scratch buffer,
         not in out."""
         buf = memoryview(out).cast("B")
-        off, end, ranges = self.stored(name)
+        off, end, ranges, ends = _stored_indexed(str(dict.__getitem__(self, name)))
         with open(dict.__getitem__(self, name), "rb") as f:
             fd = f.fileno()
             assert end - off == (len(buf) if row is None else len(row) * PAGE), (name, end - off, len(buf))
-            # where the byte at file offset x goes: a stored range is whole pages in a row, so it stays one piece
-            at = (lambda x: x - off) if row is None else (lambda x: int(row[(x - off) // PAGE]) * PAGE + (x - off) % PAGE)
-            held = None if row is None else np.flatnonzero(row >= 0)
-            lo_b, hi_b = (off, end) if held is None else (off + int(held[0]) * PAGE, off + (int(held[-1]) + 1) * PAGE) if len(held) else (off, off)
+            if row is None:
+                p0, row_l = 0, None
+                lo_b, hi_b = off, end
+                i0 = 0
+            else:
+                held = np.flatnonzero(row >= 0)
+                if not len(held):
+                    return
+                p0, p1 = int(held[0]), int(held[-1]) + 1
+                lo_b, hi_b = off + p0 * PAGE, off + p1 * PAGE
+                row_l = row[p0:p1].tolist()
+                i0 = bisect.bisect_right(ends, lo_b)
             reads, last = [], None      # a read: [file offset, bytes, [memoryview, ...]], contiguous in the file
-            for a, p in ranges:
-                a, p = max(a, lo_b), min(p, hi_b)      # the part of the range inside the run of pages out holds
+            for a, p in ranges[i0:]:
+                if a >= hi_b:
+                    break
+                if a < lo_b:
+                    a = lo_b
+                if p > hi_b:
+                    p = hi_b
                 for lo in range(a, p, CHUNK):
-                    hi = min(lo + CHUNK, p)
-                    r = reads[-1] if reads else None
-                    piece = buf[at(lo):at(lo) + hi - lo]
-                    if r is not None and lo - last <= GAP and len(r[2]) + 2 <= IOV and r[1] + hi - last <= CHUNK:
+                    hi = lo + CHUNK if lo + CHUNK < p else p
+                    d = lo - off
+                    pos = d if row_l is None else row_l[(d >> 12) - p0] * PAGE + (d & 4095)
+                    piece = buf[pos:pos + hi - lo]
+                    if reads and lo - last <= GAP and len(reads[-1][2]) + 2 <= IOV and reads[-1][1] + hi - last <= CHUNK:
                         if lo > last:
-                            r[2].append(_SCRATCH[:lo - last])
-                        r[2].append(piece)
-                        r[1] += hi - last
+                            reads[-1][2].append(_SCRATCH[:lo - last])
+                        reads[-1][2].append(piece)
+                        reads[-1][1] += hi - last
                     else:
                         reads.append([lo, hi - lo, [piece]])
                     last = hi
@@ -560,6 +576,49 @@ class _ChipFiles(dict):
             list(_READERS.map(lambda r: read(*r), reads))
 
 
+_FS_IOC_FIEMAP = 0xC020660B
+_FIEMAP_FLAG_SYNC = 0x0001
+_FIEMAP_EXTENT_LAST = 0x0001
+_FIEMAP_MAX = 4096
+
+
+def _fiemap_ranges(fd, off, end):
+    """Stored byte ranges [lo, hi) clipped to [off, end) via FS_IOC_FIEMAP (10s of ioctls vs 40k lseeks on ext4/xfs).
+    Raises OSError on filesystems that do not support FIEMAP (e.g. tmpfs) so the caller falls back to SEEK_DATA."""
+    buf = bytearray(32 + _FIEMAP_MAX * 56)
+    ranges = []
+    pos = off
+    while pos < end:
+        struct.pack_into("<QQIIII", buf, 0, pos, end - pos, _FIEMAP_FLAG_SYNC, 0, _FIEMAP_MAX, 0)
+        fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
+        _, _, _, mapped, _, _ = struct.unpack_from("<QQIIII", buf, 0)
+        if mapped == 0:
+            break
+        last = False
+        for i in range(mapped):
+            logical, _, length, _, _, flags = struct.unpack_from("<QQQQQI", buf, 32 + i * 56)
+            lo = max(logical, off)
+            hi = min(logical + length, end)
+            if hi > lo:
+                if ranges and ranges[-1][1] >= lo:
+                    ranges[-1] = (ranges[-1][0], max(ranges[-1][1], hi))
+                else:
+                    ranges.append((lo, hi))
+            pos = logical + length
+            if flags & _FIEMAP_EXTENT_LAST:
+                last = True
+        if last:
+            break
+    return ranges
+
+
+@functools.lru_cache(None)
+def _stored_indexed(path):
+    """_ChipFiles.stored with precomputed range-end array for O(log N) bisect slicing per staged part."""
+    off, end, ranges = _stored(path)
+    return off, end, ranges, [p for _, p in ranges]
+
+
 @functools.lru_cache(None)
 def _stored(path):
     """_ChipFiles.stored for one file, walked once: a Small k2 constants file has ~30,000 stored ranges."""
@@ -568,14 +627,17 @@ def _stored(path):
         (np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0)(f)
         off, fd = f.tell(), f.fileno()
         end = os.fstat(fd).st_size
-        ranges, p = [], off
-        while p < end:
-            try:
-                a = os.lseek(fd, p, os.SEEK_DATA)
-            except OSError:      # ENXIO: a hole to the end of the file
-                break
-            p = os.lseek(fd, a, os.SEEK_HOLE)
-            ranges.append((a, p))
+        try:
+            ranges = _fiemap_ranges(fd, off, end)
+        except OSError:
+            ranges, p = [], off
+            while p < end:
+                try:
+                    a = os.lseek(fd, p, os.SEEK_DATA)
+                except OSError:      # ENXIO: a hole to the end of the file
+                    break
+                p = os.lseek(fd, a, os.SEEK_HOLE)
+                ranges.append((a, p))
     return off, end, ranges
 
 
