@@ -313,15 +313,82 @@ void kernel_main() {
 #define CW(i) P[CR ? ((i) & (CR * PW - 1)) : (i)]
 #ifdef CFD_ICACHE
     // init cache (run_vm --icache): an op's _init only when the last init of its kind was a different one. Loads key on
-    // the source CB; SFPU inits on the op (exp, div, ... program shared SFPU constants, so any other op re-inits)
+    // fp32 unpack-to-dest state (cb_v and cb_in are identical fp32 32x32 CBs, so switching between them needs no re-init);
+    // SFPU inits key on the op (exp, div, ... program shared SFPU constants, so any other op re-inits)
     uint32_t ci = 0xffffffffu, si = 0xffffffffu;
-#define LDI(cb) do { if (ci != (cb)) { copy_tile_to_dst_init_short(cb); ci = (cb); } } while (0)
+#define LDI(cb) do { if (ci != 1u) { copy_tile_to_dst_init_short(cb_v); ci = 1u; } } while (0)
 #define LDX() (ci = 0xffffffffu)
 #define SFI(k, init) do { if (si != (k)) { init; si = (k); } } while (0)
 #else
 #define LDI(cb) copy_tile_to_dst_init_short(cb)
 #define LDX()
 #define SFI(k, init) init
+#endif
+#if defined(CFD_BLK) && defined(TRISC_MATH)
+    uint32_t last_blk = 0xffffffffu;
+#endif
+#if !defined(CFD_PROFW) && !defined(CFD_TRACE)
+    // Persistent fp32 unpack-to-dest + coalesced multi-load + 4-tile pure-copy TBEG: keep Unpack_if_sel=1, SRCA_SET_Base=0
+    // and fp32 Zstride live across fp32 loads (restored only around C_LDRH), amortize the MATH<->UNPACK handshake over up
+    // to 4 consecutive LD/LDS/LDR ops, and batch pure-copy TBEG loops 4 tiles per DEST section.
+#define CFD_LEAN 1
+    uint32_t u2d = 0;
+    auto u2d_enter = [&]() __attribute__((noinline, noclone)) {
+        copy_tile_to_dst_init_short(cb_v);
+        UNPACK(({
+            TTI_SETC16(SRCA_SET_Base_ADDR32, 0x0);
+            TTI_RDCFG(ckernel::p_gpr_unpack::UNPACK_STRIDE, UNP0_ADDR_CTRL_ZW_REG_1_Zstride_ADDR32);
+            constexpr uint32_t zstr = (FACE_C_DIM * FACE_R_DIM * 4u) << UNP0_ADDR_CTRL_ZW_REG_1_Zstride_SHAMT;
+            TT_SETDMAREG(0, LOWER_HALFWORD(zstr), 0, LO_16(ckernel::p_gpr_unpack::TMP_LO));
+            TTI_WRCFG(ckernel::p_gpr_unpack::TMP_LO, ckernel::p_cfg::WRCFG_32b, UNP0_ADDR_CTRL_ZW_REG_1_Zstride_ADDR32);
+            ckernel::cfg_reg_rmw_tensix<THCON_SEC0_REG2_Unpack_if_sel_cntx0_RMW>(1);
+            ckernel::cfg_reg_rmw_tensix<THCON_SEC0_REG2_Unpack_if_sel_cntx1_RMW>(1);
+        }));
+        u2d = 1;
+    };
+#ifdef CFD_NARROW
+    auto u2d_exit = [&]() __attribute__((noinline, noclone)) {
+        if (!u2d) return;
+        UNPACK(({
+            TTI_STALLWAIT(ckernel::p_stall::STALL_CFG, ckernel::p_stall::UNPACK);
+            TTI_WRCFG(ckernel::p_gpr_unpack::UNPACK_STRIDE, ckernel::p_cfg::WRCFG_32b, UNP0_ADDR_CTRL_ZW_REG_1_Zstride_ADDR32);
+            ckernel::cfg_reg_rmw_tensix<THCON_SEC0_REG2_Unpack_if_sel_cntx0_RMW>(0);
+            ckernel::cfg_reg_rmw_tensix<THCON_SEC0_REG5_Dest_cntx0_address_RMW>(4 * 16);
+            ckernel::cfg_reg_rmw_tensix<THCON_SEC0_REG2_Unpack_if_sel_cntx1_RMW>(0);
+            ckernel::cfg_reg_rmw_tensix<THCON_SEC0_REG5_Dest_cntx1_address_RMW>(4 * 16);
+            TTI_SETC16(SRCA_SET_Base_ADDR32, 0x4);
+        }));
+        u2d = 0;
+    };
+#endif
+#ifdef TRISC_UNPACK
+    auto lean_unpack_one = [&](uint32_t l1_addr, uint32_t dst_byte_addr) __attribute__((noinline, noclone)) {
+        TTI_SETADCZW(0b011, 0, 0, 0, 0, 0b1111);
+        ckernel::unpacker::wait_for_next_context(2);
+        volatile uint32_t tt_reg_ptr* cfg = ckernel::get_cfg_pointer();
+        const uint32_t ctx = unp_cfg_context;
+        cfg[ctx == 0 ? THCON_SEC0_REG3_Base_address_ADDR32 : THCON_SEC0_REG3_Base_cntx1_address_ADDR32] = l1_addr;
+        ckernel::semaphore_post(ckernel::semaphore::UNPACK_SYNC);
+        if (ctx == 0) ckernel::cfg_reg_rmw_tensix<THCON_SEC0_REG5_Dest_cntx0_address_RMW>(dst_byte_addr);
+        else ckernel::cfg_reg_rmw_tensix<THCON_SEC0_REG5_Dest_cntx1_address_RMW>(dst_byte_addr);
+        TTI_STALLWAIT(ckernel::p_stall::STALL_UNPACK, ckernel::p_stall::TRISC_CFG | ckernel::p_stall::CFGEXU);
+        ckernel::ckernel_template::run();
+        ckernel::t6_semaphore_get(ckernel::semaphore::UNPACK_SYNC);
+        ckernel::unpacker::switch_config_context(unp_cfg_context);
+    };
+#endif
+#ifdef TRISC_MATH
+    auto lean_math_load = [&](uint32_t k, uint32_t dm) __attribute__((noinline, noclone)) {
+        ckernel::math::math_unpack_to_dest_math_ready();
+        ckernel::mailbox_write(ckernel::ThreadId::UnpackThreadId, ckernel::get_dest_buffer_base());
+        ckernel::math::math_unpack_to_dest_tile_ready();
+        for (uint32_t j = 0; j < k; ++j) {
+            const uint32_t lt = (dm >> (4 * j)) & 3u;
+            for (uint32_t f = 0; f < 4; ++f)
+                TT_ZEROACC(p_zeroacc::CLR_16, 1, 1, ADDR_MOD_3, ckernel::math::get_dest_index_in_faces(lt, f));
+        }
+    };
+#endif
 #endif
 #ifdef CFD_TRACE
     uint32_t trg_ = 0;
@@ -386,6 +453,80 @@ void kernel_main() {
             case C_ACQ: MACQ(); tile_regs_acquire(); MDRAIN(1); break;
             case C_COMMIT: tile_regs_commit(); tile_regs_wait(); break;
             case C_REL: tile_regs_release(); break;
+#ifdef CFD_LEAN
+            case C_LD:
+            case C_LDS:
+            case C_LDR: {
+                if (!u2d) u2d_enter();
+                uint32_t lw[4];
+                int32_t lu[4];
+                lw[0] = w;
+                if (op == C_LDS) {
+                    lu[0] = static_cast<int32_t>(CW(pc));
+                    ++pc;
+                }
+                uint32_t k = 1;
+                const uint32_t plim = CR ? hi * PW : 0xffffffffu;
+                while (k < 4 && pc < plim) {
+                    const uint32_t nw = CW(pc), nop = nw & 0x7f;
+#ifdef CFD_DMP
+                    // Under CFD_DMP every C_LDR must synchronize USYNC/MWAIT_U/PWAIT_U before UNPACK blocks on cb_in.
+                    if (nop != C_LD && nop != C_LDS) break;
+#else
+                    if (nop != C_LD && nop != C_LDS && nop != C_LDR) break;
+#endif
+                    ++pc;
+                    lw[k] = nw;
+                    if (nop == C_LDS) {
+                        lu[k] = static_cast<int32_t>(CW(pc));
+                        ++pc;
+                    }
+                    ++k;
+                }
+                nops += k - 1;
+#ifdef CFD_PROF
+                for (uint32_t j = 1; j < k; ++j) ++cnt[lw[j] & 0x7f];
+#endif
+                UNPACK(({
+                    uint32_t dbase = 0;
+                    const uint32_t vbase = get_local_cb_interface(cb_v).fifo_rd_ptr - 1;
+                    const uint32_t vpg = get_local_cb_interface(cb_v).fifo_page_size;
+                    for (uint32_t j = 0; j < k; ++j) {
+                        const uint32_t wj = lw[j], opj = wj & 0x7f;
+                        uint32_t addr;
+                        if (opj == C_LDR) {
+                            USTATE(1);
+                            TWAIT(cb_in);
+                            cb_wait_front(cb_in, 1);
+                            USTATE(0);
+                            USYNC();
+                            addr = get_local_cb_interface(cb_in).fifo_rd_ptr + ((wj >> 12) & 0xf) - 1;
+                        } else {
+                            const uint32_t t = (wj >> 16) + ((wj & TILE) ? tl : 0);
+                            addr = vbase + (opj == C_LDS ? static_cast<uint32_t>(lu[j]) : 0u) + t * vpg;
+                        }
+                        if (j == 0) {
+                            dbase = ckernel::mailbox_read(ckernel::ThreadId::MathThreadId);
+                            ckernel::unpacker::wait_for_dest_available();
+                        }
+                        lean_unpack_one(addr, 16u * (4u + dbase + (((wj >> 8) & 0xf) << 6)));
+                        if (opj == C_LDR) cb_pop_front(cb_in, 1);
+                    }
+                    ckernel::t6_semaphore_post<ckernel::p_stall::UNPACK0>(ckernel::semaphore::UNPACK_TO_DEST);
+                }));
+                MATH(({
+                    if (op == C_LDR) MWAIT_U();
+                    uint32_t dm = 0;
+                    for (uint32_t j = 0; j < k; ++j) dm |= (((lw[j] >> 8) & 0xf) << (4 * j));
+                    lean_math_load(k, dm);
+                }));
+                PACK(({
+                    if (op == C_LDR) PWAIT_U();
+                }));
+                break;
+            }
+            case C_ST: pack_tile<true>(a, cb_v, (w >> 16) + to); break;
+#else
             case C_LD: LDI(cb_v); COPY_TILE(cb_v, (w >> 16) + to, a); break;
             case C_LDS: {   // offset load: the unpacker reads the tile from a 16-byte-unit shifted L1 address
                 const int32_t units = static_cast<int32_t>(CW(pc));
@@ -411,6 +552,7 @@ void kernel_main() {
                 UNPACK((get_local_cb_interface(cb_in).fifo_rd_ptr -= b));
                 cb_pop_front(cb_in, 1);
                 break;
+#endif
 #ifdef CFD_NARROW
             case C_LDRH:   // C_LDR of a bf16 page: CB CFD_NARROW (bfloat16) views cb_in's front page, srcA widens it to fp32
                 USTATE(1);
@@ -420,11 +562,17 @@ void kernel_main() {
                 USYNC();
                 MWAIT_U();
                 PWAIT_U();
+#ifdef CFD_LEAN
+                u2d_exit();
+#endif
                 copy_tile_to_dst_init_short_with_dt(cb_in, CFD_NARROW);
                 UNPACK((get_local_cb_interface(CFD_NARROW).fifo_rd_ptr = get_local_cb_interface(cb_in).fifo_rd_ptr + b));
                 COPY_TILE_N(CFD_NARROW, 0, a);
                 copy_tile_to_dst_init_short_with_dt(CFD_NARROW, cb_in);
                 LDX();
+#ifdef CFD_ICACHE
+                si = 0xffffffffu;
+#endif
                 cb_pop_front(cb_in, 1);
                 break;
 #endif
@@ -465,8 +613,10 @@ void kernel_main() {
                 // words, row program; blk_exec.h) in BLK_TAB, the table of this lowering's distinct programs that
                 // run_mesh --blktab compiles into the MATH kernel (blk_tab.h, included ahead of this file)
                 MATH(({
-                    SFI(C_BLK, blk_init());
-                    blk_run(&BLK_TAB[w >> 16]);
+                    const uint32_t bi = w >> 16;
+                    SFI(C_BLK, (blk_init(), last_blk = 0xffffffffu));
+                    blk_run(&BLK_TAB[bi], bi != last_blk);
+                    last_blk = bi;
                 }));
                 break;
 #else
@@ -474,15 +624,111 @@ void kernel_main() {
                 // program; blk_exec.h). MATH pushes them, UNPACK and PACK step over them. An op never straddles a page
                 const uint32_t n = w >> 16;
                 MATH(({
-                    SFI(C_BLK, blk_init());
-                    blk_run(const_cast<const uint32_t*>(&P[CR ? (pc & (CR * PW - 1)) : pc]));
+                    SFI(C_BLK, (blk_init(), last_blk = 0xffffffffu));
+                    blk_run(const_cast<const uint32_t*>(&P[CR ? (pc & (CR * PW - 1)) : pc]), pc != last_blk);
+                    last_blk = pc;
                 }));
                 pc += n;
                 break;
             }
 #endif
 #endif
-            case C_TBEG: tn = w >> 16; tl = 0; tpc = pc; break;
+            case C_TBEG: {
+                tn = w >> 16;
+                tl = 0;
+                tpc = pc;
+#ifdef CFD_LEAN
+                const uint32_t plim = CR ? hi * PW : 0xffffffffu;
+                if (tn > 1 && pc + 6 <= plim && (CW(pc) & 0x7f) == C_ACQ) {
+                    const uint32_t w1 = CW(pc + 1), op1 = w1 & 0x7f;
+                    const uint32_t q2 = pc + (op1 == C_LDS ? 3u : 2u);
+                    if ((op1 == C_LD || op1 == C_LDS || op1 == C_LDR) && q2 + 4 <= plim &&
+                        (CW(q2) & 0x7f) == C_COMMIT && (CW(q2 + 2) & 0x7f) == C_REL && (CW(q2 + 3) & 0x7f) == C_TEND) {
+                        const uint32_t w3 = CW(q2 + 1), op3 = w3 & 0x7f;
+                        if ((op3 == C_ST || op3 == C_STW) && ((w1 >> 8) & 0xf) == ((w3 >> 8) & 0xf)) {
+                            const int32_t u1 = op1 == C_LDS ? static_cast<int32_t>(CW(pc + 2)) : 0;
+                            bool ok = (op3 == C_STW);
+                            if (!ok && (w3 & TILE)) {
+                                if (op1 == C_LDR) {
+                                    ok = true;
+                                } else {
+                                    const int32_t s_lo = static_cast<int32_t>(w1 >> 16) * 256 + u1;
+                                    const int32_t s_hi = s_lo + static_cast<int32_t>((w1 & TILE) ? tn : 1u) * 256;
+                                    const int32_t d_lo = static_cast<int32_t>(w3 >> 16) * 256;
+                                    const int32_t d_hi = d_lo + static_cast<int32_t>(tn) * 256;
+                                    ok = (s_hi <= d_lo || d_hi <= s_lo);
+                                }
+                            }
+#ifdef CFD_DMP
+                            if (op1 == C_LDR) ok = false;   // every C_LDR needs per-page USYNC/MWAIT_U/PWAIT_U
+#endif
+                            if (ok) {
+                                if (!u2d) u2d_enter();
+                                const uint32_t d_base = w3 >> 16, s_base = w1 >> 16, b1 = (w1 >> 12) & 0xf;
+                                const uint32_t s_step = (w1 & TILE) ? 1u : 0u;
+                                for (uint32_t t = 0; t < tn;) {
+                                    const uint32_t k = (tn - t >= 4u) ? 4u : (tn - t);
+                                    tile_regs_acquire();
+                                    UNPACK(({
+                                        uint32_t dbase = 0;
+                                        const uint32_t vbase = get_local_cb_interface(cb_v).fifo_rd_ptr - 1;
+                                        const uint32_t vpg = get_local_cb_interface(cb_v).fifo_page_size;
+                                        for (uint32_t j = 0; j < k; ++j) {
+                                            uint32_t addr;
+                                            if (op1 == C_LDR) {
+                                                USTATE(1);
+                                                TWAIT(cb_in);
+                                                cb_wait_front(cb_in, 1);
+                                                USTATE(0);
+                                                addr = get_local_cb_interface(cb_in).fifo_rd_ptr + b1 - 1;
+                                            } else {
+                                                addr = vbase + static_cast<uint32_t>(u1) + (s_base + (t + j) * s_step) * vpg;
+                                            }
+                                            if (j == 0) {
+                                                dbase = ckernel::mailbox_read(ckernel::ThreadId::MathThreadId);
+                                                ckernel::unpacker::wait_for_dest_available();
+                                            }
+                                            lean_unpack_one(addr, 16u * (4u + dbase + (j << 6)));
+                                            if (op1 == C_LDR) cb_pop_front(cb_in, 1);
+                                        }
+                                        ckernel::t6_semaphore_post<ckernel::p_stall::UNPACK0>(ckernel::semaphore::UNPACK_TO_DEST);
+                                    }));
+                                    MATH((lean_math_load(k, 0x3210u)));
+                                    tile_regs_commit();
+                                    tile_regs_wait();
+                                    if (op3 == C_ST) {
+                                        for (uint32_t j = 0; j < k; ++j) pack_tile<true>(j, cb_v, d_base + t + j);
+                                    } else {
+                                        for (uint32_t j = 0; j < k; ++j) {
+                                            PSTATE(1);
+                                            PWAIT(cb_out);
+                                            cb_reserve_back(cb_out, 1);
+                                            PSTATE(0);
+                                            pack_tile(j, cb_out);
+                                            cb_push_back(cb_out, 1);
+                                        }
+                                    }
+                                    tile_regs_release();
+                                    t += k;
+                                }
+                                pc = q2 + 4u;
+                                tl = tn;
+                                nops += 6u * tn;
+#ifdef CFD_PROF
+                                cnt[C_ACQ] += tn;
+                                cnt[op1] += tn;
+                                cnt[C_COMMIT] += tn;
+                                cnt[op3] += tn;
+                                cnt[C_REL] += tn;
+                                cnt[C_TEND] += tn;
+#endif
+                            }
+                        }
+                    }
+                }
+#endif
+                break;
+            }
             case C_TEND: if (++tl < tn) pc = tpc; break;
             case C_FILL: SFI(C_FILL, fill_tile_init()); fill_tile_bitcast(a, CW(pc)); ++pc; break;
             case C_RVF: {
