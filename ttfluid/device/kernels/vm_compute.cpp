@@ -118,12 +118,12 @@ void kernel_main() {
     // its Tensix pipeline before a load or an acquire (its own queued work), issues it, and drains again: the post of
     // that drain lands when the unpacker (the packer) has let the instruction through, and each poll's cycles go to the
     // state published at that poll: loads to hdr 700 + 2 (16 unpack state + reader class), acquires to 960 + 2 pack
-    // state, own work to 976, the after-drains to 978 (load) and 992 (acquire), the last poll of each drain kind to
-    // 980 + 2 kind, of the load's poll to 986, of the acquire's to 994 (two words each: low, high); counts at 988..990
+    // state, own work to 976, the after-drains to 978 (load) and 952 (acquire), the last poll of each drain kind to
+    // 980 + 2 kind, of the load's poll to 986, of the acquire's to 954 (two words each: low, high); counts at 988..990. Nothing from 992 on: BRISC stages its history row there (16 words)
 #define USTATE(s) UNPACK((hw[300] = (s)))
 #define PSTATE(s) PACK((hw[301] = (s)))
 #ifdef TRISC_MATH
-    for (uint32_t i = 700; i < 1000; ++i) hw[i] = 0;
+    for (uint32_t i = 700; i < 992; ++i) hw[i] = 0;
     auto wadd = [&](uint32_t i, uint32_t dt) __attribute__((noinline)) {   // out of line, as the three below: one copy each, the kernel config buffer is 69 KB
         const uint32_t lo = hw[i], nl = lo + dt;
         hw[i] = nl;
@@ -146,13 +146,13 @@ void kernel_main() {
         }
     };
     // kind 0: after a load (cross-check of mload's poll, to 978: only the get and the four clears are left), 1: after an
-    // acquire (cross-check of macq's poll, to 992: nothing is left), 2: own work (976)
+    // acquire (cross-check of macq's poll, to 952: nothing is left), 2: own work (976)
     auto mdrain = [&](uint32_t kind) __attribute__((noinline)) {
         uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
         ckernel::t6_semaphore_wait_on_max<ckernel::p_stall::STALL_SYNC>(ckernel::semaphore::MATH_DONE);
         ckernel::t6_semaphore_post<ckernel::p_stall::MATH | ckernel::p_stall::WAIT_SFPU>(ckernel::semaphore::MATH_DONE);
         while (ckernel::semaphore_read(ckernel::semaphore::MATH_DONE) == 0) {
-            const uint32_t i = kind == 0 ? 978 : kind == 1 ? 992 : 976;
+            const uint32_t i = kind == 0 ? 978 : kind == 1 ? 952 : 976;
             const uint32_t t = static_cast<uint32_t>(ckernel::read_wall_clock());
             wadd(i, t - tp);
             tp = t;
@@ -184,7 +184,7 @@ void kernel_main() {
     };
     // an acquire's wait for the packer, polled on the RISC-V before the acquire is issued: MATH_PACK counts the dest
     // sections committed and not yet released, the acquire stalls while it is at its maximum (2 with SyncHalf, 1 with
-    // SyncFull). Each poll's cycles go to 960 + 2 pack state, the last poll to 994
+    // SyncFull). Each poll's cycles go to 960 + 2 pack state, the last poll to 954
     auto macq = [&]() __attribute__((noinline)) {
         constexpr uint32_t mpmax = (DST_SYNC_MODE == DstSync::SyncFull) ? 1 : 2;
         mdrain(2);
@@ -195,7 +195,7 @@ void kernel_main() {
             wadd(i, t - tp);
             tp = t;
         }
-        wadd(994, static_cast<uint32_t>(ckernel::read_wall_clock()) - tp);
+        wadd(954, static_cast<uint32_t>(ckernel::read_wall_clock()) - tp);
     };
 #define MDRAIN(k) MATH((mdrain(k)))
 #define MACQ() MATH((macq()))
