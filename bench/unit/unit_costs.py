@@ -14,6 +14,7 @@ import numpy as np
 ap = argparse.ArgumentParser()
 ap.add_argument("--ns", type=int, default=65536, help="sections per cell (4 units each for most cells)")
 ap.add_argument("--mask", type=lambda x: int(x, 0), default=0x8FFFFFFF, help="cells to run, bit 31 = the checks")
+ap.add_argument("--mask2", type=lambda x: int(x, 0), default=0x3F, help="cells 32 and up (bit 0 = cell 32)")
 ap.add_argument("--reps", type=int, default=3)
 ap.add_argument("--sysfs-node", type=int, default=None, help="sysfs node of the chip (default: TT_VISIBLE_DEVICES)")
 ap.add_argument("--break-arm", type=int, default=0, help="1: the lean-load check loads one tile where it claims four; 2: the fused blocks store the wrong register. The checks must then fail")
@@ -24,13 +25,23 @@ import torch  # noqa: E402
 import ttnn  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-NV, CB_V, CB_HDR, CB_DONE, CB_H = 26, 0, 1, 2, 3
+import zlib  # noqa: E402
+BLKH = HERE / "blk_exec.h" if (HERE / "blk_exec.h").exists() else HERE.parents[1] / "ttfluid/device/kernels/blk_exec.h"
+BLKREV = zlib.crc32(BLKH.read_bytes())   # the JIT cache keys on the kernel source and its defines, not on an included header
+NV, CB_V, CB_HDR, CB_DONE, CB_H = 32, 0, 1, 2, 3
 CELLS = {0: "empty section", 1: "stock load (init once)", 2: "stock load (init each)", 3: "stock pack to L1",
          4: "stock add", 5: "stock mul", 6: "stock addcmul", 7: "stock where", 8: "stock bf16 load (reconfig)", 9: "lean load x1", 10: "lean load x2",
          11: "lean load x4", 12: "fused block, issued", 13: "fused block, sfpi", 14: "fused block, MOP",
          15: "add block, MOP", 16: "scheduled block, NOPs", 17: "scheduled block, no NOPs",
          18: "pipelined add in place (load macro)", 19: "pipelined mul + add chain (load macro)", 20: "stock div",
-         21: "stock max", 22: "stock min", 23: "stock neg", 24: "stock abs", 25: "stock gtz", 26: "stock fill", 27: "stock copy dest"}
+         21: "stock max", 22: "stock min", 23: "stock neg", 24: "stock abs", 25: "stock gtz", 26: "stock fill", 27: "stock copy dest",
+         32: "blk_run add, config + record", 33: "blk_run add, loaded", 34: "blk_run chain, config + record",
+         35: "blk_run chain, loaded", 36: "blk_run plain mul + add, record", 37: "blk_run plain mul + add, loaded"}
+on = lambda i: (a.mask >> i if i < 32 else a.mask2 >> (i - 32)) & 1
+# the generic executor's programs (ub_compute.cpp BT_*): words pushed per tile for config + record (cfg, the replay
+# load, the row), SFPU rows of 32 lanes per tile, and the hand-written cell each one repeats
+BLK = {"add": dict(full=32, loaded=33, words=5 + 1 + 4, hand=18), "chain": dict(full=34, loaded=35, words=9 + 1 + 3, hand=19),
+       "plain mul + add": dict(full=36, loaded=37, words=0 + 1 + 7, hand=None)}
 node = a.sysfs_node if a.sysfs_node is not None else int(os.environ["TT_VISIBLE_DEVICES"].split(",")[0])
 CLK = f"/sys/class/tenstorrent/tenstorrent!{node}/tt_aiclk"
 
@@ -103,9 +114,8 @@ def program(t_in, t_out):
     cc.unpack_to_dest_mode = um
     comp = ttnn.KernelDescriptor(kernel_source=str(HERE / "ub_compute.cpp"), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                                  core_ranges=grid, compile_time_args=[CB_V, CB_HDR, CB_DONE, NV, CB_H], config=cc)
-    comp.common_runtime_args = [a.mask & 0xFFFFFFFF, a.ns]
-    if a.break_arm:
-        comp.defines = [("UB_BREAK", str(a.break_arm))]
+    comp.common_runtime_args = [a.mask & 0xFFFFFFFF, a.ns, a.mask2 & 0xFFFFFFFF]
+    comp.defines = [("UB_BLKREV", str(BLKREV))] + ([("UB_BREAK", str(a.break_arm))] if a.break_arm else [])
     prog.kernels = [dm, comp]
     mpd = ttnn.MeshProgramDescriptor()
     mc = ttnn.MeshCoordinate(0, 0)
@@ -125,7 +135,7 @@ for r in range(a.reps + 1):   # the first run carries the JIT build and is dropp
     o = ttnn.to_torch(t_out).numpy().view(np.uint32).reshape(-1)
     hdr, arena = o[:1024], o[1024:].view(np.float32).reshape(NV, 1024)
     assert all((hdr[i] >> 16) == 0xC0DE for i in range(3)), "kernel did not reach its end: %s" % [hex(x) for x in hdr[:3]]
-    cyc = {i: [int(x) for x in hdr[32 + 4 * i:36 + 4 * i]] for i in CELLS if a.mask >> i & 1}
+    cyc = {i: [int(x) for x in hdr[32 + 4 * i:36 + 4 * i]] for i in CELLS if on(i)}
     runs.append(dict(wall=wall, t0=t0, t1=t0 + wall, aiclk_min=min(clk.vals, default=None), aiclk_max=max(clk.vals, default=None),
                      aiclk_n=len(clk.vals), cyc=cyc))
     ttnn.deallocate(t_out)
@@ -158,12 +168,16 @@ if a.mask >> 31 & 1:
         checks["pipelined mul + add"] = dict(eq_stock=int((arena[25].view(np.uint32) == arena[24].view(np.uint32)).sum()),
                                              eq_s2=int((arena[25].view(np.uint32) == t[2].view(np.uint32)).sum()),
                                              stock_eq_numpy=int((arena[24].view(np.uint32) == two.view(np.uint32)).sum()), lanes=1024)
+    if NV > 31:   # the generic executor against the stock results: with config + record, and with the program loaded
+        for i, name, ref in ((26, "blk_run add", 22), (27, "blk_run add, loaded", 22), (28, "blk_run chain", 24),
+                             (29, "blk_run chain, loaded", 24), (30, "blk_run plain", 24), (31, "blk_run plain, loaded", 24)):
+            checks[name] = dict(eq_stock=int((arena[i].view(np.uint32) == arena[ref].view(np.uint32)).sum()), lanes=1024)
 keep = runs[1:]
 med = lambda xs: float(np.median(xs))
 rows = {}
 base = med([max(r["cyc"][0][:3]) / r["cyc"][0][3] for r in keep]) if a.mask & 1 else 0.0
 for i, name in CELLS.items():
-    if not a.mask >> i & 1:
+    if not on(i):
         continue
     per = [max(r["cyc"][i][:3]) / r["cyc"][i][3] for r in keep]            # slowest thread, per unit
     sec = [max(r["cyc"][i][:3]) / a.ns for r in keep]                       # per section
@@ -174,11 +188,20 @@ lo = min(r["aiclk_min"] for r in keep if r["aiclk_min"]) if any(r["aiclk_min"] f
 print("\ncell                         units  cyc/unit  net of empty section  [unpack math pack cycles]")
 for name, v in rows.items():
     print("%-28s %5d  %8.1f  %8.1f  %s" % (name, v["units"], v["per_unit"], v["per_unit_net"], v["threads"]))
+blk = {}
+for name, b in BLK.items():   # the executor's cost per body-tile: on top of the hand cell, and per pushed word
+    if not (on(b["full"]) and on(b["loaded"])):
+        continue
+    f, l = rows[CELLS[b["full"]]]["per_unit_net"], rows[CELLS[b["loaded"]]]["per_unit_net"]
+    h = rows[CELLS[b["hand"]]]["per_unit_net"] if b["hand"] is not None and on(b["hand"]) else None
+    blk[name] = dict(full=f, loaded=l, hand=h, words=b["words"], per_word=(f - l) / b["words"])
+    print("blk_run %-16s config + record %6.1f, loaded %6.1f%s cyc per tile: %5.1f for %d pushed words = %.2f per word"
+          % (name, f, l, ", hand cell %.1f," % h if h is not None else "", f - l, b["words"], (f - l) / b["words"]))
 ok = all(v if isinstance(v, bool) else v["eq_stock"] == v["lanes"] for k, v in checks.items() if k != "scheduled, no NOPs")   # that one is a question, not a gate
 print("checks:", json.dumps(checks))
 print("CHECKS %s%s" % ("PASS" if ok else "FAIL", " (break arm %d)" % a.break_arm if a.break_arm else ""))
 print("aiclk min %s MHz over %d kept runs, n=%d" % (lo, len(keep), len(keep)))
 print("TIMED %.3f %.3f" % (keep[0]["t0"], keep[-1]["t1"]))   # epoch span of the kept runs, for an outside clock sampler
 if a.json:
-    json.dump(dict(rows=rows, runs=runs, checks=checks, checks_ok=ok, break_arm=a.break_arm, ns=a.ns, mask=a.mask, aiclk_min=lo, n=len(keep), node=node), open(a.json, "w"), indent=1)
+    json.dump(dict(blk=blk, mask2=a.mask2, rows=rows, runs=runs, checks=checks, checks_ok=ok, break_arm=a.break_arm, ns=a.ns, mask=a.mask, aiclk_min=lo, n=len(keep), node=node), open(a.json, "w"), indent=1)
 ttnn.close_mesh_device(md)

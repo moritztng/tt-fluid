@@ -3,7 +3,7 @@
 // barrier before a cell (each after tensix_sync, so its Tensix queue is empty) and stamp the wall clock when their
 // own part of the cell has drained. Header words: 32 + 4 id + {0 unpack, 1 math, 2 pack} = cycles, + 3 = units.
 // Tiles of cb_v: 0-7 input, 8-11 stock-load check, 12-15 lean-load check, 16-25 op results, 20-23 pack scratch
-// (the pack cell runs before the checks).
+// (the pack cell runs before the checks), 26-31 the generic executor's results. Cells 32 and up are bits of mask2.
 #include <cstdint>
 
 #include "api/compute/common.h"
@@ -18,6 +18,11 @@
 #include "api/compute/eltwise_unary/negative.h"
 #include "api/compute/eltwise_unary/comp.h"
 #include "api/compute/eltwise_unary/fill.h"
+#if __has_include("blk_exec.h")
+#include "blk_exec.h"   // the box holds bench/unit only: a copy next to this file
+#else
+#include "../../ttfluid/device/kernels/blk_exec.h"
+#endif
 
 constexpr uint32_t NB = 4;   // fp32 tiles of one DEST half
 // UB_BREAK (unit_costs.py --break-arm): 1 = the lean-load check moves one tile where it claims four, 2 = the fused
@@ -176,6 +181,49 @@ template <typename F>
     TTI_SFPNOP;
     SFPU_END();
 }
+// The two pipelined bodies above and one plain body as C_BLK programs for the generic executor (blk_exec.h): h, the
+// config words, the row program. UB_BREAK 2 breaks each the way it breaks the hand-written cell; the plain body then
+// stores the product instead of the sum.
+#define BT_U(x) static_cast<uint32_t>(x)
+#define BT_H(ncfg, len, nrep, nfl) BT_U((ncfg) | (len) << 8 | (nrep) << 16 | (nfl) << 24)
+#define BT_FP32 InstrModLoadStore::FP32
+constexpr uint32_t BT_ADD[] = {   // s1 = s0 + s1, two cycles per row, two rows per pass
+    BT_H(5, 4, 16, 3),
+    BT_U(TT_OP_SFPADD(p_sfpu::LCONST_1, p_sfpu::LREG2, 0, 12, 0)),
+    BT_U(TT_OP_SFPLOADI(0, sfpi::SFPLOADI_MOD0_LOWER, ((((0 << 3) | 4) << 8) | 0))),
+    BT_U(TT_OP_SFPLOADI(0, sfpi::SFPLOADI_MOD0_UPPER, (((((UB_BREAK == 2 ? 0 : 2) << 3) | 3) << 8) | 0))),
+    BT_U(TT_OP_SFPCONFIG(0, 4 + 0, 0)),
+    BT_U(TT_OP_SFPCONFIG(0x010, 8, 1)),
+    BT_U(TT_OP_SFPLOAD(p_sfpu::LREG2, BT_FP32, ADDR_MOD_7, 0)),
+    BT_U(TT_OP_SFPLOADMACRO((0 << 2) | 0, BT_FP32, ADDR_MOD_6, 64)),
+    BT_U(TT_OP_SFPLOAD(p_sfpu::LREG2, BT_FP32, ADDR_MOD_7, 0)),
+    BT_U(TT_OP_SFPLOADMACRO((0 << 2) | 1, BT_FP32, ADDR_MOD_6, 64)),
+};
+constexpr uint32_t BT_CHAIN[] = {   // s2 = s0 * s1 + s2 as mul then add, three cycles per row
+    BT_H(9, 3, 32, 5),
+    BT_U(TT_OP_SFPMUL(p_sfpu::LREG2, 0, p_sfpu::LCONST_0, 12, 0)),
+    BT_U(TT_OP_SFPADD(p_sfpu::LCONST_1, p_sfpu::LREG0, 0, 13, 0)),
+    BT_U(TT_OP_SFPLOADI(0, sfpi::SFPLOADI_MOD0_LOWER, (((0x80 | (0 << 3) | 4) << 8) | 0))),
+    BT_U(TT_OP_SFPLOADI(0, sfpi::SFPLOADI_MOD0_UPPER, 0)),
+    BT_U(TT_OP_SFPCONFIG(0, 4 + 0, 0)),
+    BT_U(TT_OP_SFPLOADI(0, sfpi::SFPLOADI_MOD0_LOWER, (((0x40 | ((UB_BREAK == 2 ? 0 : 1) << 3) | 5) << 8) | 0))),
+    BT_U(TT_OP_SFPLOADI(0, sfpi::SFPLOADI_MOD0_UPPER, (((0x40 | (3 << 3) | 3) << 8) | 0))),
+    BT_U(TT_OP_SFPCONFIG(0, 4 + 1, 0)),
+    BT_U(TT_OP_SFPCONFIG(0x020, 8, 1)),
+    BT_U(TT_OP_SFPLOAD(p_sfpu::LREG2, BT_FP32, ADDR_MOD_7, 0)),
+    BT_U(TT_OP_SFPLOADMACRO((0 << 2) | 0, BT_FP32, ADDR_MOD_7, 64)),
+    BT_U(TT_OP_SFPLOADMACRO((1 << 2) | 1, BT_FP32, ADDR_MOD_6, 128)),
+};
+constexpr uint32_t BT_PLAIN[] = {   // s3 = s0 * s1 + s2 as mul then add, one instruction per cycle: seven per row
+    BT_H(0, 7, 32, 0),
+    BT_U(TT_OP_SFPLOAD(p_sfpu::LREG0, BT_FP32, ADDR_MOD_7, 0)),
+    BT_U(TT_OP_SFPLOAD(p_sfpu::LREG1, BT_FP32, ADDR_MOD_7, 64)),
+    BT_U(TT_OP_SFPMUL(p_sfpu::LREG0, p_sfpu::LREG1, p_sfpu::LCONST_0, p_sfpu::LREG3, 0)),
+    BT_U(TT_OP_SFPLOAD(p_sfpu::LREG2, BT_FP32, ADDR_MOD_7, 128)),   // fills the cycle the product needs
+    BT_U(TT_OP_SFPADD(p_sfpu::LCONST_1, p_sfpu::LREG3, p_sfpu::LREG2, p_sfpu::LREG4, 0)),
+    BT_U(TT_OP_SFPNOP),
+    BT_U(TT_OP_SFPSTORE((UB_BREAK == 2 ? p_sfpu::LREG3 : p_sfpu::LREG4), BT_FP32, ADDR_MOD_6, 192)),
+};
 #endif
 
 void kernel_main() {
@@ -184,7 +232,7 @@ void kernel_main() {
     constexpr uint32_t cb_done = get_compile_time_arg_val(2);
     constexpr uint32_t nv = get_compile_time_arg_val(3);
     constexpr uint32_t cb_h = get_compile_time_arg_val(4);   // bfloat16 view of cb_v's memory (CFD_NARROW)
-    const uint32_t mask = get_common_arg_val<uint32_t>(0), NS = get_common_arg_val<uint32_t>(1);
+    const uint32_t mask = get_common_arg_val<uint32_t>(0), NS = get_common_arg_val<uint32_t>(1), mask2 = get_common_arg_val<uint32_t>(2);
 
     init_sfpu(cb_v, cb_v);
     cb_wait_front(cb_v, nv);
@@ -202,7 +250,7 @@ void kernel_main() {
 #define SEC_BEGIN() tile_regs_acquire()
 #define SEC_END() tile_regs_commit(); tile_regs_wait(); tile_regs_release()
 #define CELL(id, units, ...)                                     \
-    if (mask & (1u << (id))) {                                   \
+    if (((id) < 32 ? mask >> ((id) & 31) : mask2 >> ((id) & 31)) & 1u) { \
         barrier();                                               \
         const uint32_t t0_ = clk();                              \
         __VA_ARGS__;                                             \
@@ -309,6 +357,18 @@ void kernel_main() {
     copy_dest_values_init();
     CELL(27, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); for (uint32_t j = 0; j < NB; ++j) copy_dest_values<DataFormat::Float32>(0, 1); SEC_END(); });
 
+    // 32-37: the pipelined add, the chain and the plain body through the generic executor (blk_exec.h). Even: every
+    // tile pushes its config and records its row program (the VM when consecutive bodies differ); odd: only the first
+    // tile of the cell does (the same body still loaded: the floor)
+    MATH((blk_init()));
+#define BLK_CELL(id, tbl, every) CELL(id, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); MATH(({ for (uint32_t j = 0; j < NB; ++j) blk_run(tbl, (every) || (s | j) == 0); })); SEC_END(); })
+    BLK_CELL(32, BT_ADD, true);
+    BLK_CELL(33, BT_ADD, false);
+    BLK_CELL(34, BT_CHAIN, true);
+    BLK_CELL(35, BT_CHAIN, false);
+    BLK_CELL(36, BT_PLAIN, true);
+    BLK_CELL(37, BT_PLAIN, false);
+
     // checks (mask bit 31). Stock load of tiles 0-3 packed to 8-11; lean load of tiles 4-7 packed to 12-15
     if (mask & 0x80000000u) {
         barrier();
@@ -388,6 +448,18 @@ void kernel_main() {
         tile_regs_wait();
         pack_tile<true>(2, cb_v, 25);
         tile_regs_release();
+        // the same results through the generic executor: add -> 26, chain -> 28, plain body -> 30 with config and
+        // record, and each again with the program still loaded -> 27, 29, 31
+        MATH((blk_init()));
+        for (uint32_t v = 0; v < 6; ++v) {
+            tile_regs_acquire();
+            for (uint32_t j = 0; j < 3; ++j) copy_tile(cb_v, j, j);
+            MATH((blk_run(v < 2 ? BT_ADD : v < 4 ? BT_CHAIN : BT_PLAIN, (v & 1) == 0)));
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_tile<true>(v < 2 ? 1 : v < 4 ? 2 : 3, cb_v, 26 + v);
+            tile_regs_release();
+        }
     }
     barrier();
     UNPACK((hw[0] = 0xC0DE0000u | bk));
