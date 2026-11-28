@@ -20,6 +20,9 @@ from ttfluid import __version__
 SRAM = ["--layout", "rcb", "--amg", "--amg-depth", "0", "--amg-stack", "--amg-vec", "--amg-smoothed", "0", "--lsched",
         "--phase", "--sliced", "--fuse", "--cse", "1", "--hlate", "1"]
 P300_SUBSYSTEMS = {"0x0044", "0x0045", "0x0046"}
+# Blackhole Galaxy: a tray of 8 chips is a 4x2 ladder (0-1-2-3 over 4-5-6-7), so these are one chip and physical 1x2 and
+# 2x2 blocks. Other blocks: set TT_VISIBLE_DEVICES (docs/architecture.md).
+GALAXY_BLOCK = {1: "0", 2: "0,1", 4: "0,1,4,5"}
 
 
 def mesh_shape(chips):
@@ -37,9 +40,28 @@ def _p300_nodes():
     return out
 
 
+def _galaxy():
+    try:
+        return Path("/sys/class/tenstorrent/tenstorrent!0/tt_card_type").read_text().strip() == "galaxy-blackhole"
+    except OSError:
+        return False
+
+
 def _mesh_descriptor(chips):
-    """A p300 board is a custom topology for ttnn: one chip opens as a p150, both chips as the p300 mesh."""
-    if os.environ.get("TT_MESH_GRAPH_DESC_PATH") or not _p300_nodes() or chips > 2:
+    """A p300 board is a custom topology for ttnn: one chip opens as a p150, both chips as the p300 mesh. So is a
+    block of a Blackhole Galaxy, whose neighbours share two Ethernet channels: its descriptor is written here."""
+    if os.environ.get("TT_MESH_GRAPH_DESC_PATH"):
+        return
+    if chips in GALAXY_BLOCK and _galaxy():
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".textproto", delete=False) as f:
+            f.write('mesh_descriptors { name: "M0" arch: BLACKHOLE device_topology { dims: [ %s ] } '
+                    'host_topology { dims: [ 1, 1 ] } channels { count: 2 policy: RELAXED } }\n'
+                    'top_level_instance { mesh { mesh_descriptor: "M0" mesh_id: 0 } }\n' % mesh_shape(chips).replace(",", ", "))
+        os.environ["TT_MESH_GRAPH_DESC_PATH"] = f.name
+        os.environ.setdefault("TT_VISIBLE_DEVICES", GALAXY_BLOCK[chips])
+        return
+    if not _p300_nodes() or chips > 2:
         return
     import importlib.util
     spec = importlib.util.find_spec("ttnn")
@@ -78,9 +100,11 @@ def main(argv=None):
         ap.error(f"{case} has no constant/polyMesh")
     r = ["case", str(a.iterations), "--case", str(case), "--arch", a.arch, "--mesh", mesh_shape(a.chips),
          "--out", a.out, "--runs", "1", *SRAM]
-    if a.chips == 2 and a.arch == "bh":
-        # a p300 board links its two chips with Ethernet links 0 and 1: halos on 0, the reductions on 1
+    if a.chips >= 2 and a.arch == "bh":
+        # Blackhole neighbours (a p300 board, a Galaxy) share Ethernet links 0 and 1: halos on 0, the reductions on 1
         r += ["--gw", "1", "--links", "0", "--rlink", "1"]
+        if a.chips >= 4:   # the chips are a physical R x C block, cut into strips
+            r += ["--block2d", "--strips"]
     if a.cmd == "check":
         r.append("--emuonly")
     else:
@@ -88,9 +112,9 @@ def main(argv=None):
             r += ["--write", str(Path(a.write).resolve())]
         if a.no_check:
             r.append("--noemu")
-        os.environ.setdefault("TT_VISIBLE_DEVICES", ",".join(str(i) for i in range(a.chips)))
         if a.arch == "bh":
             _mesh_descriptor(a.chips)
+        os.environ.setdefault("TT_VISIBLE_DEVICES", ",".join(str(i) for i in range(a.chips)))
     sys.argv = ["ttfluid.device.run_mesh", *r, *extra]
     runpy.run_module("ttfluid.device.run_mesh", run_name="__main__")
 

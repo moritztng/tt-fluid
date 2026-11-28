@@ -22,8 +22,8 @@ $/h    = capex / (3 x 8760 h)  +  wall kW x PUE 1.3 x $0.15 per kWh
 $/case = batch wall time x $/h / 3600 / cases in the batch
 ```
 
-A batch fills the box with independent cases: one case per GPU on an 8-GPU server, one case per p300c board (2 chips)
-on a QuietBox 2. The batch wall time is that of the slowest member, so the box is charged for every second any part of
+A batch fills the box with independent cases: one case per GPU on an 8-GPU server (several per GPU: see "A fair
+baseline" below), one case per p300c board (2 chips) on a QuietBox 2. The batch wall time is that of the slowest member, so the box is charged for every second any part of
 it is busy.
 
 | | QuietBox 2 | 8x H100 SXM | 8x B200 |
@@ -58,9 +58,14 @@ OpenFOAM we know of. The rules we held ourselves to:
   (`bench/nvidia/boundfix/boundFix.C`, loaded with `LD_PRELOAD`) rather than report a failed GPU run.
 - **Cheapest documented price.** NVIDIA gets the lowest server listing we could document. Tenstorrent gets its own
   store price, which a buyer would negotiate down, and its full power rating.
-- **One case per GPU.** The case fits easily in one GPU's memory, and splitting one case over several GPUs costs
-  efficiency. Packing two cases on one GPU could raise GPU throughput; we did not measure it, and a bound derived from
-  GPU utilisation would leave the QuietBox 2 ahead at about 1.35x.
+- **Cases per GPU: the table is not yet the GPU at its best.** The table runs one case per GPU, and the case uses
+  6 GiB of an H100's 80. Measured on 2026-11-28 on one H100 SXM under NVIDIA MPS, same case and precision mode, every
+  case passing the drag check, priced as one eighth of the server above: two cases per GPU take 891.3 s for both
+  ($0.158 per case, QuietBox 2 ahead by 1.37x), four take 1,331.6 s ($0.119 per case, 1.03x) and eight take
+  2,122.3 s ($0.096 per case, the GPU server ahead by 1.20x). A whole 8-GPU server at eight cases per GPU is still to
+  be measured. These rows are not in the table or in `bench/per_dollar.py` yet; their raw data follows. Two things
+  the packed number does not show: a packed batch returns its first result later (2,122 s for eight cases against
+  681 s for one case alone on that GPU), and each packed case holds one host core, 64 for the server.
 
 Build and run scripts: `bench/nvidia/spuma_build.sh`, `spdp_build.sh`, `spuma_pack.sh`, `spuma_min.sh`,
 `spuma_run.sh`, `boundfix.sh`.

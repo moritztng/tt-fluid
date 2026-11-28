@@ -86,6 +86,16 @@ ap.add_argument("--gcache", type=int, default=-1, help="as run_vm.py: N gather t
 ap.add_argument("--icache", type=int, default=1, help="as run_vm.py: compute skips a repeated op _init (CFD_ICACHE)")
 ap.add_argument("--sched", type=int, default=3, help="as run_vm.py: 1 greedy reorder of each fused run's blocks so values die early, 2 greedy or depth-first, 3 (default) the same at min-store cut points (Machine(sched=K))")
 ap.add_argument("--dedup", type=int, default=0, help="as run_vm.py: a fused run streams each DRAM page once (Machine(dedup=True))")
+ap.add_argument("--span", type=int, default=0, help="1 with --l1 N: a split gather whose window and whole residue read one "
+                "DRAM-homed vector reads an L1 copy of it (one reserved L1 slot of T tiles, filled by a copy block when the vector "
+                "changes), which --tabdense then serves like any L1 vector (Machine(span=1)); 2: a served gather with an L1 destination is "
+                "one reader page too, not a block and a gather op; values unchanged")
+ap.add_argument("--tabdense", type=int, default=0, help="N > 0 with --tabstream: a reader-patched map with at least N local residue entries "
+                "per tile on a core is streamed as a dense destination-ordered uint16 index table (512 words a tile) and the reader "
+                "gathers the page in one pass with no window read (CFD_DENSE; encode.py tab_dense). The same page values. "
+                "530 is the measured break-even on BH (6.45 cycles a dense lane against 12.1 a residue entry)")
+ap.add_argument("--tabdense-break", type=int, default=0, help="the broken arm of the --tabdense gate: N pairs of lanes of every dense table of "
+                "core 0 read each other's source, so the state must differ from the control's")
 ap.add_argument("--tsort", type=int, default=None, help="as run_vm.py: tabstream residue entries sorted by source tile (CFD_TSORT). "
                 "Default on with --tabstream; with --from-images as the images were lowered")
 ap.add_argument("--bpatch", type=int, default=None, help="as run_vm.py: -1 / unset auto (4 when --tabstream and >= --bpatch-min local residue entries per patched map tile), K in 1..7 BRISC scatters (8 - K) / 8 of a patched page's L1 residue (CFD_BPATCH; mailbox in the last 256 B of cb_sync)")
@@ -190,6 +200,7 @@ if a.owner:
     ttfluid.resident.machine.rcb = lambda xyz, P, chips=None: _parts
 from ttfluid.resident.memu import MachineEmu  # noqa: E402
 from ttfluid.resident.encode import Encoded  # noqa: E402
+from ttfluid.resident.tabstream import bpatch_auto  # noqa: E402
 from ttfluid.resident.program import build  # noqa: E402
 import ttfluid.resident.krylov  # noqa: E402
 
@@ -205,7 +216,7 @@ stamp("python imports done")
 
 t0 = time.time()
 # the flags that shape the lowering and the encoding: a --load must carry the ones its --save had
-LOWER = {k: getattr(a, k) for k in ("what", "n", "case", "mesh", "layout", "tiles", "l1", "red2", "strips", "fuse", "redm", "sched",
+LOWER = {k: getattr(a, k) for k in ("what", "n", "case", "mesh", "layout", "tiles", "l1", "span", "red2", "strips", "fuse", "redm", "sched",
                                     "hoist", "jointred", "fold1", "fusepart", "gsplit", "wplace", "bcast", "cg1", "page", "tabstream",
                                     "bgather", "bscal", "bjoint", "cap")}
 if a.phase:
@@ -298,7 +309,7 @@ else:
                     l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
                     joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
                     bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, lsplit=bool(a.lsplit), hpack=bool(a.hpack), gsmin=a.gsmin)
+                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span, lsplit=bool(a.lsplit), hpack=bool(a.hpack), gsmin=a.gsmin)
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))
@@ -350,7 +361,17 @@ else:
     assert a.tabstream or not ttfluid.resident.encode.WIDE, "T=%d > 64 needs --tabstream" % m.T
     assert not (ttfluid.resident.encode.WIDE and (a.tgts or a.gtile)), "--tgts / --gtile hand over 16-bit gather entries (vm_compute tsvc): not with wide ones"
     if not a.load:
-        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
+        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break)
+        if a.tabdense:
+            S_ = E.tab_stream
+            print("tabdense %d: %d twin maps, %d of %d (core, twin) tables dense, L1 table %d words, blob %d words a core (staging %d)" % (
+                a.tabdense, len(S_["dense"]), S_["ndense"], len(S_["l1"]) * len(S_["dense"]), S_["l1_words"], S_["blob_words"], S_["staging_words"]), flush=True)
+            from ttfluid.resident.tabstream import gcensus
+            from ttfluid.resident.program import PHASES
+            gc_ = gcensus(E)   # which gathers the dense twin reaches, one execution of every op, means over the cores
+            for (ph, cls), (no, nl, nd, nh) in sorted(gc_.items(), key=lambda kv: (-1 if kv[0][0] is None else kv[0][0], -kv[1][1])):
+                print("gcensus %-11s %-40s ops %4d  local entries a core %9.0f  through a dense table %9.0f  halo %7.0f" % (
+                    "top" if ph is None else PHASES[ph], cls, no, nl, nd, nh), flush=True)
         if a.tscheck:   # as run_vm.py: NCRISC's streamed walk replayed against the cursor tables, every core
             from ttfluid.resident.tabstream import check
             check(E, E.tab_stream, E.tab_cursor)
@@ -359,7 +380,7 @@ else:
             k = max(0, int((a.l1_bytes - (cb_bytes(E) - m.ntiles * 4096)) // 4096 - m.nsmall) // m.T)
             while True:
                 m.place(k, print)
-                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
+                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break)
                 print("l1 auto: %d vector slots in L1, CB bytes %d" % (k, cb_bytes(E)), flush=True)
                 if cb_bytes(E) <= a.l1_bytes or k == 0:
                     break
@@ -393,6 +414,8 @@ else:
                 gateways={f"{x}->{y}" + (f".{k}" if a.gw > 1 else ""): g for (x, y, k), g in gw.items()}, shadow_kb=NSH * SHS * 4 / 1024,
                 gw_load={g: (v["gP"], v["gR"], len(v["rec"])) for g, v in gtab.items()},
                 cells_per_chip=[int(np.sum(m.lay.owner[prog.cells.name] // P == k)) for k in range(K)])
+    if E.tab_stream:
+        info["loc"] = list(E.tab_stream["loc"])   # for --bpatch auto on a run from the images
     print("plan", json.dumps(info), flush=True)
     if cb_bytes(E) > a.l1_bytes:   # images that cannot fit L1 fail only at launch, after the whole lowering: refuse them here
         msg = "CB bytes %d over --l1-bytes %d (halo %d B): more chips or a smaller case" % (cb_bytes(E), a.l1_bytes, E.m.hwords * 4)
@@ -554,9 +577,10 @@ GB = 1024 if 1024 + 32 * P <= 4000 else 4096   # vm_brisc.cpp gather slots: befo
 RB = 4096 if GB == 1024 else GB + 32 * P       # reduction broadcast
 E0 = RB + 2 * BW    # mesh words to E0 + 1616
 if a.bpatch is None or a.bpatch < 0:
-    lm = E.tab_stream.get("loc_mean", 0.0) if isinstance(getattr(E, "tab_stream", None), dict) else 0.0   # (images: pass --bpatch)
-    a.bpatch = 4 if lm >= a.bpatch_min else 0
-    print("--bpatch auto: %.1f local residue entries per patched map tile (min %.0f) -> %d" % (lm, a.bpatch_min, a.bpatch), flush=True)
+    loc = E.tab_stream["loc"] if isinstance(E.tab_stream, dict) else None   # None: no streamed tables, or images lowered before they recorded it
+    a.bpatch, lm = bpatch_auto(loc, a.bpatch_min)
+    print("--bpatch auto: %.1f local residue entries per patched map tile (min %.0f) -> %d" % (lm, a.bpatch_min, a.bpatch)
+          + (" (these images do not record the entries: lower again, or pass --bpatch 4)" if E.tab_stream and not loc else ""), flush=True)
 assert 0 <= a.bpatch < 8 and not (a.bpatch and not a.tabstream), "--bpatch K: 1..7 with --tabstream"
 assert 0 <= a.bgts < 8 and not (a.bgts and not a.tabstream), "--bgts K: 1..7 with --tabstream"
 assert not a.tsort or a.tabstream, "--tsort 1 needs --tabstream"
@@ -611,9 +635,10 @@ elif IMG is not None:   # chip by chip: chip k's arrays are built from its image
             STATE = {k: z[k] for k in z.files if k != "hist"}
         print("state from %s" % a.state_in, flush=True)
         stamp("state read")
-    up = lambda name: image_dev.upload(md, K, DEVBLK, lambda k: image_dev.chip_arrays(IMG, k, P, STATE, name)[name], to_dev)
+    filled = lambda name: (image_dev.chip_shape(IMG, P, name), lambda k, out: image_dev.chip_fill(IMG, k, P, name, out, STATE))
+    up = lambda name: image_dev.upload(md, K, DEVBLK, *filled(name), name)
     t_arena, t_const, t_home, t_blob = up("arena"), up("consts"), up("home"), up("blob")
-    t_tab = image_dev.upload(md, K, DEVBLK, chip_tab, to_dev)
+    t_tab = image_dev.upload(md, K, DEVBLK, (P, L), lambda k, out: np.copyto(out, chip_tab(k)), "tab")
     stamp("images uploaded (arena, consts, home, blob, tab)")
     t_c, t_b, t_n = (to_dev(np.tile(code[k], (K, 1))) for k in "cbn")
     t_hist = to_dev(np.zeros((K * H, 16), np.uint32))
@@ -653,6 +678,7 @@ def kd(src, ct, cfg, rt=None, crt=None):
         ([("CFD_TSORT", "1")] if a.tsort and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_BPATCH", str(a.bpatch))] if a.bpatch and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_BGTS", str(a.bgts))] if a.bgts and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
+        ([("CFD_DENSE", "1")] if a.tabdense and src in ("vm_ncrisc.cpp", "vm_brisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_TGTS", str(a.tgts))] if a.tgts and src in ("vm_ncrisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_GTILE", "1")] if a.gtile and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_NARROW", str(CB_H))] if a.narrow and src == "vm_compute.cpp" else []) + \
@@ -775,8 +801,8 @@ def main():
             stamp("case %d: homes written" % rr)
         elif rr and a.legs:   # the next leg continues: homes stay on the device, the arena's state registers from the dump
             ttnn.deallocate(t_arena)
-            t_arena = image_dev.upload(md, K, DEVBLK, lambda k: image_dev.carry_arena(
-                IMG, k, P, o[k * P:(k + 1) * P, 1024:].reshape(P, nv, 1024)), to_dev)
+            t_arena = image_dev.upload(md, K, DEVBLK, image_dev.chip_shape(IMG, P, "arena"), lambda k, out: np.copyto(
+                out, image_dev.carry_arena(IMG, k, P, o[k * P:(k + 1) * P, 1024:].reshape(P, nv, 1024))))
             io[0] = t_arena
             common[0] = t_arena.buffer_address()
             stamp("leg %d: arena carried" % rr)
@@ -843,7 +869,7 @@ def mesh_program():
 
 
 def next_homes():   # the next case's homes as one multi-device host tensor (the image's start or --state-in)
-    return image_dev.host_shards(md, K, DEVBLK, lambda k: image_dev.chip_arrays(IMG, k, P, STATE, "home")["home"])[0]
+    return image_dev.host_shards(md, K, DEVBLK, *filled("home"))[0]
 
 
 def core0_ticks(o):

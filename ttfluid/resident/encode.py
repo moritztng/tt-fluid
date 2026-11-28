@@ -154,7 +154,7 @@ def hrun_words(lane, idx, rmin=8):
 
 class Encoded:
     def __init__(self, m, page=False, pdev=None, tab_stream=False, look=False, cores=None, tab_sort=False, phase=None,
-                 gtile=False):
+                 gtile=False, tab_dense=0, tab_break=0):
         """page: the compute stream is paged from DRAM through a ring NCRISC fills (vm_ncrisc N_CODE): every basic
         block starts on a PW-word page, the padding is C_JMP (in paged mode JMP and BRT end a block and compute moves
         on to the next delivered page), and NCRISC pushes the pages of a MIR instruction before any of its own ops
@@ -163,6 +163,11 @@ class Encoded:
         look: an N_CODE also names want, the end of its straight-line compute code (the next label, jump or branch),
         and NCRISC pushes on up to it while the ring has free slots, without waiting for them (want = hi: off).
         tab_sort: with tab_stream, local residue entries sorted by source tile per page tile (tabstream.py sort).
+        tab_dense: with tab_stream, N > 0: a reader-patched map with at least N local residue entries per tile on a
+            core is stored there as a dense destination-ordered index table (tabstream.py dense; vm_ncrisc.cpp
+            CFD_DENSE gathers the page in one pass, no window read). The table is a twin of the map, read by the
+            pages whose window and residue come from one L1 vector; the map's other users keep the residue form.
+            The page's lanes are the same values.
         cores: the global cores whose tables, arena and constants to build (row r is core cores[r]), default all; the
         per-chip lowering (lower/spmd.py) builds one chip's.
         phase: {label: phase id} (Program.phase_at, build(phase=True)): a C_PH and a B_PH right after each such label.
@@ -175,6 +180,8 @@ class Encoded:
         self.m, self.page, self.look = m, page, look
         self.cores = np.arange(m.P) if cores is None else np.asarray(cores)
         assert not (tab_stream and getattr(m, "hrun", False)), "hrun marks the L1 gather tables"
+        assert not (tab_dense and (not tab_stream or WIDE)), "dense index tables: streamed, 16-bit lanes"
+        twin = {}    # (map, shift) -> the dense twin's map id (tabstream.py dense), in order of first use
         assert tab_stream or not WIDE, "wide gather entries carry the lane within its tile: only the streamed walk"
         self.loop_pages = 1     # paged: the most code pages the ring holds at once (a tile loop's body, or an N_CODE's
         #   pages past compute's release point); the ring needs more than this
@@ -219,6 +226,10 @@ class Encoded:
                 gt[j] = m.tiles([x])
             self.gtile_n = len(gt)
         waitn = [False, None]   # gtile: a C_WAITN owed after the next C_TBEG; where it went
+        # gather census (tabstream.gcensus): one row per patched reader page and per gather op in program order:
+        # (class, map, dense twin or None, parts, phase id or None)
+        self.gops, cur_ph = [], [None]
+        gsrc = lambda xs: "dram" if all(phys[x] >= DBASE for x in xs) else "mixed" if any(phys[x] >= DBASE for x in xs) else "l1"
 
         def head(blks):
             """Open the tile loop of one block or of a fused segment's blocks: TBEG, the reader's one stream of every
@@ -247,8 +258,18 @@ class Encoded:
                 for u in ldr:
                     assert len(u[5]) <= 8      # the reader keeps 8 part cursors (vm_ncrisc.cpp)
                     ss = 14 if WIDE else 16     # WIDE: 18-bit shift, 10-bit map (vm_ncrisc SS, SM)
-                    assert -(1 << 31 - ss) <= u[3] < 1 << 31 - ss and (u[4] or 0) < (1 << 28 - ss) - 1, (u[3], u[4])
-                    n(desc(u[2]), (u[3] & (1 << 32 - ss) - 1) << ss | (0 if u[4] is None else u[4] + 1) << 4 | len(u[5]))
+                    mid = u[4]
+                    if (tab_dense and mid is not None and u[2] is not None and phys[u[2]] < DBASE
+                            and [x for x, _ in u[5]] == [u[2]]):
+                        # window and residue from one L1 vector: this page reads the map's dense twin
+                        mid = twin.setdefault((mid, u[3]), len(m.maps.tab) + len(twin))
+                    if u[4] is not None:
+                        xs = [y for y, _ in u[5]]
+                        self.gops.append(("page %d-part %s, window %s" % (len(xs), gsrc(xs), "none" if u[2] is None else
+                                          "dram" if phys[u[2]] >= DBASE else "same l1" if xs == [u[2]] else "other l1"),
+                                          u[4], mid if mid != u[4] else None, len(xs), cur_ph[0]))
+                    assert -(1 << 31 - ss) <= u[3] < 1 << 31 - ss and (mid or 0) < (1 << 28 - ss) - 1, (u[3], mid)
+                    n(desc(u[2]), (u[3] & (1 << 32 - ss) - 1) << ss | (0 if mid is None else mid + 1) << 4 | len(u[5]))
                     for x, h in u[5]:
                         n(desc(x), NONE16 if h is None else halo_slot(h))
             sink = [r for r in sts if phys[r] >= DBASE]
@@ -367,7 +388,24 @@ class Encoded:
                 b(W(B_GATHER, len(ins[3])), phys[ins[1]], ins[2], *[phys[s] for s, _ in ins[3]])
             elif op == "gather":
                 assert phys[ins[1]] < DBASE and len(ins[3]) < 16, "an N_GATHER carries at most 15 parts"
-                n(W(N_GATHER, len(ins[3]), ins[4] if len(ins) > 4 else 0) | gt.get(j, 0) << 16, phys[ins[1]], ins[2])
+                mid = ins[2]
+                # a split gather (machine.py _place): the block in front stored the source read at the map's shift,
+                # this op patches the residue
+                jb = j - 1
+                while jb >= 0 and mir[jb][0] in ("sync", "tok"):
+                    jb -= 1
+                xb = mir[jb] if jb >= 0 else ("",)
+                split = (len(ins[3]) == 1 and not (len(ins) > 4 and ins[4]) and xb[0] == "blk"
+                         and [r for _, r in xb[2]] == [ins[1]] and xb[1][-1][0] == "lds"
+                         and xb[1][-1][2] == ins[3][0][0] and all(u[2] == "__anchor__" for u in xb[1][:-1]))
+                if tab_dense and split and phys[ins[3][0][0]] < DBASE:
+                    # from one L1 vector both halves are one dense table: the op reads the twin and writes every
+                    # lane of its tiles (the block's copy stays, overwritten)
+                    mid = twin.setdefault((mid, xb[1][-1][3]), len(m.maps.tab) + len(twin))
+                xs = [y for y, _ in ins[3]]
+                self.gops.append(("gather %d-part %s%s%s" % (len(xs), gsrc(xs), ", split" if split else "",
+                                  ", mode %d" % ins[4] if len(ins) > 4 and ins[4] else ""), ins[2], mid if mid != ins[2] else None, len(xs), cur_ph[0]))
+                n(W(N_GATHER, len(ins[3]), ins[4] if len(ins) > 4 else 0) | gt.get(j, 0) << 16, phys[ins[1]], mid)
                 for src, h in ins[3]:
                     n(desc(src), NONE16 if h is None else halo_slot(h))
             elif op == "bscal":
@@ -409,6 +447,7 @@ class Encoded:
                 for s in S.values():
                     s.label(ins[1])
                 if ins[1] in phase:
+                    cur_ph[0] = phase[ins[1]]
                     if page:
                         pad()   # the marker opens the label's page (the paged block below starts there)
                     assert 0 <= phase[ins[1]] < 15
@@ -475,7 +514,7 @@ class Encoded:
         if tab_stream:      # residue tables in DRAM, a tile-offset index in L1 (tabstream.py)
             from .tabstream import stream
             self.tab_cursor, self.tab_halo_cursor = self.tab, self.tab_halo
-            self.tab_stream = S = stream(self, sort=tab_sort)
+            self.tab_stream = S = stream(self, sort=tab_sort, dense=[(o, sh, tab_dense) for o, sh in twin], brk=tab_break)
             self.tab = _pad(S["l1"])
             self.tab_blob = _pad(S["blob"])
             self.tab_halo = np.array(S["halo_off"], np.uint32)
