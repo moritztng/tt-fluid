@@ -119,7 +119,7 @@ ap.add_argument("--stop", type=int, default=0, help="bisect a hang: every core a
 for k, h in [("jointred", "krylov.JOINT + Machine(joint_red=True)"), ("cg1", "krylov.CG1"), ("fold1", "Machine(fold1=True)"),
              ("fusepart", "Machine(fusepart=True)"), ("gsplit", "Machine(gsplit=True)"), ("wplace", "Machine(wplace=True)"),
              ("bcast", "Machine(bcast_run=True)"), ("bgather", "Machine(bgather=True)"), ("bscal", "Machine(bscal=True)"),
-             ("bjoint", "krylov.BJOINT (pair with --jointred 1)"), ("cse", "Machine(cse_ir=True): value numbering over the traced IR, bit-exact"), ("narrow", "bf16 in-place DRAM constants (Machine(narrow=True), C_LDRH)")]:
+             ("bjoint", "krylov.BJOINT (pair with --jointred 1)"), ("ufuse", "krylov.UFUSE: the components of a vector solve (U) in one lockstep BiCGStab loop, bitwise the sequential solves"), ("cse", "Machine(cse_ir=True): value numbering over the traced IR, bit-exact"), ("narrow", "bf16 in-place DRAM constants (Machine(narrow=True), C_LDRH)")]:
     ap.add_argument("--" + k, type=int, default=0, help="as run_vm.py: " + h)
 ap.add_argument("--gtile", type=int, default=0, help="1 (with --tabstream): a gather whose next sync hands it to a tile loop that reads it "
                 "plainly posts one token per finished tile and compute waits once per pass, so the loop starts on tile 0 "
@@ -189,6 +189,8 @@ import ttfluid.resident.trace  # noqa: E402
 ttfluid.resident.trace.FIELD_MAJOR = bool(a.hlate)
 ttfluid.resident.krylov.CG1 = bool(a.cg1)
 ttfluid.resident.krylov.BJOINT = bool(a.bjoint)
+ttfluid.resident.krylov.UFUSE = bool(a.ufuse)
+ttfluid.resident.krylov.UFUSE_NOFREEZE = a.ufuse == 2   # the broken arm of the bitwise check
 stamp("python imports done")
 
 t0 = time.time()
@@ -202,7 +204,7 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "ufuse") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
@@ -945,7 +947,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         h[:, w] += h[:, w + 400] << 32
     root = [k * P for k in range(K)]
     gws = sorted(gtab)
-    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
+    res = dict(ufuse=a.ufuse, jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
                plan=info, sizes=E.sizes(), l1=l1, rows=nrow, walls=walls, ticks=ticks,
                ms_device=[max(t) / amax / 1e3 for t in ticks], aiclk=clks,
                same_history_all_chips=bool(all(np.array_equal(hist_all[0, :nrow], hist_all[k, :nrow]) for k in range(K))),

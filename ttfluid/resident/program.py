@@ -71,6 +71,14 @@ class TracedOps(EllOps):
             return perf
         return run
 
+    def krylov_fused(self, As, xs, bs, c):
+        """The components of one vector solve in one lockstep loop (krylov.UFUSE); None: solve them one by one."""
+        if not krylov.UFUSE:
+            return None
+        perfs = krylov.pbicgstab_fused(As, xs, bs, c)
+        self.perfs.extend(("pbicgstab", p) for p in perfs)
+        return perfs
+
     def bslots(self, d, like):
         """Per-slot array, patch values on each patch's boundary slots, 0 elsewhere."""
         e, tr = self.e, self.tr
