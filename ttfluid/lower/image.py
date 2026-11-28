@@ -30,6 +30,24 @@ SCALARS = ("K", "P", "T", "ndram", "hpages", "cpages", "ntiles", "nhalo", "hmax"
            "loop_pages")
 
 
+class Pages:
+    """A (cores, pages, LANES) array held as the pages that are not zero: rows[row[core, page]] is a page, and the
+    pages left out share one row (zero on the way back from a chip; never written on the way in, their values are
+    zero). Indexed as Image.state and put_state index the homes: [core, page, lane] with index arrays."""
+
+    def __init__(self, rows, row):
+        self.rows, self.row = rows, row
+
+    def view(self, dtype):
+        return Pages(self.rows.view(dtype), self.row)
+
+    def __getitem__(self, i):
+        return self.rows[self.row[i[0], i[1]], i[2]]
+
+    def __setitem__(self, i, v):
+        self.rows[self.row[i[0], i[1]], i[2]] = v
+
+
 class Image:
     def __init__(self, shared, chips):
         self.shared = shared          # name -> array or JSON-able object
@@ -158,7 +176,7 @@ class Image:
 
     # ---- results, chip by chip ------------------------------------------------------------------------------------
     def state(self, out_rows, home_rows):
-        """out_rows(k) -> chip k's arena (P, ntiles, LANES) fp32; home_rows(k) -> its DRAM homes (P, hpages, LANES).
+        """out_rows(k) -> chip k's arena (P, ntiles, LANES) fp32; home_rows(k) -> its DRAM homes (P, hpages, LANES) or Pages.
         Returns name -> global array, as Encoded.state_from_arena. Each register is read front to back on its own
         thread, as put_state writes it."""
         from ttfluid.resident.machine import DBASE
@@ -195,11 +213,11 @@ class Image:
             self._members[k, spn] = core[o], lane[o] // LANES, lane[o] % LANES, ids[o]
         return self._members[k, spn]
 
-    def put_state(self, k, arena, home, state, home_row=None):
+    def put_state(self, k, arena, home, state):
         """The inverse of state() for chip k: write name -> global array (state()'s layout) into chip k's arena
         (P, ntiles, LANES) and DRAM homes (P, hpages, LANES), fp32 views, in place, so the next launch starts from it
-        (a restart). Either array may be None to write only the other. home_row: the homes are staged, home is
-        (rows, LANES) and home_row[core, page] the row that holds a page. A register the lowering kept as a constant
+        (a restart). Either array may be None to write only the other, and the homes may be Pages that hold every
+        page of a state register. A register the lowering kept as a constant
         must already hold the value: a state that changes one cannot be loaded into these images. The components of
         a name are gathered together, one row per element, and each register is written on its own thread (numpy
         indexing releases the GIL): Small k2 lays 122 M values over a chip's homes."""
@@ -225,8 +243,7 @@ class Image:
                 core, tile, lane, ids = self.members(k, spn)
                 if g is None:
                     g = v[ids]
-                idx = (core, tt + tile, lane) if X is arena or home_row is None else (home_row[core, tt + tile], lane)
-                jobs.append(_READERS.submit(put, X, idx, g[:, i]))
+                jobs.append(_READERS.submit(put, X, (core, tt + tile, lane), g[:, i]))
         for j in jobs:
             j.result()
 

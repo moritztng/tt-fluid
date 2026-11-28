@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from ttfluid.lower.image import Image, LANES
+from ttfluid.lower.image import Image, LANES, Pages
 
 KERNELS = Path(__file__).resolve().parent.parent / "device" / "kernels"
 
@@ -147,8 +147,7 @@ def chip_fill(img, k, P, name, out, state=None, row=None):
         f = out.view(np.float32)
         nt = img.s["ntiles"]
         img.put_state(k, f[:, :nt * LANES].reshape(P, nt, LANES) if name == "arena" else None,
-                      (f.reshape(P, -1, LANES) if row is None else f) if name == "home" else None, state,
-                      None if row is None else row.reshape(P, -1))
+                      (f.reshape(P, -1, LANES) if row is None else Pages(f, row.reshape(P, -1))) if name == "home" else None, state)
 
 
 def chip_pages(img, k, P, name, state=None):
@@ -186,19 +185,25 @@ class Staged:
         self.mark()
         return (self.shape, self.fill) if self.sparse else (self.full, self.fill_full)
 
-    def work(self, k, W):
-        """Chip k's array split over W workers: (map, args). Worker w lays pages first .. first + count - 1; bit j of
-        its map row (uint32 words) says page first + j is staged, and its staged pages start at row start of the
-        staging buffer. args[w] = (w, first, count, start), what kernels/place.cpp takes."""
-        on = self.on[k]
-        n = -(-len(on) // W)
-        bits = np.zeros((W, -(-n // 512) * 512), bool)      # a map row is whole 64-byte DRAM reads
-        pad = np.zeros(W * n, bool)
-        pad[:len(on)] = on
-        bits[:, :n] = pad.reshape(W, n)
-        start = np.concatenate([[0], np.cumsum(pad)])[::n]
-        args = [(w, w * n, max(0, min(n, len(on) - w * n)), int(start[w])) for w in range(W)]
-        return np.packbits(bits, axis=1, bitorder="little").view(np.uint32), args
+
+def page_map(on, W):
+    """An array's pages split over W workers: (map, args) from one bool per page. Worker w moves pages first ..
+    first + count - 1; bit j of its map row (uint32 words) says page first + j is staged, and its staged pages start
+    at row start of the staging tensor. args[w] = (w, first, count, start), what kernels/place.cpp takes."""
+    n = -(-len(on) // W)
+    bits = np.zeros((W, -(-n // 512) * 512), bool)      # a map row is whole 64-byte DRAM reads
+    pad = np.zeros(W * n, bool)
+    pad[:len(on)] = on
+    bits[:, :n] = pad.reshape(W, n)
+    start = np.concatenate([[0], np.cumsum(pad)])[::n]
+    args = [(w, w * n, max(0, min(n, len(on) - w * n)), int(start[w])) for w in range(W)]
+    return np.packbits(bits, axis=1, bitorder="little").view(np.uint32), args
+
+
+def map_pages(m, rows):
+    """page_map's inverse: one bool per page from the (W, words) map of an array of `rows` pages."""
+    n = -(-rows // len(m))
+    return np.unpackbits(np.ascontiguousarray(m).view(np.uint8), axis=1, bitorder="little")[:, :n].reshape(-1)[:rows].astype(bool)
 
 
 def carry_arena(img, k, P, a_out):
@@ -255,6 +260,41 @@ def verify(t, K, DEVBLK, shape, fill, name):
             assert np.array_equal(download_chip(t, d), ref), ("upload read back differs", name, d)
 
 
+def workers(md, cells, grid, cores, DEVBLK, source, ct, tensors, out, common, args, l1):
+    """Runs kernels/<source> on both data movement processors of every core of every chip: 2 * cores workers a chip.
+    Worker w (core w // 2, processor w % 2) on the chip of block k gets the runtime args args(k)[w] and an L1 buffer
+    of l1 bytes; the compile-time args are [that buffer] + ct + the accessors of `tensors`, the common args the
+    tensors' addresses + common. out: the tensor the program writes. cells[d]: device d's mesh coordinate."""
+    import ttnn
+    acc = [a for x in tensors for a in ttnn.TensorAccessorArgs(x).get_compile_time_args()]
+    mpd = ttnn.MeshProgramDescriptor()
+    for d, rc in enumerate(cells):
+        rows = args(DEVBLK[d])
+        prog = ttnn.ProgramDescriptor()
+        prog.cbs = [ttnn.CBDescriptor(total_size=l1, core_ranges=grid, format_descriptors=[
+            ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.uint32, page_size=l1)]) for i in (0, 1)]
+        kernels = []
+        for i, (proc, noc) in enumerate(((ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0),
+                                         (ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1))):
+            kd = ttnn.KernelDescriptor(kernel_source=str(KERNELS / source), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                                       core_ranges=grid, compile_time_args=[i] + list(ct) + acc,
+                                       config=ttnn.DataMovementConfigDescriptor(processor=proc, noc=noc))
+            rt = ttnn.RuntimeArgs()
+            for c, (x, y) in enumerate(cores):
+                rt[x][y] = list(rows[2 * c + i])
+            kd.runtime_args = rt
+            kd.common_runtime_args = [x.buffer_address() for x in tensors] + list(common)
+            kernels.append(kd)
+        prog.kernels = kernels
+        mc = ttnn.MeshCoordinate(*rc)
+        mpd[ttnn.MeshCoordinateRange(mc, mc)] = prog
+    ttnn.generic_op([x for x in tensors if x is not out] + [out], mpd)
+    ttnn.synchronize_device(md)
+
+
+NB = 16   # pages a worker keeps in flight
+
+
 def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, host=None):
     """upload for a Staged array. Sparse: the host writes the staged pages and a page map, and every core of a chip
     lays a share of the array with both its data movement processors (kernels/place.cpp), copying the staged pages
@@ -262,7 +302,7 @@ def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, host=None):
     fifth of the bytes (zeros cost it what data costs) and the host never holds the zero pages. Not sparse: a plain
     upload. cells[d]: device d's mesh coordinate; host: a future of host_shards(md, K, DEVBLK, *sg.src())."""
     import ttnn
-    K, P, W, NB = len(DEVBLK), len(cores), 2 * len(cores), 16
+    K, W = len(DEVBLK), 2 * len(cores)
     prof = name and os.environ.get("CFD_UPLOAD_PROFILE")
     if host is not None:
         host.result()        # it marked the pages
@@ -271,39 +311,17 @@ def upload_placed(md, cells, grid, cores, DEVBLK, sg, name=None, host=None):
     t = ttnn.allocate_tensor_on_device(ttnn.Shape(list(sg.full)), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
     t_stage = upload(md, K, DEVBLK, *sg.src(), name and name + " staged", host)
     t0 = time.time()
-    work = {k: sg.work(k, W) for k in DEVBLK}
+    work = {k: page_map(sg.on[k], W) for k in DEVBLK}
     mw = work[DEVBLK[0]][0].shape[1]
     t_map = upload(md, K, DEVBLK, (W, mw), lambda k, out: np.copyto(out, work[k][0]))
-    acc = [a for x in (t, t_stage, t_map) for a in ttnn.TensorAccessorArgs(x).get_compile_time_args()]
-    l1 = 4 * mw + 4096 * (NB + 1)
-    mpd = ttnn.MeshProgramDescriptor()
-    for d, rc in enumerate(cells):
-        prog = ttnn.ProgramDescriptor()
-        prog.cbs = [ttnn.CBDescriptor(total_size=l1, core_ranges=grid, format_descriptors=[
-            ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.uint32, page_size=l1)]) for i in (0, 1)]
-        kernels = []
-        for i, (proc, noc) in enumerate(((ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0),
-                                         (ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1))):
-            kd = ttnn.KernelDescriptor(kernel_source=str(KERNELS / "place.cpp"), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
-                                       core_ranges=grid, compile_time_args=[i, 4 * mw, NB] + acc,
-                                       config=ttnn.DataMovementConfigDescriptor(processor=proc, noc=noc))
-            rt = ttnn.RuntimeArgs()
-            for c, (x, y) in enumerate(cores):
-                rt[x][y] = list(work[DEVBLK[d]][1][2 * c + i])
-            kd.runtime_args = rt
-            kd.common_runtime_args = [x.buffer_address() for x in (t, t_stage, t_map)]
-            kernels.append(kd)
-        prog.kernels = kernels
-        mc = ttnn.MeshCoordinate(*rc)
-        mpd[ttnn.MeshCoordinateRange(mc, mc)] = prog
     t1 = time.time()
-    ttnn.generic_op([t_stage, t_map, t], mpd)
-    ttnn.synchronize_device(md)
+    workers(md, cells, grid, cores, DEVBLK, "place.cpp", [4 * mw, NB, 0], [t, t_stage, t_map], t, [0],
+            lambda k: work[k][1], 4 * mw + 4096 * (NB + 1))
     t2 = time.time()
     ttnn.deallocate(t_stage)
     ttnn.deallocate(t_map)
     if prof:
-        print("place %s: %d of %d pages per chip staged, map and program %.2f s, laid on the chips in %.2f s (compile included)"
+        print("place %s: %d of %d pages per chip staged, map %.2f s, laid on the chips in %.2f s (compile included)"
               % (name, sg.shape[0], sg.full[0], t1 - t0, t2 - t1), flush=True)
     verify(t, K, DEVBLK, sg.full, sg.fill_full, name)
     return t
@@ -348,22 +366,36 @@ def state_pages(img):
     return [tuple(r) for r in m]
 
 
-def download_state_pages(md, t, P, HPG, ranges):
-    """d -> device d's homes as (P, HPG, LANES) uint32 with only the page ranges read (the rest zero). Each range is
-    one slice of every core's homes on the whole mesh, so all chips cut it at once, and one read: the host reads the
-    state pages and not the whole matrix, and not chip after chip."""
+def download_state(md, cells, grid, cores, DEVBLK, t, P, HPG, ranges):
+    """d -> device d's homes as Pages (uint32) that hold the state pages which are not zero: all the host reads.
+    Every worker tests the state pages of its share on the chip and marks them in a page map (kernels/scan.cpp); the
+    host reads the maps, and the chips collect the marked pages into one tensor in page order (kernels/place.cpp,
+    backwards). After 20 its of Small a third of the state pages hold anything: the unused slots of a cell's face
+    row stay zero. ranges: state_pages, inside a core's HPG pages."""
     import ttnn
-    try:
-        x = ttnn.reshape(t, ttnn.Shape([P, HPG, LANES]))
-        parts = []
-        for lo, hi in ranges:
-            y = ttnn.slice(x, [0, lo, 0], [P, hi, LANES])
-            parts.append(ttnn.to_torch(y, mesh_composer=ttnn.ConcatMeshToTensor(md, dim=0)).numpy().view(np.uint32))
-            ttnn.deallocate(y)
-    except Exception as e:   # a ttnn without the mesh slice: chip by chip
-        print("download_state_pages: mesh slice failed (%s), reading chip by chip" % str(e).splitlines()[0][:120], flush=True)
-        return lambda d: download_home_pages(t, d, P, HPG, ranges)
-    return spread_pages(parts, P, HPG, ranges)
+    K, W, rows = len(DEVBLK), 2 * len(cores), P * HPG
+    read = lambda x: ttnn.to_torch(x, mesh_composer=ttnn.ConcatMeshToTensor(md, dim=0)).numpy().view(np.uint32)
+    t0 = time.time()
+    m0, geo = page_map(np.zeros(rows, bool), W)
+    mw = m0.shape[1]
+    alloc = lambda r, w: ttnn.allocate_tensor_on_device(ttnn.Shape([r, w]), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
+    t_map = alloc(W, mw)
+    workers(md, cells, grid, cores, DEVBLK, "scan.cpp", [4 * mw, NB, HPG, len(ranges)], [t, t_map], t_map,
+            [x for r in ranges for x in r], lambda k: [g[:3] for g in geo], 4 * mw + 4096 * NB)
+    t1 = time.time()
+    on = [map_pages(m, rows) for m in read(t_map).reshape(K, W, mw)]
+    S = max(int(o.sum()) for o in on)
+    t_stage = alloc(S + 1, LANES)
+    workers(md, cells, grid, cores, DEVBLK, "place.cpp", [4 * mw, NB, 1], [t, t_stage, t_map], t_stage, [S],
+            lambda k: page_map(on[DEVBLK.index(k)], W)[1], 4 * mw + 4096 * (NB + 1))
+    t2 = time.time()
+    x = read(t_stage).reshape(K, S + 1, LANES)
+    ttnn.deallocate(t_stage)
+    ttnn.deallocate(t_map)
+    if os.environ.get("CFD_UPLOAD_PROFILE"):
+        print("state download: %d of %d state pages per chip not zero, scan and map %.2f s, collect %.2f s, read %.2f s"
+              % (S, P * sum(h - l for l, h in ranges), t1 - t0, t2 - t1, time.time() - t2), flush=True)
+    return lambda d: Pages(x[d], np.where(on[d], np.cumsum(on[d]) - 1, S).reshape(P, HPG))
 
 
 def spread_pages(parts, P, HPG, ranges):
@@ -374,20 +406,3 @@ def spread_pages(parts, P, HPG, ranges):
             out[:, lo:hi] = h[d * P:(d + 1) * P]
         return out
     return pages
-
-
-def download_home_pages(t, d, P, HPG, ranges):
-    """Device d's homes as (P, HPG, LANES) uint32 with only the page ranges read (the rest zero): each range is a slice
-    of every core's homes, cut on the device, so the host reads the state pages and not the whole matrix."""
-    import ttnn
-    out = np.zeros((P, HPG, LANES), np.uint32)
-    try:
-        x = ttnn.reshape(ttnn.get_device_tensors(t)[d], ttnn.Shape([P, HPG, LANES]))
-        for lo, hi in ranges:
-            y = ttnn.slice(x, [0, lo, 0], [P, hi, LANES])
-            out[:, lo:hi] = ttnn.to_torch(y).numpy().view(np.uint32)
-            ttnn.deallocate(y)
-    except Exception as e:   # a ttnn without a per-device slice: read the whole homes
-        print("download_home_pages: device slice failed (%s), reading all %d pages" % (str(e).splitlines()[0][:120], HPG), flush=True)
-        out = download_chip(t, d).reshape(P, HPG, LANES)
-    return out

@@ -1013,7 +1013,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
     if IMG is not None:   # chip k's DRAM homes come back from the device that ran block k
         dev_of = {DEVBLK[d]: d for d in range(K)}
         pr = image_dev.state_pages(IMG)
-        home_pages = home_pages or image_dev.download_state_pages(md, t_home, P, HPG, pr)
+        home_pages = home_pages or image_dev.download_state(md, cells, grid, cores, DEVBLK, t_home, P, HPG, pr)
         dev_state = IMG.state(lambda k: o[k * P:(k + 1) * P, 1024:].reshape(P, nv, 1024).view(np.float32),
                               lambda k: home_pages(dev_of[k]).view(np.float32))
         print("state: %d of %d home pages read, ranges %s" % (sum(h - l for l, h in pr), HPG, pr), flush=True)
