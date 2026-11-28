@@ -118,8 +118,8 @@ void kernel_main() {
     // its Tensix pipeline before a load or an acquire (its own queued work), issues it, and drains again: the post of
     // that drain lands when the unpacker (the packer) has let the instruction through, and each poll's cycles go to the
     // state published at that poll: loads to hdr 700 + 2 (16 unpack state + reader class), acquires to 960 + 2 pack
-    // state, own work to 976, the load's after-drain to 978, the last poll of each kind to 980 + 2 kind and of the load's
-    // poll to 986 (two words each: low, high); counts at 988..990
+    // state, own work to 976, the after-drains to 978 (load) and 992 (acquire), the last poll of each drain kind to
+    // 980 + 2 kind, of the load's poll to 986, of the acquire's to 994 (two words each: low, high); counts at 988..990
 #define USTATE(s) UNPACK((hw[300] = (s)))
 #define PSTATE(s) PACK((hw[301] = (s)))
 #ifdef TRISC_MATH
@@ -146,13 +146,13 @@ void kernel_main() {
         }
     };
     // kind 0: after a load (cross-check of mload's poll, to 978: only the get and the four clears are left), 1: after an
-    // acquire (PACK's state), 2: own work
+    // acquire (cross-check of macq's poll, to 992: nothing is left), 2: own work (976)
     auto mdrain = [&](uint32_t kind) {
         uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
         ckernel::t6_semaphore_wait_on_max<ckernel::p_stall::STALL_SYNC>(ckernel::semaphore::MATH_DONE);
         ckernel::t6_semaphore_post<ckernel::p_stall::MATH | ckernel::p_stall::WAIT_SFPU>(ckernel::semaphore::MATH_DONE);
         while (ckernel::semaphore_read(ckernel::semaphore::MATH_DONE) == 0) {
-            const uint32_t i = kind == 0 ? 978 : kind == 1 ? 960 + 2 * (hw[301] & 7) : 976;
+            const uint32_t i = kind == 0 ? 978 : kind == 1 ? 992 : 976;
             const uint32_t t = static_cast<uint32_t>(ckernel::read_wall_clock());
             wadd(i, t - tp);
             tp = t;
@@ -182,14 +182,32 @@ void kernel_main() {
         for (uint32_t f = 0; f < 4; ++f) TT_ZEROACC(p_zeroacc::CLR_16, 1, 1, ADDR_MOD_3, ckernel::math::get_dest_index_in_faces(lt, f));
         mdrain(0);
     };
+    // an acquire's wait for the packer, polled on the RISC-V before the acquire is issued: MATH_PACK counts the dest
+    // sections committed and not yet released, the acquire stalls while it is at its maximum (2 with SyncHalf, 1 with
+    // SyncFull). Each poll's cycles go to 960 + 2 pack state, the last poll to 994
+    auto macq = [&]() {
+        constexpr uint32_t mpmax = (DST_SYNC_MODE == DstSync::SyncFull) ? 1 : 2;
+        mdrain(2);
+        uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
+        while (ckernel::semaphore_read(ckernel::semaphore::MATH_PACK) >= mpmax) {
+            const uint32_t i = 960 + 2 * (hw[301] & 7);
+            const uint32_t t = static_cast<uint32_t>(ckernel::read_wall_clock());
+            wadd(i, t - tp);
+            tp = t;
+        }
+        wadd(994, static_cast<uint32_t>(ckernel::read_wall_clock()) - tp);
+    };
 #define MDRAIN(k) MATH((mdrain(k)))
+#define MACQ() MATH((macq()))
 #else
 #define MDRAIN(k)
+#define MACQ()
 #endif
 #else
 #define USTATE(s)
 #define PSTATE(s)
 #define MDRAIN(k)
+#define MACQ()
 #endif
 #ifdef CFD_PROFW
 #define COPY_TILE(cb, i, d) do { UNPACK((llk_unpack_A<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, UnpackToDestEn>(cb, i))); MATH((mload(d))); } while (0)
@@ -285,7 +303,7 @@ void kernel_main() {
 #endif
         switch (op) {
             case C_END: run = false; break;
-            case C_ACQ: MDRAIN(2); tile_regs_acquire(); MDRAIN(1); break;
+            case C_ACQ: MACQ(); tile_regs_acquire(); MDRAIN(1); break;
             case C_COMMIT: tile_regs_commit(); tile_regs_wait(); break;
             case C_REL: tile_regs_release(); break;
             case C_LD: LDI(cb_v); COPY_TILE(cb_v, (w >> 16) + to, a); break;

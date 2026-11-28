@@ -5,7 +5,8 @@
 # iterations; the timeout is only the net under a hang, and a leg it ends stops the chain. D31: no FLX node open
 # inside a booked window.
 #   A = stock op words (--blocks 0), B = generated bodies (--blocks 1, C_BLK), X = broken arm (--blocks 2).
-# Legs: A0 B0 (each image's first run: discarded) A1 B1 A2 B2, then X if its image exists. flx-sol's and flx-asm's
+# Legs (env LEGS, NAME:ARM ...): A0 B0 (each image's first run: discarded) A1 B1 A2 B2, then X if its image exists.
+# In front of every leg (D34.3): ~/flx/slotwait.sh kernel <pair> <leg s>, ~/flx/winwait.sh, then the pair's flock. flx-sol's and flx-asm's
 # protocol to the letter (tools/leg.sh, exp7b.sh): same run flags, same start state, same 1x2 descriptor.
 # A leg takes 215-231 s of process wall on the control; one starts only if the last leg's wall + 30 s (300 s before
 # the first) ends by END and 3 minutes before the next booked window; a leg that does not fit before a window waits
@@ -20,7 +21,8 @@
 # Status: logs/chainK.status, one line a leg with host= chip= sha= aiclk= n= and the state digest;
 # `python3 run/absum.py logs/chainK.status sk` prints the lines with the in-run clock, the means and the digest gate.
 K=$HOME/flx/kernel; R=$K/run; L=$K/logs; SB=$HOME/flx/sol; ST=$L/chainK.status; [ -n "$DRY" ] && ST=$L/chainKdry.status
-CHIPS=${CHIPS:-6,7}; LOCK=${LOCK:-$HOME/flx/locks/c67}; ITS=${ITS:-100}; LEGTMO=${LEGTMO:-480}
+CHIPS=${CHIPS:-6,7}; PAIR=c${CHIPS//,/}; LOCK=${LOCK:-$HOME/flx/locks/$PAIR}; ITS=${ITS:-100}; LEGTMO=${LEGTMO:-480}
+LEGS=${LEGS:-A0:A B0:B A1:A B1:B A2:A B2:B X:X}
 T=${TREE:-$R/sktree}; SHA=$(cat $T.sha 2>/dev/null)
 CTL=$SB/img/small_k2_jac; CDIG=f95cbd4a993426ef94b88ce31aacccbe458fa9eb4ab85e86dce8cf78b6ed10db
 if [ -z "$AIMG" ]; then AIMG=$CTL; [ -e $R/img/skA.ready ] && AIMG=$R/img/skA; fi
@@ -71,6 +73,12 @@ leg() { # NAME ARM -> run_mesh's rc; 8 the arm's image is not ready, 9 it would 
     st "$n rc=0 img=$(basename $img) blocks=$b host=anx-glx chip=$CHIPS sha=$SHA aiclk=000..000 samples=0 ms_device= digest= (DRY)"
     return 0
   fi
+  # D34.3: the slot is the order, the window check is the box's, the flock is the mutex. slotwait waits for a later slot
+  # of this row on the pair by itself; rc 5 = no slot left (a note to the orchestrator, the chain ends)
+  $HOME/flx/slotwait.sh kernel $PAIR $EST >> $L/chainK.slotwait 2>&1; rc=$?
+  [ $rc != 0 ] && { st "$n not started: slotwait kernel $PAIR $EST rc=$rc (5 = no slot of flx-kernel left on $PAIR, 3 = HANDBACK, 4 = gave up)"; exit 6; }
+  $HOME/flx/winwait.sh $EST ${CHIPS//,/ } >> $L/chainK.winwait 2>&1; rc=$?
+  [ $rc != 0 ] && { st "$n not started: winwait rc=$rc"; exit 6; }
   while :; do
     [ -e $HOME/fleet/HANDBACK ] && { st "$n refused: HANDBACK"; exit 3; }
     [ $(now) -gt $GIVEUP ] && { st "$n: gave up"; exit 5; }
@@ -108,7 +116,7 @@ st "chainK armed pid $$ chips $CHIPS lock $LOCK tree $T ($SHA) its $ITS start $(
 [ -d $T/ttfluid ] || { st "no tree at $T: not started"; exit 2; }
 [ -e $TT_MESH_GRAPH_DESC_PATH ] || { st "no 1x2 descriptor: not started"; exit 2; }
 while [ $(now) -lt $START ]; do sleep 5; done
-for l in A0:A B0:B A1:A B1:B A2:A B2:B X:X; do
+for l in $LEGS; do
   n=${l%%:*}; arm=${l##*:}
   leg sk_$n $arm; r=$?
   [ $r = 9 ] && break
