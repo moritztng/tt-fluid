@@ -604,11 +604,18 @@ elif IMG is not None:   # chip by chip: chip k's arrays are built from its image
             STATE = {k: z[k] for k in z.files if k != "hist"}
         print("state from %s" % a.state_in, flush=True)
         stamp("state read")
-    filled = lambda name: (image_dev.chip_shape(IMG, P, name), lambda k, out: image_dev.chip_fill(IMG, k, P, name, out, STATE))
+    filled = lambda name: (image_dev.chip_shape(IMG, P, name),
+                           lambda k, out, row=None: image_dev.chip_fill(IMG, k, P, name, out, STATE, row))
+    # constants and homes are mostly zero pages: the host writes the pages that hold a value, the chips lay the array
+    staged = {name: image_dev.Staged(DEVBLK, *filled(name), lambda k, name=name: image_dev.chip_pages(IMG, k, P, name, STATE))
+              for name in ("consts", "home")}
+    staged = {name: sg for name, sg in staged.items() if sg.sparse}
     # an array's host tensor is built while the array before it is written to the chips
     ahead = ThreadPoolExecutor(1)
-    pre = lambda name: ahead.submit(image_dev.host_shards, md, K, DEVBLK, *filled(name))
-    up = lambda name, host=None: image_dev.upload(md, K, DEVBLK, *filled(name), name, host)
+    pre = lambda name: ahead.submit(image_dev.host_shards, md, K, DEVBLK,
+                                    *((staged[name].shape, staged[name].fill) if name in staged else filled(name)))
+    up = lambda name, host=None: (image_dev.upload_placed(md, cells, grid, cores, DEVBLK, staged[name], name, host) if name in staged
+                                  else image_dev.upload(md, K, DEVBLK, *filled(name), name, host))
     h_const = pre("consts")
     t_arena = up("arena")
     h_home = pre("home")

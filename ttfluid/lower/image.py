@@ -194,10 +194,11 @@ class Image:
             self._members[k, spn] = core[o], lane[o] // LANES, lane[o] % LANES, ids[o]
         return self._members[k, spn]
 
-    def put_state(self, k, arena, home, state):
+    def put_state(self, k, arena, home, state, home_row=None):
         """The inverse of state() for chip k: write name -> global array (state()'s layout) into chip k's arena
         (P, ntiles, LANES) and DRAM homes (P, hpages, LANES), fp32 views, in place, so the next launch starts from it
-        (a restart). Either array may be None to write only the other. A register the lowering kept as a constant
+        (a restart). Either array may be None to write only the other. home_row: the homes are staged, home is
+        (rows, LANES) and home_row[core, page] the row that holds a page. A register the lowering kept as a constant
         must already hold the value: a state that changes one cannot be loaded into these images. The components of
         a name are gathered together, one row per element, and each register is written on its own thread (numpy
         indexing releases the GIL): Small k2 lays 122 M values over a chip's homes."""
@@ -223,11 +224,13 @@ class Image:
                 core, tile, lane, ids = self.members(k, spn)
                 if g is None:
                     g = v[ids]
-                jobs.append(_READERS.submit(put, X, (core, tt + tile, lane), g[:, i]))
+                idx = (core, tt + tile, lane) if X is arena or home_row is None else (home_row[core, tt + tile], lane)
+                jobs.append(_READERS.submit(put, X, idx, g[:, i]))
         for j in jobs:
             j.result()
 
 
+PAGE = 4 * LANES                           # bytes of a DRAM page: one row of the constants or the homes
 GAP, CHUNK, IOV = 1 << 18, 1 << 26, 1024   # read_into: stored ranges closer than GAP share a read of at most CHUNK bytes
 _SCRATCH = memoryview(bytearray(GAP))      # where the zeros between them go (never read; shared by all readers)
 _READERS = ThreadPoolExecutor(int(os.environ.get("CFD_IMG_THREADS", 8)))   # preadv and numpy indexing release the GIL
@@ -246,36 +249,61 @@ class _ChipFiles(dict):
     def get(self, name, default=None):
         return self[name] if name in self else default
 
-    def read_into(self, name, out):
-        """Array `name` read into out, a zeroed C-contiguous buffer of its byte size, from the byte ranges the file
-        stores. write_chip left the zero pages as holes and a hole is not read, so its pages of out stay untouched:
-        they take no time and no RAM (Small k2: 5.3 of 27.3 GB is stored). The zero rows of the constants sit between
-        data every ~60 KB and one read per stored range is slow, so ranges closer than GAP share one vectored read
-        whose zeros between them land in a scratch buffer, not in out."""
+    def stored(self, name):
+        """(f, off, end, ranges): the open file of array `name`, the file offsets where its data starts and ends, and
+        the byte ranges [(lo, hi), ...] the file stores. write_chip left the zero pages as holes."""
+        f = open(dict.__getitem__(self, name), "rb")
+        major, _ = np.lib.format.read_magic(f)
+        (np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0)(f)
+        off, fd = f.tell(), f.fileno()
+        end = os.fstat(fd).st_size
+        ranges, p = [], off
+        while p < end:
+            try:
+                a = os.lseek(fd, p, os.SEEK_DATA)
+            except OSError:      # ENXIO: a hole to the end of the file
+                break
+            p = os.lseek(fd, a, os.SEEK_HOLE)
+            ranges.append((a, p))
+        return f, off, end, ranges
+
+    def pages(self, name):
+        """One bool per PAGE bytes of array `name`: the file stores some of the page. A page that is False is zero."""
+        f, off, end, ranges = self.stored(name)
+        f.close()
+        r = np.array(ranges, np.int64).reshape(-1, 2) - off
+        step = np.zeros(-(-(end - off) // PAGE) + 1, np.int32)
+        np.add.at(step, r[:, 0] // PAGE, 1)
+        np.add.at(step, -(-r[:, 1] // PAGE), -1)
+        return np.cumsum(step[:-1]) > 0
+
+    def read_into(self, name, out, row=None):
+        """Array `name` read into out, a zeroed C-contiguous buffer, from the byte ranges the file stores. A hole is
+        not read, so its pages of out stay untouched: they take no time and no RAM (Small k2: 5.3 of 27.3 GB is
+        stored). row: out holds only the pages pages() marks, page p in row row[p] (a staged upload); without it out
+        is the whole array. The zero rows of the constants sit between data every ~60 KB and one read per stored range
+        is slow, so ranges closer than GAP share one vectored read whose zeros between them land in a scratch buffer,
+        not in out."""
         buf = memoryview(out).cast("B")
-        with open(dict.__getitem__(self, name), "rb") as f:
-            major, _ = np.lib.format.read_magic(f)
-            (np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0)(f)
-            off, fd = f.tell(), f.fileno()
-            end = os.fstat(fd).st_size
-            assert end - off == len(buf), (name, end - off, len(buf))
-            reads, p, last = [], off, None      # a read: [file offset, bytes, [memoryview, ...]], contiguous in the file
-            while p < end:
-                try:
-                    a = os.lseek(fd, p, os.SEEK_DATA)
-                except OSError:      # ENXIO: a hole to the end of the file
-                    break
-                p = os.lseek(fd, a, os.SEEK_HOLE)
+        f, off, end, ranges = self.stored(name)
+        with f:
+            fd = f.fileno()
+            assert end - off == (len(buf) if row is None else len(row) * PAGE), (name, end - off, len(buf))
+            # where the byte at file offset x goes: a stored range is whole pages in a row, so it stays one piece
+            at = (lambda x: x - off) if row is None else (lambda x: int(row[(x - off) // PAGE]) * PAGE + (x - off) % PAGE)
+            reads, last = [], None      # a read: [file offset, bytes, [memoryview, ...]], contiguous in the file
+            for a, p in ranges:
                 for lo in range(a, p, CHUNK):
                     hi = min(lo + CHUNK, p)
                     r = reads[-1] if reads else None
+                    piece = buf[at(lo):at(lo) + hi - lo]
                     if r is not None and lo - last <= GAP and len(r[2]) + 2 <= IOV and r[1] + hi - last <= CHUNK:
                         if lo > last:
                             r[2].append(_SCRATCH[:lo - last])
-                        r[2].append(buf[lo - off:hi - off])
+                        r[2].append(piece)
                         r[1] += hi - last
                     else:
-                        reads.append([lo, hi - lo, [buf[lo - off:hi - off]]])
+                        reads.append([lo, hi - lo, [piece]])
                     last = hi
 
             def read(lo, size, views):
