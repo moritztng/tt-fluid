@@ -1087,13 +1087,30 @@ class Machine:
             if k:
                 self._allocate()
         self.dedup = dedup
-        self._pre_place = (list(self.mir), dict(self.phys), self.ntiles, self.nvec, self.nsmall)
+        self._pre_place = self._snap()
         self.place(l1_vec, log)
+
+    def _snap(self):
+        return (list(self.mir), dict(self.phys), self.ntiles, self.nvec, self.nsmall,
+                len(self.space), dict(self.ext), self.adj, list(self.vsize0), list(self.vslots),
+                dict(self.hphys), dict(self.halo_plan), list(self.hoff), self.hwords, self.hwords_plan,
+                self.nhalo, set(self.live_entry), self.halo_peak, self.halo_peak_readers)
+
+    def _restore(self, snap):
+        (mir, phys, self.ntiles, self.nvec, self.nsmall, nsp, ext,
+         self.adj, vsize0, vslots, hphys, halo_plan, hoff,
+         self.hwords, self.hwords_plan, self.nhalo, live_entry,
+         self.halo_peak, self.halo_peak_readers) = snap
+        self.mir, self.phys = list(mir), dict(phys)
+        del self.space[nsp:]
+        self.ext = dict(ext)
+        self.vsize0, self.vslots = list(vsize0), list(vslots)
+        self.hphys, self.halo_plan, self.hoff = dict(hphys), dict(halo_plan), list(hoff)
+        self.live_entry = set(live_entry)
 
     def place(self, l1_vec, log=lambda *a: None):
         """(Re)do the L1/DRAM placement and the syncs for l1_vec vector slots in L1 (None: all)."""
-        mir, phys, self.ntiles, self.nvec, self.nsmall = self._pre_place
-        self.mir, self.phys = list(mir), dict(phys)
+        self._restore(self._pre_place)
         self._place(l1_vec)
         if self.dedup:
             self._dedup()
@@ -2057,6 +2074,22 @@ class Machine:
         self.adj = adj
         self.live_entry = live0
 
+    @staticmethod
+    def _loop_regions(mir):
+        """Single-entry single-exit innermost loop regions: list of (i, j, lo, hi) sorted by i."""
+        labels = {ins[1]: i for i, ins in enumerate(mir) if ins[0] == "label"}
+        jumps = {k: labels[ins[-1]] for k, ins in enumerate(mir) if ins[0] in ("jump", "jumpif")}
+        back = [(t, k) for k, t in jumps.items() if t < k]
+        inner = [(i, j) for i, j in back if not any((a, b) != (i, j) and i <= a and b <= j for a, b in back)]
+        out = []
+        for i, j in sorted(inner):
+            hi = max([t for k, t in jumps.items() if i <= k <= j] + [j])         # the last exit label
+            lo = min([k for k, t in jumps.items() if k < i and i <= t <= hi] + [i])   # the first jump that skips the loop
+            if any((lo <= k <= hi) != (lo <= t <= hi) for k, t in jumps.items()) or mir[hi][0] not in ("label", "jumpif"):
+                continue
+            out.append((i, j, lo, hi))
+        return out
+
     def _split_loops(self, l1_vec, cold=False):
         """lsplit: free the L1 colours that values merely live across a Krylov loop hold while it runs. A written vector
         with an L1 colour that the solve neither reads nor writes is copied to a new register in front of it and back
@@ -2073,28 +2106,19 @@ class Machine:
         of (loop, register) splits."""
         if l1_vec is None or self.T == 1:
             return 0
-        snap = (self.mir, dict(self.phys), self.ntiles, self.nvec, self.nsmall)
-        self.mir = list(self.mir)
+        snap = self._snap()
         self._place(l1_vec)          # trial: who holds a colour without the split
         isv = lambda r: isinstance(r, int) and self.is_vec(r)
-        l1 = {r for r in self.phys if isv(r) and r not in self.dram and r not in self.ovl}
+        l1 = {r for r in self.phys if isv(r) and r not in self.dram and r not in self.ovl and r not in self.span_held}
         dram = set(self.dram)
-        self.mir, self.phys, self.ntiles, self.nvec, self.nsmall = snap
+        self._restore(snap)
         mir = self.mir
-        labels = {ins[1]: i for i, ins in enumerate(mir) if ins[0] == "label"}
-        jumps = {k: labels[ins[-1]] for k, ins in enumerate(mir) if ins[0] in ("jump", "jumpif")}
-        back = [(t, k) for k, t in jumps.items() if t < k]
-        inner = [(i, j) for i, j in back if not any((a, b) != (i, j) and i <= a and b <= j for a, b in back)]
         ud, live_in, _ = _liveness(mir)
         touch = lambda ins: [r for x in (ins[1] if ins[0] == "seg" else [ins]) for r in _mir_uses(x) + _mir_defs(x)]
         writes = {r for ins in mir if ins[0] != "fetch" for r in _mir_defs(ins)}
         fetched = getattr(self, "fetched_from", {})
         front, behind, n = defaultdict(list), defaultdict(list), 0
-        for i, j in sorted(inner):
-            hi = max([t for k, t in jumps.items() if i <= k <= j] + [j])         # the last exit label
-            lo = min([k for k, t in jumps.items() if k < i and i <= t <= hi] + [i])   # the first jump that skips the loop
-            if any((lo <= k <= hi) != (lo <= t <= hi) for k, t in jumps.items()) or mir[hi][0] not in ("label", "jumpif"):
-                continue
+        for i, j, lo, hi in self._loop_regions(mir):
             if not {r for ins in mir[i:j + 1] for r in touch(ins)} & dram:
                 continue
             cnt = Counter(r for ins in mir[lo:hi + 1] for r in touch(ins))
@@ -2121,21 +2145,9 @@ class Machine:
             self.mir = [x for k, ins in enumerate(mir) for x in front.get(k, []) + [ins] + behind.get(k, [])]
         return n
 
-    # ---- DRAM homes. With l1_vec set (and T > 1), only that many vector slots stay in L1; the rest live in DRAM, each
-    # as many pages per core as its widest register's tiles, packed: phys DBASE + the slot's tile offset, page core *
-    # hpages + offset + tile. A DRAM-homed fetched constant is read in place from its DRAM constant pages (phys KBASE +
-    # the constant's tile offset coff, page core * cpages + offset + tile; no fetch). Compute reaches a DRAM vector only through rings: a
-    # load becomes ("ldr", slot, reg, shift, mid, halos), whose page the reader (agent N) builds (the source tile
-    # read at the shift, or zeros, then the gather residue of map `mid` patched in), and a store goes to the writer
-    # (agent B). A split gather (offset/zero block + residue gather) touching a DRAM vector becomes one ldr block.
-    def _place(self, l1_vec):
-        self.dram, self.alias, self.ndram, self.hpages, self.dslots = set(), {}, 0, 0, []
-        self.ovl, self.ovdev, self.ovwid, self.locmap = {}, {}, {}, {}
-        vsize = self.vsize0
-        self.vslots = [(self.nsmall + o, n) for o, n in zip(np.cumsum([0] + vsize[:-1]), vsize)] if vsize else []
-        # l1_vec counts T-tile slots: a budget of l1_vec * T tiles, so narrower multigrid slots pack more per budget
-        if l1_vec is None or self.T == 1 or l1_vec * self.T >= sum(vsize):
-            return
+    def _wplace_color(self, l1_vec, first=()):
+        """Weighted per-register colouring (wplace >= 1). Registers in `first` are coloured ahead of weight order
+        (never overlaid on one-tile slots), so non-interfering span copies share colour 0 deterministically."""
         mir, phys, T = self.mir, self.phys, self.T
         # a use weighs the passes its loops typically make: the trace's hint per loop (a pressure solve runs hundreds,
         # a smoother a few), 10 for a loop without one; this picks what lives in L1 and never changes results
@@ -2160,40 +2172,104 @@ class Machine:
             for r in regs:
                 if r in phys and isv(r):
                     rweight[r] += passes[j]
-        if self.wplace:
-            # per register, heaviest first: the lowest of l1_vec L1 colours no interfering register holds, else a
-            # DRAM colour the same way (a slot-wise pick leaves a loop's L1 slots idle through the outer body). An L1
-            # colour is T tiles wide whatever the registers in it (a narrower multigrid value fills the front of its
-            # slot); DRAM colours are per tile count, so a coarse level never pays a fine slot's pages
-            # a fetched constant read by one instruction stays in place in DRAM: a colour would add a fetch copy
-            # before that one read (K10 gave 103 such temps colours and its p solve ran 25 % slower than K8)
-            nread = Counter(r for ins in mir for r in set(_mir_uses(ins)))
-            wr = {r for ins in mir if ins[0] != "fetch" for r in _mir_defs(ins)}
-            inplace = {r for r in getattr(self, "fetched_from", {}) if r not in wr and nread[r] <= 1}
-            vslot, col, dcol = {}, {}, {}
-            order = sorted((r for r in phys if isv(r) and r not in inplace), key=lambda r: (-rweight[r], str(r)))
-            ovl = self._overlay(order, T, isv) if self.wplace >= 2 else {}
-            for r in order:
-                if r in ovl:
-                    vslot[r] = ("ovl", ovl[r])
-                    continue
-                used = {col[y] for y in self.adj[r] if y in col}
-                c = next((c for c in range(l1_vec) if c not in used), None)
-                if c is not None:
-                    col[r] = vslot[r] = c
-                else:
-                    n = self.size(r)
-                    used = {dcol[y] for y in self.adj[r] if y in dcol}
-                    d = 0
-                    while (n, d) in used:
-                        d += 1
-                    dcol[r] = vslot[r] = (n, d)
-            vslot = vslot.get
-            keep = list(range(1 + max(col.values(), default=-1)))
-            vsize = {c: T for c in keep}
-            vsize.update({c: c[0] for c in set(dcol.values())})
-            dslot = {c: i for i, c in enumerate(sorted(set(dcol.values()), key=lambda c: (-c[0], c[1])))}
+        # per register, heaviest first: the lowest of l1_vec L1 colours no interfering register holds, else a
+        # DRAM colour the same way (a slot-wise pick leaves a loop's L1 slots idle through the outer body). An L1
+        # colour is T tiles wide whatever the registers in it (a narrower multigrid value fills the front of its
+        # slot); DRAM colours are per tile count, so a coarse level never pays a fine slot's pages
+        # a fetched constant read by one instruction stays in place in DRAM: a colour would add a fetch copy
+        # before that one read (K10 gave 103 such temps colours and its p solve ran 25 % slower than K8)
+        nread = Counter(r for ins in mir for r in set(_mir_uses(ins)))
+        wr = {r for ins in mir if ins[0] != "fetch" for r in _mir_defs(ins)}
+        inplace = {r for r in getattr(self, "fetched_from", {}) if r not in wr and nread[r] <= 1}
+        first_set = set(first)
+        vslot, col, dcol = {}, {}, {}
+        order = sorted((r for r in phys if isv(r) and r not in inplace and r not in first_set),
+                       key=lambda r: (-rweight[r], str(r)))
+        ovl = self._overlay(order, T, isv) if self.wplace >= 2 else {}
+        for r in sorted(first_set, key=str) + order:
+            if r in ovl:
+                vslot[r] = ("ovl", ovl[r])
+                continue
+            used = {col[y] for y in self.adj[r] if y in col}
+            c = next((c for c in range(l1_vec) if c not in used), None)
+            if c is not None:
+                col[r] = vslot[r] = c
+            else:
+                n = self.size(r)
+                used = {dcol[y] for y in self.adj[r] if y in dcol}
+                d = 0
+                while (n, d) in used:
+                    d += 1
+                dcol[r] = vslot[r] = (n, d)
+        keep = list(range(1 + max(col.values(), default=-1)))
+        vsize = {c: T for c in keep}
+        vsize.update({c: c[0] for c in set(dcol.values())})
+        dslot = {c: i for i, c in enumerate(sorted(set(dcol.values()), key=lambda c: (-c[0], c[1])))}
+        return vslot, col, dcol, ovl, keep, vsize, dslot
+
+    # ---- DRAM homes. With l1_vec set (and T > 1), only that many vector slots stay in L1; the rest live in DRAM, each
+    # as many pages per core as its widest register's tiles, packed: phys DBASE + the slot's tile offset, page core *
+    # hpages + offset + tile. A DRAM-homed fetched constant is read in place from its DRAM constant pages (phys KBASE +
+    # the constant's tile offset coff, page core * cpages + offset + tile; no fetch). Compute reaches a DRAM vector only through rings: a
+    # load becomes ("ldr", slot, reg, shift, mid, halos), whose page the reader (agent N) builds (the source tile
+    # read at the shift, or zeros, then the gather residue of map `mid` patched in), and a store goes to the writer
+    # (agent B). A split gather (offset/zero block + residue gather) touching a DRAM vector becomes one ldr block.
+    def _place(self, l1_vec):
+        self.dram, self.alias, self.ndram, self.hpages, self.dslots = set(), {}, 0, 0, []
+        self.ovl, self.ovdev, self.ovwid, self.locmap = {}, {}, {}, {}
+        self.span_held, self.span_src = set(), {}
+        vsize = self.vsize0
+        self.vslots = [(self.nsmall + o, n) for o, n in zip(np.cumsum([0] + vsize[:-1]), vsize)] if vsize else []
+        # l1_vec counts T-tile slots: a budget of l1_vec * T tiles, so narrower multigrid slots pack more per budget
+        if l1_vec is None or self.T == 1 or l1_vec * self.T >= sum(vsize):
+            return
+        mir, phys, T = self.mir, self.phys, self.T
+        isv = lambda r: r != "__anchor__" and not isinstance(r, tuple) and self.is_vec(r)
+        span3 = self.span >= 3 and l1_vec >= 1
+        if span3:
+            # --span 3: the span shares colour 0 with the Krylov loops (no extra L1 slot). A trial placement with
+            # l1_vec - 1 colours finds the DRAM-homed vectors outside loops; _span_fill inserts unpinned copies only
+            # outside innermost loop regions; _allocate builds exact interference with those copies; final colouring
+            # places all span copies first into colour 0 and colours everything else around them (both colours free
+            # inside Krylov loops where no span copy is live).
+            assert self.wplace, "--span 3 needs --wplace"
+            _, col0, _, ovl0, _, _, _ = self._wplace_color(l1_vec - 1)
+            writes0 = {r for ins in mir if ins[0] != "fetch" for r in _mir_defs(ins)}
+            D0 = {r for r in phys if isv(r) and r not in ovl0 and r not in col0}
+            alias0 = {r for r in D0 if r in self.fetched_from and r not in writes0}
+            skip = {k for _, _, lo, hi in self._loop_regions(mir) for k in range(lo, hi + 1)}
+            mir = self._span_fill(mir, D0, None, alias=alias0, skip=skip)
+            if self.span_held:
+                self.mir = mir
+                self._allocate()
+                mir, phys = self.mir, self.phys
+            vslot_d, col, dcol, ovl, keep, vsize, dslot = self._wplace_color(l1_vec, first=self.span_held)
+            assert all(col.get(h) == 0 for h in self.span_held), "span 3: a span copy missed colour 0"
+            vslot = vslot_d.get
+        elif self.wplace:
+            vslot_d, col, dcol, ovl, keep, vsize, dslot = self._wplace_color(l1_vec)
+            vslot = vslot_d.get
         else:
+            labels = {ins[1]: i for i, ins in enumerate(mir) if ins[0] == "label"}
+            trips = getattr(self.prog, "trips", {})
+            passes = np.ones(len(mir))
+            for j, ins in enumerate(mir):
+                if ins[0] in ("jump", "jumpif") and labels[ins[-1]] < j:
+                    passes[labels[ins[-1]]:j + 1] *= trips.get(ins[-1], 10)
+            rweight = Counter()
+            for j, ins in enumerate(mir):
+                regs = []
+                if ins[0] in ("blk", "seg"):
+                    regs = [r for b in ([ins] if ins[0] == "blk" else ins[1])
+                            for r in [u[2] for u in b[1] if u[0] in ("ld", "lds", "ldr") and u[2] is not None] +
+                            [y for u in b[1] if u[0] == "ldr" for y, _ in u[5]] + [r for _, r in b[2]]]
+                elif ins[0] == "gather":
+                    regs = [ins[1]] + [x for x, _ in ins[3]]
+                elif ins[0] == "halo":
+                    regs = [ins[2]]
+                for r in regs:
+                    if r in phys and isv(r):
+                        rweight[r] += passes[j]
             slot_at = {b: c for c, (b, _) in enumerate(self.vslots)}
             vslot = lambda r: slot_at[phys[r]]
             weight = Counter()
@@ -2208,7 +2284,7 @@ class Machine:
                     used += vsize[c]
             keep.sort()
             dslot = {c: i for i, c in enumerate(c for c in range(self.nvec) if c not in keep)}
-        span = "span" if self.span else None
+        span = "span" if self.span in (1, 2) else None
         if span:   # one more L1 slot of T tiles that no register is coloured into (_span_fill)
             keep = list(keep) + [span]
             vsize = dict(vsize) if isinstance(vsize, dict) else dict(enumerate(vsize))
@@ -2265,7 +2341,13 @@ class Machine:
         D = self.dram
         if span:
             mir = self._span_fill(mir, D, self.nsmall + newc[span])
-        spanh = self.span_held if span and self.span >= 2 else ()   # --span 2: a gather from the span is a page for any destination
+        elif span3:
+            l1_src = sum(1 for s in self.span_src.values() if s not in D)
+            nfill, npage, skipped = self.span_stat
+            self._log("span 3: %d gathers read colour 0 (tile %d), %d fills (%d from L1), kept on today's path: %s" % (
+                npage, self.nsmall + newc[0] if 0 in newc else -1, nfill, l1_src,
+                ", ".join("%s %d" % kv for kv in sorted(skipped.items())) or "none"))
+        spanh = self.span_held if self.span >= 2 else ()   # --span 2|3: a gather from the span is a page for any destination
 
         def blk(ins, nxt):
             """A block with its DRAM-homed loads made ldr pages: (new block, instructions consumed)."""
@@ -2315,13 +2397,26 @@ class Machine:
     # constants (narrow would start to round them) and gathers with no window keep today's path. Values are
     # unchanged: the same lanes are read, from a copy. With --span 1 a served gather whose destination is in L1 stays
     # a block and a gather op (two syncs); --span 2 makes it one reader page as well, like the DRAM destinations.
-    def _span_fill(self, mir, D, base):
+    # With --span 3 the copies are ordinary registers inserted only outside innermost loop regions and coloured first
+    # into colour 0, so the span shares colour 0 with the Krylov loops instead of taking an extra L1 slot.
+    def _span_fill(self, mir, D, base, alias=None, skip=()):
         out, cur, held, nfill, npage, skipped = [], None, None, 0, 0, Counter()
-        self.span_held = set()
+        alias = self.alias if alias is None else alias
+        self.span_held, self.span_src = set(), {}
         i = 0
         while i < len(mir):
             ins = mir[i]
             nxt = mir[i + 1] if i + 1 < len(mir) else None
+            if i in skip:
+                cur = None
+                if ins[0] == "blk" and nxt is not None and nxt[0] == "gather" and len(ins[2]) == 1 and \
+                        nxt[1] == ins[2][0][1] and nxt[2] in self.base:
+                    u = ins[1][-1]
+                    if u[0] == "lds" and u[2] in D and (len(ins[1]) == 1 or (len(ins[1]) == 2 and ins[1][0][2] == "__anchor__")):
+                        skipped["loop"] += 1
+                out.append(ins)
+                i += 1
+                continue
             if ins[0] in ("label", "jump", "jumpif"):
                 cur = None
             src = None
@@ -2329,7 +2424,7 @@ class Machine:
                     nxt[1] == ins[2][0][1] and nxt[2] in self.base:
                 u = ins[1][-1]
                 if u[0] == "lds" and u[2] in D and (len(ins[1]) == 1 or (len(ins[1]) == 2 and ins[1][0][2] == "__anchor__")):
-                    why = "constant" if u[2] in self.alias else "parts" if any(x != u[2] for x, h in nxt[3]) \
+                    why = "constant" if u[2] in alias else "parts" if any(x != u[2] for x, h in nxt[3]) \
                         else "self" if nxt[1] == u[2] else None
                     if why is None:
                         src = u[2]
@@ -2340,8 +2435,10 @@ class Machine:
                     held = self._tmp(self.space[src])
                     if src in self.ext:
                         self.ext[held] = self.ext[src]
-                    self.phys[held] = base
+                    if base is not None:
+                        self.phys[held] = base
                     self.span_held.add(held)
+                    self.span_src[held] = src
                     out.append(("blk", [("ld", 0, src)], [(0, held)]))
                     cur, nfill = src, nfill + 1
                 out.append(("blk", list(ins[1][:-1]) + [("lds", u[1], held, u[3])], ins[2]))
@@ -2354,8 +2451,9 @@ class Machine:
             out.append(ins)
             i += 1
         self.span_stat = (nfill, npage, dict(skipped))
-        self._log("span: %d gathers read the L1 span at tile %d, %d fills (static), kept on today's path: %s" % (
-            npage, base, nfill, ", ".join("%s %d" % kv for kv in sorted(skipped.items())) or "none"))
+        if base is not None:
+            self._log("span: %d gathers read the L1 span at tile %d, %d fills (static), kept on today's path: %s" % (
+                npage, base, nfill, ", ".join("%s %d" % kv for kv in sorted(skipped.items())) or "none"))
         return out
 
     def _overlay(self, regs, T, isv):

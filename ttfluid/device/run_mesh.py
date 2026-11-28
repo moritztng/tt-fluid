@@ -89,7 +89,8 @@ ap.add_argument("--dedup", type=int, default=0, help="as run_vm.py: a fused run 
 ap.add_argument("--span", type=int, default=0, help="1 with --l1 N: a split gather whose window and whole residue read one "
                 "DRAM-homed vector reads an L1 copy of it (one reserved L1 slot of T tiles, filled by a copy block when the vector "
                 "changes), which --tabdense then serves like any L1 vector (Machine(span=1)); 2: a served gather with an L1 destination is "
-                "one reader page too, not a block and a gather op; values unchanged")
+                "one reader page too, not a block and a gather op; 3: the span shares colour 0 with the Krylov loops (no extra L1 slot; "
+                "copies inserted only outside innermost loops and coloured first); values unchanged")
 ap.add_argument("--tabdense", type=int, default=0, help="N > 0 with --tabstream: a reader-patched map with at least N local residue entries "
                 "per tile on a core is streamed as a dense destination-ordered uint16 index table (512 words a tile) and the reader "
                 "gathers the page in one pass with no window read (CFD_DENSE; encode.py tab_dense). The same page values. "

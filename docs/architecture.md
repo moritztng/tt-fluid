@@ -88,7 +88,9 @@ stays bit-identical. Both are off by default.
 - `--span 1` gives a gather whose source vector is homed in DRAM an SRAM copy of that vector to read. The copy lives
   in the span, one reserved slot of T tiles, and is filled by a streamed copy unless the span already holds the
   vector. The gather is then served by the dense tables, with no window read and no gather-cache miss. `--span 2`
-  also turns such a gather into a single reader page when its destination is in SRAM.
+  also turns such a gather into a single reader page when its destination is in SRAM. `--span 3` drops the extra slot
+  and shares colour 0 with the Krylov loops: copies are inserted only outside innermost loops and coloured first into
+  colour 0, leaving all colours free inside the Krylov loops.
 
 `ttfluid.resident.encode` packs the result into three uint32 streams per core, one for each kernel:
 
