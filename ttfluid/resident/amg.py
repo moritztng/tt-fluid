@@ -200,6 +200,96 @@ def pairwise(nbr, mask, w, part, rounds=3, max_coarse=200, min_ratio=0.7):
     return aggs
 
 
+def handshake(A, core, size, cap, q=4.0, rounds=40):
+    """One matching pass inside each core. An edge is a candidate while both ends are free and the pair would hold at
+    most cap cells. Every node takes its candidate of highest priority and mutual choices pair. The priority is the
+    coupling in steps of 2^(1/q) with a hash of the edge inside a step: with the bare coupling, a mesh whose
+    coefficients grow smoothly in one direction pairs one cell per round along each chain and the pass stalls.
+    An edge to a node with no other candidate comes first: such a node (a cell on a ragged core boundary) otherwise
+    loses every handshake and is carried down the levels as a row of its own.
+    Returns the aggregate of every node and their count."""
+    n = A.shape[0]
+    i = np.repeat(np.arange(n, dtype=np.int32), np.diff(A.indptr))
+    j = A.indices
+    keep = (A.data < 0) & (core[i] == core[j]) & (size[i] + size[j] <= cap)
+    i, j, w = i[keep], j[keep], -A.data[keep].astype(np.float64)
+    lo, hi = np.minimum(i, j).astype(np.uint64), np.maximum(i, j).astype(np.uint64)
+    h = (lo * np.uint64(0x9E3779B97F4A7C15)) ^ (hi * np.uint64(0xC2B2AE3D27D4EB4F))
+    h = ((h ^ (h >> np.uint64(29))) * np.uint64(0xBF58476D1CE4E5B9)) >> np.uint64(40)
+    w = np.floor(q * np.log2(w)) + h.astype(np.float64) / float(1 << 24)
+    mate = np.full(n, -1, np.int64)
+    for _ in range(rounds):
+        if not len(i):
+            break
+        start = np.flatnonzero(np.r_[True, i[1:] != i[:-1]])           # the entries stay grouped by row
+        count = np.diff(np.r_[start, len(i)])
+        last = np.zeros(n, bool)                                       # nodes with one candidate left: taken first,
+        last[i[start[count == 1]]] = True                              # or their only partner pairs elsewhere
+        v = w + 1e6 * (last[i] | last[j])
+        hit = np.flatnonzero(v == np.repeat(np.maximum.reduceat(v, start), count))
+        hit = hit[np.r_[True, i[hit][1:] != i[hit][:-1]]]              # one per row
+        bi, bj = i[hit], j[hit]
+        best = np.full(n, -1, np.int64)
+        best[bi] = bj
+        mutual = bi[best[bj] == bi]
+        if 2000 * len(mutual) < len(bi):                               # the tail: chains that pair one cell per round
+            break
+        mate[mutual] = best[mutual]
+        free = (mate[i] < 0) & (mate[j] < 0)
+        i, j, w = i[free], j[free], w[free]
+    head = np.where((mate < 0) | (np.arange(n) < mate), np.arange(n), mate)
+    ids, agg = np.unique(head, return_inverse=True)
+    return agg.astype(np.int64), len(ids)
+
+
+def csr_galerkin(A, agg, nc):
+    """P^T A P for the piecewise-constant P of agg."""
+    n = A.shape[0]
+    i = agg[np.repeat(np.arange(n), np.diff(A.indptr))]
+    import scipy.sparse as sp
+    Ac = sp.csr_matrix((A.data, (i, agg[A.indices])), shape=(nc, nc))
+    Ac.sum_duplicates()
+    return Ac
+
+
+def coarsen(A, core, passes, extra=2, q=4.0):
+    """One level for the SPD matrix A (CSR): `passes` passes of handshake, so aggregates of at most 2**passes rows
+    inside a core, and `extra` more that merge what was left over. Returns the aggregate of every row, the Galerkin
+    matrix by summation and the core of every aggregate."""
+    agg, Ac, cc, size = np.arange(A.shape[0]), A, core, np.ones(A.shape[0], np.int64)
+    for _ in range(passes + extra):
+        a, nc = handshake(Ac, cc, size, 1 << passes, q)
+        if nc == len(a):
+            break
+        first = np.zeros(nc, np.int64)
+        first[a] = np.arange(len(a))
+        Ac, cc, agg, size = csr_galerkin(Ac, a, nc), cc[first], a[agg], np.bincount(a, size, nc).astype(np.int64)
+    return agg, Ac, cc
+
+
+def matched(nbr, mask, w, part, passes=3, max_coarse=4000, extra=2, q=4.0, min_ratio=2.0, depth=None):
+    """Aggregates per level like `pairwise` returns them, by `coarsen` on the graph Laplacian of the ELL weights w:
+    never across `part`, levels until max_coarse rows are left, a level shrinks by less than min_ratio or `depth`
+    levels exist. tools/mgmodel.py runs the same matching on the captured p systems."""
+    import scipy.sparse as sp
+    n, S = nbr.shape
+    k = np.asarray(mask, bool).ravel()
+    r = np.repeat(np.arange(n), S)[k]
+    W = np.abs(np.asarray(w, np.float64).ravel()[k])
+    A = sp.csr_matrix((np.r_[np.bincount(r, W, n) + 1e-12 * W.max(), -W],
+                       (np.r_[np.arange(n), r], np.r_[np.arange(n), np.asarray(nbr).ravel()[k]])), shape=(n, n))
+    A.sum_duplicates()
+    A.sort_indices()
+    core, aggs = np.asarray(part), []
+    while A.shape[0] > max_coarse and (depth is None or len(aggs) < depth):
+        agg, Ac, cc = coarsen(A, core, passes, extra, q)
+        if Ac.shape[0] * min_ratio > A.shape[0]:
+            break
+        aggs.append(agg)
+        A, core = Ac, cc
+    return aggs
+
+
 CAP = int(os.environ.get("CFD_AMG_CAP", 24)) or None    # coarse-row width cap (0: exact Galerkin); motorBike p:
 # cap none/24/16/12/8 -> PCG 11/11/13/16/21 it, coarse widths sum 445/144/96/72/48 (amg/cap_study.py)
 

@@ -37,6 +37,8 @@ from pathlib import Path
 import numpy as np
 import scipy.sparse as sp
 
+from ..resident.amg import coarsen, csr_galerkin as galerkin
+
 SMALL = 1e-20
 CPC = 1                                                            # cores a chip, set by main
 AGG = "p1"                                                         # aggregation version: names the cache and tags the rows
@@ -48,57 +50,6 @@ def log(*a):
 
 
 # ---- aggregation ---------------------------------------------------------------------------------------------------
-
-def pairwise(A, core, size, cap, q=4.0, rounds=40):
-    """One matching pass inside each core. An edge is a candidate while both ends are free and the pair would hold at
-    most cap cells. Every node takes its candidate of highest priority and mutual choices pair. The priority is the
-    coupling in steps of 2^(1/q) with a hash of the edge inside a step: with the bare coupling, a mesh whose
-    coefficients grow smoothly in one direction pairs one cell per round along each chain and the pass stalls.
-    An edge to a node with no other candidate comes first: such a node (a cell on a ragged core boundary) otherwise
-    loses every handshake and is carried down the levels as a row of its own.
-    Returns the aggregate of every node and their count."""
-    n = A.shape[0]
-    i = np.repeat(np.arange(n, dtype=np.int32), np.diff(A.indptr))
-    j = A.indices
-    keep = (A.data < 0) & (core[i] == core[j]) & (size[i] + size[j] <= cap)
-    i, j, w = i[keep], j[keep], -A.data[keep].astype(np.float64)
-    lo, hi = np.minimum(i, j).astype(np.uint64), np.maximum(i, j).astype(np.uint64)
-    h = (lo * np.uint64(0x9E3779B97F4A7C15)) ^ (hi * np.uint64(0xC2B2AE3D27D4EB4F))
-    h = ((h ^ (h >> np.uint64(29))) * np.uint64(0xBF58476D1CE4E5B9)) >> np.uint64(40)
-    w = np.floor(q * np.log2(w)) + h.astype(np.float64) / float(1 << 24)
-    mate = np.full(n, -1, np.int64)
-    for _ in range(rounds):
-        if not len(i):
-            break
-        start = np.flatnonzero(np.r_[True, i[1:] != i[:-1]])           # the entries stay grouped by row
-        count = np.diff(np.r_[start, len(i)])
-        last = np.zeros(n, bool)                                       # nodes with one candidate left: taken first,
-        last[i[start[count == 1]]] = True                              # or their only partner pairs elsewhere
-        v = w + 1e6 * (last[i] | last[j])
-        hit = np.flatnonzero(v == np.repeat(np.maximum.reduceat(v, start), count))
-        hit = hit[np.r_[True, i[hit][1:] != i[hit][:-1]]]              # one per row
-        bi, bj = i[hit], j[hit]
-        best = np.full(n, -1, np.int64)
-        best[bi] = bj
-        mutual = bi[best[bj] == bi]
-        if 2000 * len(mutual) < len(bi):                               # the tail: chains that pair one cell per round
-            break
-        mate[mutual] = best[mutual]
-        free = (mate[i] < 0) & (mate[j] < 0)
-        i, j, w = i[free], j[free], w[free]
-    head = np.where((mate < 0) | (np.arange(n) < mate), np.arange(n), mate)
-    ids, agg = np.unique(head, return_inverse=True)
-    return agg.astype(np.int64), len(ids)
-
-
-def galerkin(A, agg, nc):
-    """P^T A P for the piecewise-constant P of agg."""
-    n = A.shape[0]
-    i = agg[np.repeat(np.arange(n), np.diff(A.indptr))]
-    Ac = sp.csr_matrix((A.data, (i, agg[A.indices])), shape=(nc, nc))
-    Ac.sum_duplicates()
-    return Ac
-
 
 class Level:
     def __init__(self, A, core):
@@ -143,15 +94,7 @@ def hierarchy(A, core, passes, coarsest, cache=None, extra=2, q=4.0, minratio=2.
             first[agg] = np.arange(L.n)
             Ac, cc = galerkin(L.A, agg, len(first)), L.core[first]
         else:
-            agg, Ac, cc, size = np.arange(L.n), L.A, L.core, np.ones(L.n, np.int64)
-            p = passes[min(len(lev) - 1, len(passes) - 1)]
-            for _ in range(p + extra):                                 # the extra passes merge what was left over
-                a, nc = pairwise(Ac, cc, size, 1 << p, q)
-                if nc == len(a):
-                    break
-                first = np.zeros(nc, np.int64)
-                first[a] = np.arange(len(a))
-                Ac, cc, agg, size = galerkin(Ac, a, nc), cc[first], a[agg], np.bincount(a, size, nc).astype(np.int64)
+            agg, Ac, cc = coarsen(L.A, L.core, passes[min(len(lev) - 1, len(passes) - 1)], extra, q)
         if Ac.shape[0] * minratio > L.n:                               # what is left pairs too slowly to be a level
             break
         L.agg = agg
