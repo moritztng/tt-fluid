@@ -157,26 +157,35 @@ What the runs in `results/` grade as:
 | SPUMA SPDP, 8 runs on H100 and 1 on B200, pooled | 201-800 | +8.4 +- 5.0 | 12.5 | pass |
 | 16 SPUMA runs on H100 and 2 on B200 (SPDP and fp64), one by one | 201-800 | -12.6 to +27.0, mean +5.3 | 17.8 | 17 pass, 1 fails (+27.0) |
 | SPUMA SPDP with the inlet 1 % and 0.3 % too fast, wrong on purpose | 201-800 | +82.0 and +43.5 | 17.8 | both fail |
-| tt-fluid, Blackhole Galaxy, seven 4-chip runs pooled | 201-799 | -3.3 +- 4.9 | 12.5 | pass |
+| tt-fluid, Blackhole Galaxy, eight 4-chip runs pooled | 201-799 | -5.7 +- 4.9 | 12.5 | pass |
+| the eight one by one | 201-799 | -21.6 to +10.2 | 17.8 | 7 pass, 1 fails (-21.6, by 3.8) |
+| the build before the fp32 omega floor, seven 4-chip runs pooled | 201-799 | -3.3 +- 4.9 | 12.5 | pass |
 | the seven one by one | 201-799 | -17.8 to +7.0 | 17.8 | 6 pass, 1 fails (-17.8, by 0.03) |
-| tt-fluid, Blackhole Galaxy, 2 chips | 201-3499 | -3.1 | 17.8 | pass |
-| tt-fluid, QuietBox 2 board A, 2 chips | 201-1899 | -17.0 | 17.8 | pass, by 0.8 |
-| all nine tt-fluid runs pooled | as above | -5.7 +- 4.6 | 12.5 | pass |
+| that build, Blackhole Galaxy, 2 chips | 201-3499 | -3.1 | 17.8 | pass |
+| that build, QuietBox 2 board A, 2 chips | 201-1899 | -17.0 | 17.8 | pass, by 0.8 |
+| all nine runs of that build pooled | as above | -5.7 +- 4.6 | 12.5 | pass |
 
-One failure in 18 correct runs is what a two-sigma band gives, and so is one in seven that misses by 0.03 counts. The
+One failure in 18 correct runs is what a two-sigma band gives, and so is one in seven that misses by 0.03 counts or
+one in eight that misses by 3.8. The
 two wrong-on-purpose runs show the gate can fail a real solve: with the inlet at 20.2 m/s instead of 20 and the forces
 still normalised with 20, SPUMA reads +82.0 counts (`results/nvidia/h100-wrong-inlet`).
 
-The seven Galaxy runs are tt-fluid's grade of record. They ran at once on seven 4-chip blocks of one Blackhole Galaxy,
-each from the potentialFoam start with the velocity scaled by 1 +- k x 1e-7 (k = 0 to 4), so they are seven draws of one
+The eight Galaxy runs are tt-fluid's grade of record. They ran at once on eight 4-chip blocks of one Blackhole Galaxy,
+each from the potentialFoam start with the velocity scaled by 1 +- k x 1e-7 (k = 0 to 4), so they are eight draws of one
 fp32 program (`results/tenstorrent/galaxy-blackhole/runs.status` has chips, commit, clock and final state of every
-run). Their means spread as the rule predicts (3.4 counts on the pooled mean against 3.3), and the pool reads
--3.3 +- 4.9 against the 12.5 bar. The two 2-chip runs are the same program on other partitions. Taken alone,
-iterations 201-800 of the QuietBox 2 run read -22.8, outside the band for one run; pooled with the others the nine read
--5.7 +- 4.6.
+run). Their means spread as the rule predicts (3.4 counts on the pooled mean against 3.1), and the pool reads
+-5.7 +- 4.9 against the 12.5 bar.
+
+The build before it floored omega at 1e-15 in fp32 ([below](#a-known-behaviour-of-the-case)). Seven of the same eight
+starts ran on it, the eighth went NaN, and they read -3.3 +- 4.9: the two pools differ by 2.4 counts, well inside
+their noise, so the floor does not move the drag. The two 2-chip runs are that earlier build on other partitions.
+Taken alone, iterations 201-800 of the QuietBox 2 run read -22.8, outside the band for one run; pooled with the other
+eight of that build the nine read -5.7 +- 4.6.
 
 ```bash
 G=results/tenstorrent/galaxy-blackhole; Q=results/tenstorrent/quietbox2-p300x4
+python3 bench/cdgrade.py --run $G/glx3_2_0-1-4-5.hist.json:0 $(for f in $G/glx3_2_[1-9]*.hist.json; do echo --pool $f:0; done)
+# the build before the fp32 omega floor: its seven Galaxy runs, then all nine
 python3 bench/cdgrade.py --run $G/d_l0_b0.hist.json:0 $(for f in $G/glx1_*.hist.json; do echo --pool $f:0; done)
 python3 bench/cdgrade.py --run $G/d_l0_b0.hist.json:0 $(for f in $G/glx1_*.hist.json; do echo --pool $f:0; done) \
     --pool $(for i in 1 2 3 4 5 6 7; do echo $G/hC_$i.hist.json:$(((i - 1) * 500)); done) \
@@ -190,9 +199,22 @@ comparison of both boards' final states against two earlier builds.
 
 ### A known behaviour of the case
 
-On long runs (about 2,200 iterations) HPC_motorbike Small can produce a NaN on the device. The same discretisation in fp64
-on the host floors omega in the same cell and fails the same way, so it belongs to the model and mesh, not to fp32 or
-the device. tt-fluid stops a run one iteration after any field becomes non-finite.
+HPC_motorbike Small has gone NaN on the device in two cases: after about 2,200 iterations on a 1x2 block, and in
+iteration 337 of one of nine start states on a 2x2 block. Device states around both events and a host replay of the
+first show the chain. The explicit non-orthogonal correction of omega's laplacian pulls a pocket of cells below zero.
+`bound()` gives a cell whose face neighbours are all negative exactly the floor `omegaMin`. The cross-diffusion source
+divides by omega, so one iteration later that cell is near 1e18 when the floor is 1e-15 (8.0e17 and 3.7e18 in the two
+events). In the next omega solve PBiCGStab's dot product `r0 . r` leaves the fp32 range and the fields are NaN from
+there on; the same solve carried out in double precision stays finite.
+
+The floor was OpenFOAM's double-precision `SMALL` in single-precision arithmetic. OpenFOAM's single-precision `SMALL`
+is 1e-6 (ESI `floatScalarSMALL`), and tt-fluid now floors omega there when it computes in fp32 (1e-15 in fp64;
+`omegaMin` and `kMin` in the RAS dictionary override the defaults). With that floor the start that went NaN in
+iteration 337 runs all 800 iterations, like the seven beside it (the eight runs above). A run whose residuals still
+become non-finite ends in that iteration: the device program leaves its outer loop, and `run_mesh` prints `DIVERGED`
+with the iteration, saves the state and exits with code 4. On a Blackhole 2x2 block a Small run started with one NaN
+cell stopped after its first iteration, 1.5 s of device time. `tests/test_diverge.py` reproduces the chain on
+pitzDaily, from the pocket to the NaN.
 
 ## 4. Drag and lift against OpenFOAM (occDrivAer, coarse mesh)
 

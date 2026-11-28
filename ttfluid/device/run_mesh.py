@@ -38,7 +38,8 @@ ap.add_argument("--legs", type=int, default=0, help="with --from-images: chain t
                 "come back from the last run's dump): a whole case per process, the same answer as a --state-in chain")
 ap.add_argument("--cases", type=int, default=0, help="with --from-images: this many whole cases back to back in one process "
                 "(sweep mode), each from the images' start (or --state-in), each with its own state npz and result row; the mesh "
-                "opens once and the next case's DRAM homes are built on the host while the device runs this one")
+                "opens once and the next case's DRAM homes are built on the host while the device runs this one; a case that "
+                "diverges does not stop the cases after it, and the process then exits with status 4")
 ap.add_argument("--overlap", type=int, default=1, help="--cases: 1 = case k's outputs are copied on the device, case k+1 is "
                 "launched, and case k is read and saved over a second command queue while k+1 runs (the next homes are "
                 "written there too); 0 = the serial path (read, save, write, launch)")
@@ -236,6 +237,21 @@ LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_k
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
+
+def diverged(rows):
+    """The first history row with a value that is not finite, or None. The device program ends after that row
+    (resident/program.py), so it is the last one; DIVERGED on stdout names the iteration and the fields."""
+    for q, r in enumerate(rows):
+        bad = sorted(k for k, v in r.items() if not np.isfinite(v))
+        if bad:
+            print("DIVERGED: outer iteration %d of this run: %s not finite (%s); the program stopped there" % (
+                q + 1, ", ".join(bad), " ".join("%s=%s" % (k, r[k]) for k in r if not k.startswith("its"))), flush=True)
+            return dict(row=q + 1, outer=r.get("outer"), fields=bad)
+    return None
+
+
+diverged_cases = []   # --cases: the cases whose run diverged; they decide the exit status once every case has its line
+
 
 def mcache_open(mode):   # a --mcache path ending in .zst is read and written as a zstd stream (Small k4: 121 GB raw)
     if not a.mcache.endswith(".zst"):
@@ -471,7 +487,7 @@ elif not a.noemu:
         if a.ref:
             with open(a.ref, "wb") as f:
                 pickle.dump(ref, f)
-        sys.exit()
+        sys.exit(4 if diverged(me.history) else 0)
 
 stamp("host tables built")
 import torch  # noqa: E402
@@ -841,6 +857,8 @@ def main():
             hl = from_dev(t_hist, np.uint32).reshape(K, H, 16)
             rows_all += [{nm: float(hl[0, q, i:i + 1].view(np.float32)[0]) for i, nm in enumerate(E.out_names)}
                          for q in range(min(int(o.reshape(K * P, -1)[0, 14]), H))]
+            if rows_all and not all(np.isfinite(v) for v in rows_all[-1].values()):
+                break   # this leg ended on a non-finite row: the next one would only carry it
         if a.cases:   # every case its own answer, read before the next case's homes overwrite this one's
             report(o, walls[-1:], ticks[-1:], clks[-1:], None, ".c%d" % rr)
     if not a.cases:
@@ -1012,7 +1030,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
                              halo_all_max=int(h[:, 54].max()), halo_all_med=float(np.median(h[:, 54])),
                              gw={int(g): dict(relay=int(h[g, 50]), members=int(h[g, 51]), rcred=int(h[g, 52]),
                                               send=int(h[g, 53])) for g in gws}),
-               last=rows[-1] if rows else None)
+               last=rows[-1] if rows else None, diverged=diverged(rows))
     if a.phase:   # hdr 512 + 2 id MATH, 544 BRISC, 576 B_RED, 608 B_HALO, 640 B_WAITC (vm_compute / vm_brisc CFD_PHASE)
         from ttfluid.resident.program import PHASES
         hz = amax * 1e6
@@ -1066,10 +1084,17 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         f.write(json.dumps(res) + "\n")
     if res["abort"]["cores"] or not nrow:   # a run that aborted on its bounded waits is a failure, not a row
         raise SystemExit(3)
+    if res["diverged"]:   # the state is saved and the row is in the result; the answer is not one
+        if not a.cases:
+            raise SystemExit(4)
+        diverged_cases.append(tag)   # the program ended by itself, so the cases after this one still run
 
 
 try:
     main()
+    if diverged_cases:   # a process with a diverged case fails like a single diverged run, after every case has run
+        print("status 4: %d of %d cases diverged (%s)" % (len(diverged_cases), a.cases, " ".join(diverged_cases)), flush=True)
+        raise SystemExit(4)
 finally:   # a failed build or run must still release the mesh, or the interpreter hangs at exit
     ttnn.close_mesh_device(md)
     if FAB:

@@ -110,6 +110,19 @@ def test_device_runs_from_starts_one_rounding_step_apart_pool_to_a_grade_of_reco
     assert q["record"] and q["grade"] == "PASS" and q["Cd"]["band"] == cdgrade.BAND and round(q["Cd"]["diff"], 1) == -3.3
 
 
+def test_runs_on_the_single_precision_omega_floor_all_end_and_pool_to_a_grade_of_record():
+    """Eight 4-chip Galaxy runs of the build that floors omega at 1e-6 in fp32: the potentialFoam start and seven
+    starts 1e-7 apart, the starts of glx1. With the double-precision floor the start U x (1 + 1e-7) went NaN in
+    iteration 337 and never gave a history (glx1 has six); here all eight run 800 finite iterations."""
+    files = sorted(GLX.glob("glx3_2_*.hist.json"))
+    hists = [json.load(open(f)) for f in files]
+    assert len(hists) == 8 and all(len(h) == 800 for h in hists)
+    assert all(v == v and abs(v) < 1e30 for h in hists for r in h for v in r.values())
+    assert max(r["its4"] for h in hists for r in h[5:]) < 100 and max(r["its5"] for h in hists for r in h[5:]) < 100   # k, omega: no solve at its cap
+    q = cdgrade.pooled([cdgrade.grade(cdgrade.series([f"{f}:0"]), REF) for f in files])
+    assert q["record"] and q["grade"] == "PASS" and q["Cd"]["band"] == cdgrade.BAND and round(q["Cd"]["diff"], 1) == -5.7
+
+
 def test_another_case_gets_means_and_no_grade(monkeypatch, capsys):
     """--means on the occDrivAer run: the window means against a chosen reference over the same iterations, no verdict."""
     occ = "occdrivaer-coarse"
