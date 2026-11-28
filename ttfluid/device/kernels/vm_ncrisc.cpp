@@ -563,10 +563,18 @@ void kernel_main() {
     uint32_t tprev = get_timestamp_32b();
     // inside STREAM (hdr 96 + 10..12): waiting for a free cb_in slot, read barriers, the patch; parts 16..17: the
     // patch's barrier and residue entries; inside GATHER (parts 18..19): waiting for the halo, the local and halo scatters
+#ifdef CFD_PROFW
+    uint32_t nst_ = 0;   // run_mesh --prof 2: this reader's op (32 + op) or the part it is in, at hdr 302 for MATH (vm_compute.cpp)
+#define NSTATE(s) (hdr[302] = (s))
+#else
+#define NSTATE(s)
+#endif
 #define PSUB(i, x)                                     \
     {                                                  \
         const uint32_t t0_ = get_timestamp_32b();      \
+        NSTATE(i);                                     \
         x;                                             \
+        NSTATE(nst_);                                  \
         cyc[i] += get_timestamp_32b() - t0_;           \
         ++cnt[i];                                      \
     }
@@ -613,6 +621,7 @@ void kernel_main() {
             TR_REC(pc - 1, op, t_);
         }
 #endif
+        NSTATE(nst_ = 32 + op);
         switch (op) {
             case N_END: run = false; break;
             case N_SIGC:

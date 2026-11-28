@@ -138,7 +138,7 @@ ap.add_argument("--phase", action="store_true", help="per-SIMPLE-phase device cy
 ap.add_argument("--cap", type=int, default=32, help="as run_vm.py: scratch cap, live one-tile values per fused run")
 ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3, 4 need --tabstream (mesh has no trid). Default 0 keeps the built images unchanged")
 ap.add_argument("--os", type=int, default=0, help="1: BRISC built for size (#pragma GCC optimize Os), 2: NCRISC too, for a program over the kernel config buffer")
-ap.add_argument("--prof", action="store_true", help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores")
+ap.add_argument("--prof", type=int, nargs="?", const=1, default=0, help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores; 2 (CFD_PROFW): MATH also drains after every load and acquire and books the wait to what UNPACK, PACK and the reader are in (census.mwait)")
 ap.add_argument("--plan", action="store_true", help="CPU only: lower, place the chips, print the plan")
 ap.add_argument("--gruns", help="CPU only: lower and encode (--tabstream), write the gather run census (lower/gruns.py) of the "
                 "cores of --gruns-chips to this json and exit")
@@ -651,7 +651,7 @@ else:
     if E.tab_stream:
         blob.reshape(K * P, TBP * 1024)[:, :E.tab_blob.shape[1]] = E.tab_blob
     t_blob = to_dev(blob)
-defs = [("CFD_PROF", "1")] * a.prof + [("CFD_STOP", str(a.stop))] * bool(a.stop) + [("CFD_CP", str(m.cpages)), ("CFD_MESH", str(K)), ("CFD_NSH", str(NSH)), ("CFD_SYNCB", str(SYNCB)), ("CFD_GB", str(GB)), ("CFD_RB", str(RB)), ("CFD_CONS", str(E0 + 512))] + ([("CFD_RED2", "1")] if m.red2 else []) + \
+defs = [("CFD_PROF", "1")] * bool(a.prof) + [("CFD_PROFW", "1")] * (a.prof > 1) + [("CFD_STOP", str(a.stop))] * bool(a.stop) + [("CFD_CP", str(m.cpages)), ("CFD_MESH", str(K)), ("CFD_NSH", str(NSH)), ("CFD_SYNCB", str(SYNCB)), ("CFD_GB", str(GB)), ("CFD_RB", str(RB)), ("CFD_CONS", str(E0 + 512))] + ([("CFD_RED2", "1")] if m.red2 else []) + \
        ([("CFD_TABSTREAM", str(CB_TS))] if a.tabstream else []) + ([("CFD_WIDE", "1")] if ttfluid.resident.encode.WIDE else []) + ([("CFD_BSCAL", "1")] if a.bscal else []) + ([("CFD_OS", str(a.os))] if a.os else [])
 
 BLKREV = zlib.crc32((DEV / "blk_exec.h").read_bytes()) | 1   # CFD_BLK's value: an edited header is a new kernel for the JIT cache

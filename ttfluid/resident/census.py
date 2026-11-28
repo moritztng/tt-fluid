@@ -188,4 +188,26 @@ def prof(hdr, log=print):
               ", ".join("%s %.1f%% (%d x %.0f)" % (nm, 100 * v["share"], v["n"], v["per"]) for nm, v in top), flush=True)
     log("census n STREAM parts: " + ", ".join("%s %.3g cyc (%d)" % (nm, v["cyc"], v["n"])
                                                 for nm, v in c["n_stream"].items()), flush=True)
+    if hdr.shape[1] >= 992 and int(hdr[:, 988:991].astype("int64").sum()):
+        c["mwait"] = mwait(hdr)
+        log("census mwait", json.dumps(c["mwait"]), flush=True)
     return c
+
+
+# run_mesh --prof 2 (CFD_PROFW, vm_compute.cpp): what MATH's drains after loads and acquires were booked to
+MW_U = ("at the load", "reader page", "NCRISC token", "BRISC token", "PACK token", "code page", "u6", "u7")
+MW_N = ("idle", "WAITC", "WAITB", "GATHER", "patch barrier", "halo wait", "scatter", "STREAM", "DRAM barrier", "slot wait",
+        "HALO", "other op", "other part", "n13", "n14", "n15")
+MW_P = ("at work", "writer page", "code page", "BRISC token page", "NCRISC token page", "p5", "p6", "p7")
+
+
+def mwait(hdr):
+    """Cycles a core (mean over cores) MATH spent draining its Tensix pipeline, by cause: load[unpack state | reader
+    class] after a load, acq[pack state] after an acquire, own = its own queued work before either; tail = the last poll
+    of each kind (nobody waited for), n = drains of each kind."""
+    w64 = lambda i: float((hdr[:, i].astype("float64") + hdr[:, i + 1].astype("float64") * 2.0 ** 32).mean())
+    load = {"%s | %s" % (MW_U[u], MW_N[n]): w64(700 + 2 * (16 * u + n)) for u in range(8) for n in range(16)}
+    acq = {MW_P[q]: w64(960 + 2 * q) for q in range(8)}
+    return dict(load={k: round(v) for k, v in load.items() if v}, acq={k: round(v) for k, v in acq.items() if v},
+                own=round(w64(976)), tail=dict(load=round(w64(980)), acq=round(w64(982)), own=round(w64(984))),
+                n=dict(load=float(hdr[:, 988].mean()), acq=float(hdr[:, 989].mean()), own=float(hdr[:, 990].mean())))
