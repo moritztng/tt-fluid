@@ -63,6 +63,7 @@ UFUSE = False   # a vector solve's components in one lockstep loop (pbicgstab_fu
 UFUSE_NOFREEZE = False   # self-test only (--ufuse 2): a component that has left keeps updating x, so the comparison with the one-by-one solve must fail
 UFUSE_REMAKE = False   # pbicgstab_fused makes y and z a second time for the x update (--uremake 1), so no SpMV source outlives its SpMV
 UFUSE_TRIPS = 5   # pbicgstab_fused's placement weight (Tracer.trips of its loop; pbicgstab's is 5, pcg's 300)
+UREMAKE = False   # pbicgstab one component at a time (plain and --uround) makes y = rD p and z = rD s again for the x update (--uremake 2): each SpMV source dies with its SpMV, so one L1 home serves both. Same products, same bits
 
 
 def pcg(A, x, b, c):
@@ -375,6 +376,8 @@ def pbicgstab(A, x, b, c):
     alpha = rho / (r0 @ v)
     ALPHA.set(alpha)
     s = R.t - alpha * v
+    if UREMAKE:
+        R.set(s)     # r = s from here: the x update reads rD * R, a product cse keeps apart from z = rD * s
     it = IT.t + 1.0
     IT.set(it)
     res = np.abs(s).sum() / nf
@@ -388,8 +391,12 @@ def pbicgstab(A, x, b, c):
     tt = t @ t
     omega = np.where(tt > 0, (t @ s) / tt, 0.0)
     OMEGA.set(omega)
-    X.set(X.t + (alpha * y + omega * z))
-    R.set(s - omega * t)
+    if UREMAKE:
+        X.set(X.t + (alpha * (rD * P.t) + omega * (rD * R.t)))
+        R.set(R.t - omega * t)
+    else:
+        X.set(X.t + (alpha * y + omega * z))
+        R.set(s - omega * t)
     res = np.abs(R.t).sum() / nf
     RES.set(res)
     done = _converged(res, r0n, c)
@@ -397,8 +404,11 @@ def pbicgstab(A, x, b, c):
     tr.jumpif(done.c[()], END)
     tr.jump(LOOP)
     tr.label(EXIT_S)
-    X.set(X.t + alpha * y)
-    R.set(s)
+    if UREMAKE:
+        X.set(X.t + alpha * (rD * P.t))
+    else:
+        X.set(X.t + alpha * y)
+        R.set(s)
     tr.label(END)
     x[...] = X.t
     return Perf(r0n, RES.t, IT.t)
@@ -532,6 +542,8 @@ def _pbicgstab_rounds(A, x, b, c, spec):
     alpha = rho / (r0 @ v)
     ALPHA.set(alpha)
     s = R.t - alpha * v
+    if UREMAKE:
+        R.set(s)     # r = s from here: the x update reads rD * R, a product cse keeps apart from z = rD * s
     it = IT.t + 1.0
     IT.set(it)
     if spec:
@@ -556,8 +568,12 @@ def _pbicgstab_rounds(A, x, b, c, spec):
         _round(tr, [(tt, ts)])
     omega = np.where(tt > 0, ts / tt, 0.0)
     OMEGA.set(omega)
-    X.set(X.t + (alpha * y + omega * z))
-    R.set(s - omega * t)
+    if UREMAKE:
+        X.set(X.t + (alpha * (rD * P.t) + omega * (rD * R.t)))
+        R.set(R.t - omega * t)
+    else:
+        X.set(X.t + (alpha * y + omega * z))
+        R.set(s - omega * t)
     rn = R.t
     a, g = np.abs(rn), r0 * rn
     sa, rho_n = a.sum(), g.sum()
@@ -570,8 +586,11 @@ def _pbicgstab_rounds(A, x, b, c, spec):
     tr.jumpif((done + (it >= float(c.maxIter)) + (np.abs(rho_n) < 1e-300)).c[()], END)
     tr.jump(LOOP)
     tr.label(EXIT_S)
-    X.set(X.t + alpha * y)
-    R.set(s)
+    if UREMAKE:
+        X.set(X.t + alpha * (rD * P.t))
+    else:
+        X.set(X.t + alpha * y)
+        R.set(s)
     tr.label(END)
     x[...] = X.t
     return Perf(r0n, RES.t, IT.t)
