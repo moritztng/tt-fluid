@@ -310,6 +310,7 @@ def main():
     ap.add_argument("--sys", required=True, help="comma list of captured system labels")
     ap.add_argument("--cores", type=int, default=220, help="cores over all chips")
     ap.add_argument("--chips", type=int, default=2)
+    ap.add_argument("--aggonly", action="store_true", help="build and cache the hierarchies, solve nothing")
     ap.add_argument("--coarsest", type=int, default=4000, help="stop coarsening at this many rows")
     ap.add_argument("--extra", type=int, default=2, help="matching passes per level after the first `agg`")
     ap.add_argument("--q", type=float, default=4.0, help="matching priority: coupling steps per factor of 2")
@@ -346,6 +347,8 @@ def main():
                         f"lmax {[round(L.lmax, 3) for L in h]} ({time.time() - t1:.0f} s)")
                     for l, st in enumerate(built[key][1]):
                         log(f"    level {l}: {st}")
+            if a.aggonly:
+                continue
             lev, st = built[key]
             if c["depth"] is not None:
                 lev = lev[:c["depth"] + 1]

@@ -7,6 +7,8 @@ lower/of_state.py start state: the fields after some SIMPLE iteration; "-" keeps
 the solver, one SIMPLE iteration runs up to the p solve, and the system handed to the Krylov solver is written to
 OUT/sys_LABEL.npz: the matrix in CSR with the sign that makes it positive definite, b with the same sign, x0 and the
 case's solver controls. OUT/mesh.npz holds what a partition needs: cell centres, faces per cell and the internal faces.
+--geo adds OUT/sys_geo.npz: the p Laplacian at uniform rAU (face weights |Sf| deltaCoeffs), the matrix a multigrid
+setup has when the program is lowered, before any coefficient exists.
 """
 import argparse
 import time
@@ -43,6 +45,7 @@ def main():
     ap.add_argument("case")
     ap.add_argument("out")
     ap.add_argument("--state", action="append", default=[], help="LABEL=STATE.npz, repeatable")
+    ap.add_argument("--geo", action="store_true", help="also write sys_geo.npz, the Laplacian of the face weights")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -52,6 +55,21 @@ def main():
     nI = m.nInternalFaces
     np.savez(out / "mesh.npz", C=m.C.astype(np.float32), counts=face_counts(m).astype(np.int16),
              owner=m.owner[:nI].astype(np.int32), neighbour=m.neighbour.astype(np.int32))
+    if a.geo:
+        import scipy.sparse as sp
+        e, n, nbr = s.ops.e, m.nCells, np.asarray(s.ops.cnbr)
+        w = np.where(e.internal, np.asarray(e.magSf, np.float64) * np.asarray(e.dc, np.float64), 0.0)
+        k = np.asarray(e.internal, bool).ravel()
+        i = np.repeat(np.arange(n), nbr.shape[1])[k]
+        K = sp.csr_matrix((np.r_[w.sum(axis=1) + 1e-12 * w.max(), -w.ravel()[k]],
+                           (np.r_[np.arange(n), i], np.r_[np.arange(n), nbr.ravel()[k]])), shape=(n, n))
+        K.sum_duplicates()
+        K.sort_indices()
+        x = np.random.default_rng(0).standard_normal(n)
+        np.savez(out / "sys_geo.npz", indptr=K.indptr.astype(np.int64), indices=K.indices.astype(np.int32),
+                 data=K.data.astype(np.float32), b=(K @ x).astype(np.float32), x0=np.zeros(n, np.float32),
+                 ctl=np.array([1e-7, 0.01, 1000, 0], np.float64))
+        log(f"saved sys_geo: n {n} nnz {K.nnz}")
     cur = {}
 
     def krylov(symmetric):
