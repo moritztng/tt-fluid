@@ -13,6 +13,7 @@ copy_host_to_device_tensor), one chip's host array at a time. CFD_IMG_UPLOAD=ful
 path); CFD_IMG_VERIFY=1 reads every uploaded tensor back chip by chip and compares it with the image.
 """
 import os
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -162,14 +163,24 @@ def carry_arena(img, k, P, a_out):
     return ar
 
 
-def upload(md, K, DEVBLK, f, to_dev):
-    """A (K * rows, words) uint32 mesh tensor whose device d holds f(DEVBLK[d]), its shards written in one copy (built one chip at a time)."""
+def upload(md, K, DEVBLK, f, to_dev, name=None):
+    """A (K * rows, words) uint32 mesh tensor whose device d holds f(DEVBLK[d]), its shards written in one copy (built one chip at a time).
+    With CFD_UPLOAD_PROFILE set and a name, prints where the upload's wall clock went: building the host shards (image
+    read, state overlay, copies) against the write to the chips, which is synchronized so the split is the device's."""
     import ttnn
     if os.environ.get("CFD_IMG_UPLOAD") == "full":
         return to_dev(np.concatenate([f(k) for k in range(K)]))
+    prof = name and os.environ.get("CFD_UPLOAD_PROFILE")
+    t0 = time.time()
     h, shape = host_shards(md, K, DEVBLK, f)
+    t1 = time.time()
     t = ttnn.allocate_tensor_on_device(shape, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
     ttnn.copy_host_to_device_tensor(h, t)
+    if prof:
+        ttnn.synchronize_device(md)
+        mb = int(np.prod(list(shape))) * 4 / 2**20
+        print("upload %s: %d chips x %.0f MB, host shards %.2f s, write %.2f s (%.0f MB/s over the mesh)"
+              % (name, K, mb, t1 - t0, time.time() - t1, K * mb / max(time.time() - t1, 1e-9)), flush=True)
     del h
     if os.environ.get("CFD_IMG_VERIFY"):
         for d in range(K):
