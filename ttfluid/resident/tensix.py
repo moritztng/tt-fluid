@@ -91,8 +91,10 @@ def _mk(name):
     return enc
 
 
-for _n in LAYOUT:
-    globals()[_n] = _mk(_n)
+ENC = {_n: _mk(_n) for _n in LAYOUT}      # one encoder an instruction: name(field, ...) -> word
+globals().update(ENC)
+# the encoders this module itself calls, bound by name (a linter cannot see the update above)
+sfploadmacro, sfploadi, sfpconfig, sfpgt, sfple, sfpadd, sfpnop, nop = (ENC[_n] for _n in "sfploadmacro sfploadi sfpconfig sfpgt sfple sfpadd sfpnop nop".split())
 
 
 def inline(w):

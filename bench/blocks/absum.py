@@ -1,7 +1,7 @@
 """flx-kernel: leg lines of a chain status file with the in-run sysfs AICLK. absum.py STATUS PREFIX
 In-run = the samples from the first to the last one at or above 1300 MHz (the node idles at 800 before the open and
 after the close); a sample under 1300 inside that span voids the leg."""
-import json, re, sys, os
+import re, sys, os
 st, pre = sys.argv[1], sys.argv[2]
 L = os.path.dirname(st)
 rows = {}
