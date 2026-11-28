@@ -96,7 +96,10 @@ ap.add_argument("--tgts", type=int, default=0, help="J in 1..7: compute's UNPACK
                 "--tabstream GATHER tile (of what --bgts leaves NCRISC) from inside its waits (CFD_TGTS, a second mailbox); 0 off. Bit-exact")
 ap.add_argument("--amg", action="store_true", help="p PCG preconditioned by smoothed aggregation (ttfluid.resident.sa), aggregates on the K x 72 global cores; "
                 "the coarse levels are chip-local (sa.setup chip_cores): only the fine level exchanges between chips")
-ap.add_argument("--amg-kind", default="sa", choices=["sa"])
+ap.add_argument("--amg-kind", default="sa", choices=["sa", "matched"])
+ap.add_argument("--amg-shape", default="fine=add,k=1,a=4,coarse=sym,ck=1,ca=4,kc=8,ac=30",
+                help="--amg-kind matched: the cycle amg.Ops runs (fine/coarse add|post|sym, Chebyshev steps k/ck on "
+                     "[2/a, 2] and [2/ca, 2], kc steps on [2/ac, 2] on the last level)")
 ap.add_argument("--amg-stack", action="store_true", help="as run_vm.py: stacked coarse SpMV")
 ap.add_argument("--amg-vec", action="store_true", help="as run_vm.py: coarse values are vector registers (--l1 auto may home them in DRAM)")
 ap.add_argument("--sliced", action="store_true", help="sorted rcb lanes; report what sliced ELL slots would save (machine.slot_extents)")
@@ -194,6 +197,9 @@ ttfluid.resident.krylov.JOINT = bool(a.jointred)
 VSHAPE = None                     # sa.Ops cycle shape; None = today's 3/3/8 V (the default build is unchanged)
 if (a.vpre, a.vpost, a.vcoarse, a.vgamma) != (3, 3, 8, ""):
     VSHAPE = dict(pre=a.vpre, post=a.vpost, coarse_deg=a.vcoarse, gamma={int(v): 2 for v in a.vgamma.split(",") if v})
+if a.amg_kind == "matched":
+    VSHAPE = {k: v if k in ("fine", "coarse") else float(v) if k in ("a", "ca", "ac") else int(v)
+              for k, v in (kv.split("=") for kv in a.amg_shape.split(","))}
 import ttfluid.resident.trace  # noqa: E402
 ttfluid.resident.trace.FIELD_MAJOR = bool(a.hlate)
 ttfluid.resident.krylov.CG1 = bool(a.cg1)

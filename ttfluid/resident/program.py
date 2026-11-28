@@ -144,15 +144,22 @@ class Program:
         self.phase_at = getattr(tr, "phase_at", {})   # build(phase=True): label -> PHASES index (encode.py C_PH / B_PH)
 
 
-def amg_setup(ops, owner, log=print):
+def amg_setup(ops, owner, log=print, kind="pairwise", shape=None, chip_cores=None):
     """Multigrid levels for the pressure PCG: pairwise aggregates on the face graph weighted by |Sf| deltaCoeffs
-    (the p Laplacian at uniform rAU), never across `owner` cores."""
+    (the p Laplacian at uniform rAU), never across `owner` cores. kind "matched": the handshake matching of the host
+    model (amg.matched, about 8 cells per aggregate and level, down to 18 rows a core), with the cycle `shape`;
+    chip_cores: its coarse levels drop the couplings between two chips."""
     from . import amg
     e = ops.e
     w = np.where(e.internal, np.asarray(e.magSf, np.float64) * np.asarray(e.dc, np.float64), 0.0)
-    aggs = amg.pairwise(ops.cnbr, e.internal, w, owner)
-    levels = amg.build(ops.cnbr, e.internal, aggs, w)
-    log(f"amg: levels {[e.nCells] + [L.nc for L in levels]}, coarse slots {[L.S for L in levels]}")
+    if kind == "matched":
+        aggs = amg.matched(ops.cnbr, e.internal, w, owner, max_coarse=18 * (int(np.max(owner)) + 1))
+    else:
+        aggs = amg.pairwise(ops.cnbr, e.internal, w, owner)
+    levels = amg.build(ops.cnbr, e.internal, aggs, w, shape=shape, owner=owner if kind == "matched" else None,
+                       chip_cores=chip_cores if kind == "matched" else None)
+    log(f"amg: levels {[e.nCells] + [L.nc for L in levels]}, coarse slots {[L.S for L in levels]}"
+        + (f", fine couplings cut at the chip boundary {[L.cut for L in levels]}" if any(L.cut for L in levels) else ""))
     return levels
 
 
@@ -212,12 +219,18 @@ def build(solver, max_outer=2000, amg_owner=None, amg_kind="pairwise", amg_smoot
             for sp_ in ([L.space] + L.apc + L.acc + L.gspaces + [c[0] for c in L.mchunks] if L.gspaces else [L.space, L.apspace, L.acspace]):
                 pspace[sp_.name] = sp_
     elif amg_owner is not None:
-        assert amg_chip_cores is None, "chip-local multigrid: --amg-kind sa only"
+        # across chips the matched levels drop the coarse couplings between two chips (amg.Level); pairwise has no cut
+        assert amg_kind == "matched" or amg_chip_cores is None or int(np.max(amg_owner)) < amg_chip_cores, \
+            "multigrid cut at the chip boundary: --amg-kind sa or matched"
         from . import amg
-        tops.amg_levels = amg.attach(tr, amg_setup(ops, np.asarray(amg_owner)), cells)
+        tops.amg_levels = amg.attach(tr, amg_setup(ops, np.asarray(amg_owner), kind=amg_kind,
+                                                   shape=amg_vshape if amg_kind == "matched" else None,
+                                                   chip_cores=amg_chip_cores), cells,
+                                     stack=amg_stack and amg_kind == "matched", owner=np.asarray(amg_owner))
         for L in tops.amg_levels:          # Layout places every space the Program lists
             pspace[L.space.name] = L.space
-            pspace[L.fspace.name] = L.fspace
+            for sp_ in L.fspaces + [c[0] for c in (L.gchunks or []) + (L.mchunks or [])]:
+                pspace[sp_.name] = sp_
 
     # ---- the state: every field's cells and patch values, and the flux
     state = []
