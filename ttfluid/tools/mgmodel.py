@@ -107,7 +107,7 @@ class Level:
         return self._own
 
 
-def hierarchy(A, core, passes, coarsest, cache=None, extra=2, q=4.0):
+def hierarchy(A, core, passes, coarsest, cache=None, extra=2, q=4.0, minratio=2.0):
     """Levels from the fine one down. cache: an .npz with the aggregate of every node per level, written when absent."""
     aggs = None
     if cache is not None and cache.exists():
@@ -131,8 +131,8 @@ def hierarchy(A, core, passes, coarsest, cache=None, extra=2, q=4.0):
                 first = np.zeros(nc, np.int64)
                 first[a] = np.arange(len(a))
                 Ac, cc, agg, size = galerkin(Ac, a, nc), cc[first], a[agg], np.bincount(a, size, nc).astype(np.int64)
-            if Ac.shape[0] == L.n:
-                break
+        if Ac.shape[0] * minratio > L.n:                               # what is left pairs too slowly to be a level
+            break
         L.agg = agg
         lev.append(Level(Ac, cc))
     if cache is not None and aggs is None:
