@@ -20,6 +20,8 @@ A --cfg is a list of key=value:
   w      weight of every coarse correction (piecewise-constant aggregation under-corrects; 1 = none)
   local  levels from this one down drop their couplings between cores, so their SpMVs need no halo exchange
          (1 = every coarse level is solved inside its core; default: none)
+  glob   levels from this one down keep their couplings again (local=1 glob=3: levels 1 and 2 inside the core, the
+         small levels below them across cores)
   fp32   1 = vectors and matrices in fp32
 
 Per solve it prints the PCG iterations and the work: SpMVs, restrictions and prolongations per level, reductions.
@@ -34,6 +36,7 @@ import numpy as np
 import scipy.sparse as sp
 
 SMALL = 1e-20
+AGG = "p1"                                                         # aggregation version: names the cache and tags the rows
 T0 = time.time()
 
 
@@ -48,6 +51,8 @@ def pairwise(A, core, size, cap, q=4.0, rounds=40):
     most cap cells. Every node takes its candidate of highest priority and mutual choices pair. The priority is the
     coupling in steps of 2^(1/q) with a hash of the edge inside a step: with the bare coupling, a mesh whose
     coefficients grow smoothly in one direction pairs one cell per round along each chain and the pass stalls.
+    An edge to a node with no other candidate comes first: such a node (a cell on a ragged core boundary) otherwise
+    loses every handshake and is carried down the levels as a row of its own.
     Returns the aggregate of every node and their count."""
     n = A.shape[0]
     i = np.repeat(np.arange(n, dtype=np.int32), np.diff(A.indptr))
@@ -63,7 +68,11 @@ def pairwise(A, core, size, cap, q=4.0, rounds=40):
         if not len(i):
             break
         start = np.flatnonzero(np.r_[True, i[1:] != i[:-1]])           # the entries stay grouped by row
-        hit = np.flatnonzero(w == np.repeat(np.maximum.reduceat(w, start), np.diff(np.r_[start, len(i)])))
+        count = np.diff(np.r_[start, len(i)])
+        last = np.zeros(n, bool)                                       # nodes with one candidate left: taken first,
+        last[i[start[count == 1]]] = True                              # or their only partner pairs elsewhere
+        v = w + 1e6 * (last[i] | last[j])
+        hit = np.flatnonzero(v == np.repeat(np.maximum.reduceat(v, start), count))
         hit = hit[np.r_[True, i[hit][1:] != i[hit][:-1]]]              # one per row
         bi, bj = i[hit], j[hit]
         best = np.full(n, -1, np.int64)
@@ -191,7 +200,7 @@ class Cycle:
         self.lev, self.c, self.W = lev, c, W
 
     def A(self, l):
-        return self.lev[l].own if l >= self.c["local"] else self.lev[l].A
+        return self.lev[l].own if self.c["local"] <= l < self.c["glob"] else self.lev[l].A
 
     def coarse(self, l, r):
         """The correction of level l - 1 from level l: gamma cycles."""
@@ -257,7 +266,7 @@ def fpcg(A, b, x0, M, ctl, W):
 
 # ---- driver --------------------------------------------------------------------------------------------------------
 
-DEF = dict(agg="3", mode="post", k=1, a=4.0, cmode="sym", ck=2, ca=4.0, gamma=1, kc=16, ac=30.0, depth=None, local=99, w=1.0, fp32=0)
+DEF = dict(agg="3", mode="post", k=1, a=4.0, cmode="sym", ck=2, ca=4.0, gamma=1, kc=16, ac=30.0, depth=None, local=99, glob=99, w=1.0, fp32=0)
 
 
 def parse_cfg(s):
@@ -314,7 +323,7 @@ def main():
                 else:
                     t1 = time.time()
                     h = hierarchy(Af, core, [int(v) for v in c["agg"].split(",")], a.coarsest,
-                                  d / f"agg_{label}_{c['agg'].replace(',', '-')}_{a.cores}_{a.chips}_{a.coarsest}_{a.extra}_{a.q:g}.npz",
+                                  d / f"agg_{label}_{c['agg'].replace(',', '-')}_{a.cores}_{a.chips}_{a.coarsest}_{a.extra}_{a.q:g}_{AGG}.npz",
                                   a.extra, a.q)
                     built[key] = h, [stats(L, a.cores, a.chips) for L in h]
                     log(f"  hierarchy agg={c['agg']}: rows {[L.n for L in h]} nnz {[L.A.nnz for L in h]} "
@@ -333,7 +342,7 @@ def main():
                        rows=[L.n for L in lev], nnz=[int(L.A.nnz) for L in lev], spmv=W.spmv, R=W.R, P=W.P, red=W.red,
                        fine_per_it=W.spmv[0] / max(it, 1),
                        coarse_nnz_eq=sum(s * L.A.nnz for s, L in zip(W.spmv[1:], lev[1:])) / lev[0].A.nnz,
-                       lmax=[L.lmax for L in lev], levels=st[:len(lev)] if st else None, cores=a.cores, chips=a.chips,
+                       lmax=[L.lmax for L in lev], levels=st[:len(lev)] if st else None, cores=a.cores, chips=a.chips, agg_ver=AGG,
                        wall=time.time() - t1)
             log(f"  {label} [{c['name']}] its {it} fine SpMV {W.spmv[0]} ({row['fine_per_it']:.2f}/it) coarse SpMV "
                 f"{W.spmv[1:]} = {row['coarse_nnz_eq']:.2f} fine-eq by nnz, R {W.R[:-1]}, red {W.red}, "
