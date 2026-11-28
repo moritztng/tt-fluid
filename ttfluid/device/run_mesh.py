@@ -85,6 +85,10 @@ ap.add_argument("--gcache", type=int, default=-1, help="as run_vm.py: N gather t
 ap.add_argument("--icache", type=int, default=1, help="as run_vm.py: compute skips a repeated op _init (CFD_ICACHE)")
 ap.add_argument("--sched", type=int, default=3, help="as run_vm.py: 1 greedy reorder of each fused run's blocks so values die early, 2 greedy or depth-first, 3 (default) the same at min-store cut points (Machine(sched=K))")
 ap.add_argument("--dedup", type=int, default=0, help="as run_vm.py: a fused run streams each DRAM page once (Machine(dedup=True))")
+ap.add_argument("--tabdense", type=int, default=0, help="N > 0 with --tabstream: a reader-patched map with at least N local residue entries "
+                "per tile on a core is streamed as a dense destination-ordered uint16 index table (512 words a tile) and the reader "
+                "gathers the page in one pass with no window read (CFD_DENSE; encode.py tab_dense). The same page values. "
+                "530 is the measured break-even on BH (6.45 cycles a dense lane against 12.1 a residue entry)")
 ap.add_argument("--tsort", type=int, default=None, help="as run_vm.py: tabstream residue entries sorted by source tile (CFD_TSORT). "
                 "Default on with --tabstream; with --from-images as the images were lowered")
 ap.add_argument("--bpatch", type=int, default=None, help="as run_vm.py: -1 / unset auto (4 when --tabstream and >= --bpatch-min local residue entries per patched map tile), K in 1..7 BRISC scatters (8 - K) / 8 of a patched page's L1 residue (CFD_BPATCH; mailbox in the last 256 B of cb_sync)")
@@ -338,7 +342,11 @@ else:
     assert a.tabstream or not ttfluid.resident.encode.WIDE, "T=%d > 64 needs --tabstream" % m.T
     assert not (ttfluid.resident.encode.WIDE and (a.tgts or a.gtile)), "--tgts / --gtile hand over 16-bit gather entries (vm_compute tsvc): not with wide ones"
     if not a.load:
-        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
+        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense)
+        if a.tabdense:
+            S_ = E.tab_stream
+            print("tabdense %d: %d twin maps, %d of %d (core, twin) tables dense, L1 table %d words, blob %d words a core (staging %d)" % (
+                a.tabdense, len(S_["dense"]), S_["ndense"], len(S_["l1"]) * len(S_["dense"]), S_["l1_words"], S_["blob_words"], S_["staging_words"]), flush=True)
         if a.tscheck:   # as run_vm.py: NCRISC's streamed walk replayed against the cursor tables, every core
             from ttfluid.resident.tabstream import check
             check(E, E.tab_stream, E.tab_cursor)
@@ -347,7 +355,7 @@ else:
             k = max(0, int((a.l1_bytes - (cb_bytes(E) - m.ntiles * 4096)) // 4096 - m.nsmall) // m.T)
             while True:
                 m.place(k, print)
-                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
+                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense)
                 print("l1 auto: %d vector slots in L1, CB bytes %d" % (k, cb_bytes(E)), flush=True)
                 if cb_bytes(E) <= a.l1_bytes or k == 0:
                     break
@@ -641,6 +649,7 @@ def kd(src, ct, cfg, rt=None, crt=None):
         ([("CFD_TSORT", "1")] if a.tsort and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_BPATCH", str(a.bpatch))] if a.bpatch and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_BGTS", str(a.bgts))] if a.bgts and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
+        ([("CFD_DENSE", "1")] if a.tabdense and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_TGTS", str(a.tgts))] if a.tgts and src in ("vm_ncrisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_GTILE", "1")] if a.gtile and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_NARROW", str(CB_H))] if a.narrow and src == "vm_compute.cpp" else []) + \

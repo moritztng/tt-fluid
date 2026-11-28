@@ -154,7 +154,7 @@ def hrun_words(lane, idx, rmin=8):
 
 class Encoded:
     def __init__(self, m, page=False, pdev=None, tab_stream=False, look=False, cores=None, tab_sort=False, phase=None,
-                 gtile=False):
+                 gtile=False, tab_dense=0):
         """page: the compute stream is paged from DRAM through a ring NCRISC fills (vm_ncrisc N_CODE): every basic
         block starts on a PW-word page, the padding is C_JMP (in paged mode JMP and BRT end a block and compute moves
         on to the next delivered page), and NCRISC pushes the pages of a MIR instruction before any of its own ops
@@ -163,6 +163,11 @@ class Encoded:
         look: an N_CODE also names want, the end of its straight-line compute code (the next label, jump or branch),
         and NCRISC pushes on up to it while the ring has free slots, without waiting for them (want = hi: off).
         tab_sort: with tab_stream, local residue entries sorted by source tile per page tile (tabstream.py sort).
+        tab_dense: with tab_stream, N > 0: a reader-patched map with at least N local residue entries per tile on a
+            core is stored there as a dense destination-ordered index table (tabstream.py dense; vm_ncrisc.cpp
+            CFD_DENSE gathers the page in one pass, no window read). The table is a twin of the map, read by the
+            pages whose window and residue come from one L1 vector; the map's other users keep the residue form.
+            The page's lanes are the same values.
         cores: the global cores whose tables, arena and constants to build (row r is core cores[r]), default all; the
         per-chip lowering (lower/spmd.py) builds one chip's.
         phase: {label: phase id} (Program.phase_at, build(phase=True)): a C_PH and a B_PH right after each such label.
@@ -175,6 +180,8 @@ class Encoded:
         self.m, self.page, self.look = m, page, look
         self.cores = np.arange(m.P) if cores is None else np.asarray(cores)
         assert not (tab_stream and getattr(m, "hrun", False)), "hrun marks the L1 gather tables"
+        assert not (tab_dense and (not tab_stream or WIDE)), "dense index tables: streamed, 16-bit lanes"
+        twin = {}    # (map, shift) -> the dense twin's map id (tabstream.py dense), in order of first use
         assert tab_stream or not WIDE, "wide gather entries carry the lane within its tile: only the streamed walk"
         self.loop_pages = 1     # paged: the most code pages the ring holds at once (a tile loop's body, or an N_CODE's
         #   pages past compute's release point); the ring needs more than this
@@ -247,8 +254,13 @@ class Encoded:
                 for u in ldr:
                     assert len(u[5]) <= 8      # the reader keeps 8 part cursors (vm_ncrisc.cpp)
                     ss = 14 if WIDE else 16     # WIDE: 18-bit shift, 10-bit map (vm_ncrisc SS, SM)
-                    assert -(1 << 31 - ss) <= u[3] < 1 << 31 - ss and (u[4] or 0) < (1 << 28 - ss) - 1, (u[3], u[4])
-                    n(desc(u[2]), (u[3] & (1 << 32 - ss) - 1) << ss | (0 if u[4] is None else u[4] + 1) << 4 | len(u[5]))
+                    mid = u[4]
+                    if (tab_dense and mid is not None and u[2] is not None and phys[u[2]] < DBASE
+                            and [x for x, _ in u[5]] == [u[2]]):
+                        # window and residue from one L1 vector: this page reads the map's dense twin
+                        mid = twin.setdefault((mid, u[3]), len(m.maps.tab) + len(twin))
+                    assert -(1 << 31 - ss) <= u[3] < 1 << 31 - ss and (mid or 0) < (1 << 28 - ss) - 1, (u[3], mid)
+                    n(desc(u[2]), (u[3] & (1 << 32 - ss) - 1) << ss | (0 if mid is None else mid + 1) << 4 | len(u[5]))
                     for x, h in u[5]:
                         n(desc(x), NONE16 if h is None else halo_slot(h))
             sink = [r for r in sts if phys[r] >= DBASE]
@@ -475,7 +487,7 @@ class Encoded:
         if tab_stream:      # residue tables in DRAM, a tile-offset index in L1 (tabstream.py)
             from .tabstream import stream
             self.tab_cursor, self.tab_halo_cursor = self.tab, self.tab_halo
-            self.tab_stream = S = stream(self, sort=tab_sort)
+            self.tab_stream = S = stream(self, sort=tab_sort, dense=[(o, sh, tab_dense) for o, sh in twin])
             self.tab = _pad(S["l1"])
             self.tab_blob = _pad(S["blob"])
             self.tab_halo = np.array(S["halo_off"], np.uint32)
