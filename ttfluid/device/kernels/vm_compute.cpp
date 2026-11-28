@@ -124,7 +124,7 @@ void kernel_main() {
 #define PSTATE(s) PACK((hw[301] = (s)))
 #ifdef TRISC_MATH
     for (uint32_t i = 700; i < 1000; ++i) hw[i] = 0;
-    auto wadd = [&](uint32_t i, uint32_t dt) {
+    auto wadd = [&](uint32_t i, uint32_t dt) __attribute__((noinline)) {   // out of line, as the three below: one copy each, the kernel config buffer is 69 KB
         const uint32_t lo = hw[i], nl = lo + dt;
         hw[i] = nl;
         if (nl < lo) hw[i + 1] = hw[i + 1] + 1;
@@ -147,7 +147,7 @@ void kernel_main() {
     };
     // kind 0: after a load (cross-check of mload's poll, to 978: only the get and the four clears are left), 1: after an
     // acquire (cross-check of macq's poll, to 992: nothing is left), 2: own work (976)
-    auto mdrain = [&](uint32_t kind) {
+    auto mdrain = [&](uint32_t kind) __attribute__((noinline)) {
         uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
         ckernel::t6_semaphore_wait_on_max<ckernel::p_stall::STALL_SYNC>(ckernel::semaphore::MATH_DONE);
         ckernel::t6_semaphore_post<ckernel::p_stall::MATH | ckernel::p_stall::WAIT_SFPU>(ckernel::semaphore::MATH_DONE);
@@ -165,7 +165,7 @@ void kernel_main() {
     // unpacker polled on the RISC-V between the mailbox write UNPACK blocks on and the semaphore get: nothing is queued
     // then, so nothing blocks ahead of the poll, and each poll's cycles go to 700 + 2 (16 unpack state + reader class);
     // the last poll to 986
-    auto mload = [&](uint32_t dst) {
+    auto mload = [&](uint32_t dst) __attribute__((noinline)) {
         mdrain(2);
         ckernel::math::math_unpack_to_dest_math_ready();
         ckernel::math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::DestReg>(dst);
@@ -185,7 +185,7 @@ void kernel_main() {
     // an acquire's wait for the packer, polled on the RISC-V before the acquire is issued: MATH_PACK counts the dest
     // sections committed and not yet released, the acquire stalls while it is at its maximum (2 with SyncHalf, 1 with
     // SyncFull). Each poll's cycles go to 960 + 2 pack state, the last poll to 994
-    auto macq = [&]() {
+    auto macq = [&]() __attribute__((noinline)) {
         constexpr uint32_t mpmax = (DST_SYNC_MODE == DstSync::SyncFull) ? 1 : 2;
         mdrain(2);
         uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
