@@ -14,6 +14,15 @@
 // kind << 28 | value, kind 0 L1 tile, 1 DRAM home slot, 2 DRAM constant, 3 none. Single DRAM words are read
 // 16 at a time into 32-B scratch slots at their phase.
 #include "api/dataflow/dataflow_api.h"
+#if defined(CFD_BPATCH) || defined(CFD_BGTS) || defined(CFD_DB) || defined(CFD_PB)
+#define CFD_BMBOX 1
+#endif
+#if defined(CFD_TGTS) || defined(CFD_DU) || defined(CFD_PU)
+#define CFD_TMBOX 1
+#endif
+#ifdef CFD_DENSE
+#include "vm_gather.h"
+#endif
 
 // gather entries dest << XS | src (ttres/encode.py): 16-bit lanes, or CFD_WIDE (T > 64 tiles a core) 22-bit sources
 // and the destination lane within its tile (tabstream only: the stream walks one destination tile at a time, WT)
@@ -32,11 +41,11 @@ constexpr uint32_t SS = 14, SM = 0x3ff;
 constexpr uint32_t SS = 16, SM = 0xfff;
 #endif
 
+#if defined(CFD_TPAT) && (!defined(CFD_TGTS) || !defined(CFD_BPATCH) || !defined(CFD_TABSTREAM))
+#error "CFD_TPAT: the T mailbox of CFD_TGTS and the page shares of CFD_BPATCH, streamed tables"
+#endif
 #if defined(CFD_DENSE) && (!defined(CFD_TABSTREAM) || defined(CFD_WIDE) || defined(CFD_DEFER) || defined(CFD_TRID))
 #error "CFD_DENSE: streamed 16-bit tables, the plain ring (no CFD_DEFER, no CFD_TRID)"
-#endif
-#if defined(CFD_RUNCOPY) && !defined(CFD_DENSE)
-#error "CFD_RUNCOPY requires CFD_DENSE"
 #endif
 
 #if defined(CFD_OS) && CFD_OS >= 2   // run_mesh --os 2: the reader built for size too (see vm_brisc.cpp)
@@ -109,7 +118,7 @@ void kernel_main() {
     constexpr uint32_t CR = get_compile_time_arg_val(17);
     constexpr uint32_t cb_ccode = get_compile_time_arg_val(18);
     constexpr uint32_t W_CREL = 1012;
-#if defined(CFD_BPATCH) || defined(CFD_BGTS)
+#ifdef CFD_BMBOX
     // B-patch mailbox: the last 256 B of cb_sync (vm_brisc.cpp bsvc; a single chip's cb_sync is 8 KB under CFD_BPATCH)
 #ifdef CFD_SYNCB
     constexpr uint32_t MB = CFD_SYNCB / 4 - 64;
@@ -119,12 +128,25 @@ void kernel_main() {
     enum : uint32_t { M_SEQ = MB, M_DONE = MB + 4, M_N = MB + 8, M_JOB = MB + 12 };
     uint32_t bseq = 0;
 #endif
-#ifdef CFD_TGTS
+#ifdef CFD_TMBOX
     // T-gather mailbox: the 256 B of cb_sync before the B one, same layout; compute's UNPACK copies its jobs from
     // inside its own waits (vm_compute.cpp tsvc) and answers DONE = SEQ
     constexpr uint32_t TMB = CFD_SYNCB / 4 - 128;
     enum : uint32_t { T_SEQ = TMB, T_DONE = TMB + 4, T_N = TMB + 8, T_JOB = TMB + 12 };
     uint32_t tseq = 0;
+#endif
+#ifdef CFD_DMP
+    // D-gather mailbox: 64 B before TMB for MATH (trisc1) and PACK (trisc2) on dense tiles
+    constexpr uint32_t DMB = CFD_SYNCB / 4 - 144;
+    enum : uint32_t { D_SRC = DMB, D_IX = DMB + 1, D_OUT = DMB + 2,
+                      D_MSEQ = DMB + 4, D_MOFF = DMB + 5, D_MDONE = DMB + 6, D_MCMD = DMB + 7,
+                      D_PSEQ = DMB + 8, D_POFF = DMB + 9, D_PDONE = DMB + 10, D_PCMD = DMB + 11 };
+#ifdef CFD_DMP_M
+    uint32_t mseq = 0;
+#endif
+#ifdef CFD_DMP_P
+    uint32_t pseq = 0;
+#endif
 #endif
     constexpr auto a_const = TensorAccessorArgs<19>();
     constexpr auto a_home = TensorAccessorArgs<a_const.next_compile_time_args_offset()>();
@@ -353,52 +375,6 @@ void kernel_main() {
         }
         asm volatile("" ::: "memory");   // the page is pushed (or the tile used) after this
     };
-#ifdef CFD_DENSE
-    // a dense tile (tabstream.py dense): lane e of the page from source word ix[e], destination order, eight loads
-    // before eight stores (6.4 cycles a lane on BH against 12.1 for a residue entry: tools/gbench.py)
-    auto gather16 = [](const uint32_t* src, const uint16_t* ix, uint32_t n, uint32_t* out) {
-        uint32_t e = 0;
-        for (; e + 8 <= n; e += 8) {
-            const uint32_t i0 = ix[e], i1 = ix[e + 1], i2 = ix[e + 2], i3 = ix[e + 3];
-            const uint32_t i4 = ix[e + 4], i5 = ix[e + 5], i6 = ix[e + 6], i7 = ix[e + 7];
-            const uint32_t v0 = src[i0], v1 = src[i1], v2 = src[i2], v3 = src[i3];
-            const uint32_t v4 = src[i4], v5 = src[i5], v6 = src[i6], v7 = src[i7];
-            out[e] = v0, out[e + 1] = v1, out[e + 2] = v2, out[e + 3] = v3;
-            out[e + 4] = v4, out[e + 5] = v5, out[e + 6] = v6, out[e + 7] = v7;
-        }
-        for (; e < n; ++e) out[e] = src[ix[e]];
-        asm volatile("" ::: "memory");
-    };
-#ifdef CFD_RUNCOPY
-    // run-copy tile (tabstream.py encode_runcopy): cmd words are COPY-RUN (bit 31: len=(w>>16)&0x7fff, s=w&0xffff ->
-    // 8x-unrolled word copy) or LITERAL-GATHER (bit 31 clear: len=w followed by (len+1)>>1 packed uint16 index words)
-    auto gather_run = [&](const uint32_t* src, const uint32_t* cmd, uint32_t nd, uint32_t* out) {
-        uint32_t* const end = out + nd;
-        while (out < end) {
-            const uint32_t w = *cmd++;
-            if (w >> 31) {
-                const uint32_t len = (w >> 16) & 0x7fffu;
-                const uint32_t* p = src + (w & 0xffffu);
-                uint32_t e = 0;
-                for (; e + 8 <= len; e += 8) {
-                    const uint32_t v0 = p[e], v1 = p[e + 1], v2 = p[e + 2], v3 = p[e + 3];
-                    const uint32_t v4 = p[e + 4], v5 = p[e + 5], v6 = p[e + 6], v7 = p[e + 7];
-                    out[e] = v0, out[e + 1] = v1, out[e + 2] = v2, out[e + 3] = v3;
-                    out[e + 4] = v4, out[e + 5] = v5, out[e + 6] = v6, out[e + 7] = v7;
-                }
-                for (; e < len; ++e) out[e] = p[e];
-                out += len;
-            } else {
-                const uint32_t len = w;
-                gather16(src, reinterpret_cast<const uint16_t*>(cmd), len, out);
-                out += len;
-                cmd += (len + 1) >> 1;
-            }
-        }
-        asm volatile("" ::: "memory");
-    };
-#endif
-#endif
 #ifdef CFD_HRUN
     // hrun: a halo entry with bit 15 set heads a run (its length in the next word) that agrees with its destination
     // mod 16 B, moved by one NoC copy out of the halo slot instead of word by word (encode.py hrun_words)
@@ -576,6 +552,193 @@ void kernel_main() {
         }                                                                        \
         ok_;                                                                     \
     })
+#ifdef CFD_DENSE
+    // Dispatch a 1,024-lane dense gather across up to 5 RISCs (NCRISC, BRISC, UNPACK, MATH, PACK) with disjoint
+    // contiguous lane slices; waits for every active helper before returning so halo/zero overlays stay bit-exact.
+    auto dense_tile = [&](const uint32_t* gs, const uint16_t* ix, uint32_t* o,
+                          uint32_t nN, uint32_t nB, uint32_t nU, uint32_t nM, uint32_t nP) -> bool {
+        uint32_t off = nN;
+#ifdef CFD_BMBOX
+        if (nB) {
+            S[M_JOB] = reinterpret_cast<uint32_t>(gs);
+            S[M_JOB + 1] = reinterpret_cast<uint32_t>(ix + off);
+            S[M_JOB + 2] = nB | (1u << 31);
+            S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + off);
+            S[M_N] = 1;
+            off += nB;
+        }
+#endif
+#ifdef CFD_TMBOX
+        if (nU) {
+            S[T_JOB] = reinterpret_cast<uint32_t>(gs);
+            S[T_JOB + 1] = reinterpret_cast<uint32_t>(ix + off);
+            S[T_JOB + 2] = nU | (1u << 31);
+            S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + off);
+            S[T_N] = 1;
+            off += nU;
+        }
+#endif
+#ifdef CFD_DMP
+        if (nM || nP) {
+            S[D_SRC] = reinterpret_cast<uint32_t>(gs);
+            S[D_IX] = reinterpret_cast<uint32_t>(ix);
+            S[D_OUT] = reinterpret_cast<uint32_t>(o);
+#ifdef CFD_DMP_M
+            if (nM) { S[D_MOFF] = off | (nM << 16); off += nM; }
+#endif
+#ifdef CFD_DMP_P
+            if (nP) { S[D_POFF] = off | (nP << 16); off += nP; }
+#endif
+        }
+#endif
+        (void)off; (void)nB; (void)nU; (void)nM; (void)nP;
+        asm volatile("" ::: "memory");
+        invalidate_l1_cache();
+#ifdef CFD_DMP_M
+        if (nM) S[D_MSEQ] = ++mseq;
+#endif
+#ifdef CFD_DMP_P
+        if (nP) S[D_PSEQ] = ++pseq;
+#endif
+#ifdef CFD_BMBOX
+        if (nB) S[M_SEQ] = ++bseq;
+#endif
+#ifdef CFD_TMBOX
+        if (nU) S[T_SEQ] = ++tseq;
+#endif
+        if (nN) cfd_gather16(gs, ix, nN, o);
+#ifdef CFD_BMBOX
+        if (nB && !WAIT_UNTIL(S[M_DONE] == bseq, 21)) return false;
+#endif
+#ifdef CFD_TMBOX
+        if (nU && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) return false;
+#endif
+#ifdef CFD_DMP_M
+        if (nM && !WAIT_UNTIL(S[D_MDONE] == mseq, 23)) return false;
+#endif
+#ifdef CFD_DMP_P
+        if (nP && !WAIT_UNTIL(S[D_PDONE] == pseq, 24)) return false;
+#endif
+        return true;
+    };
+#ifdef CFD_RUNCOPY
+    // Dispatch a run-copy tile (sn[0] < 512, 5-word split header: 3T c1,c2 + 4T q1,q2,q3 where q2 is also 2T)
+    // across 1..4 active RISCs (N, B, U, P; if P is off and M is on, M takes the 4th slot; if all 5 are active,
+    // MATH stays free for SFPU and N,B,U,P take the 4 balanced chunks).
+    auto runcopy_tile = [&](const uint32_t* gs, const uint32_t* rc, uint32_t* o,
+                            uint32_t nN, uint32_t nB, uint32_t nU, uint32_t nM, uint32_t nP) -> bool {
+        const bool uN = nN != 0;
+#ifdef CFD_BMBOX
+        const bool uB = nB != 0;
+#else
+        constexpr bool uB = false;
+#endif
+#ifdef CFD_TMBOX
+        const bool uU = nU != 0;
+#else
+        constexpr bool uU = false;
+#endif
+#ifdef CFD_DMP_P
+        const bool uP = nP != 0;
+#else
+        constexpr bool uP = false;
+#endif
+#ifdef CFD_DMP_M
+        const bool uM = !uP && (nM != 0);
+#else
+        constexpr bool uM = false;
+#endif
+        const uint32_t nthr = static_cast<uint32_t>(uN) + uB + uU + uP + uM;
+        uint32_t ln[4], nd[4], wo[4];
+        if (nthr == 1) {
+            ln[0] = 0, nd[0] = 1024, wo[0] = 5;
+        } else if (nthr == 2) {
+            const uint32_t h = rc[3], q2 = h & 0xffffu, q2o = h >> 16;
+            ln[0] = 0,  nd[0] = q2,        wo[0] = 5;
+            ln[1] = q2, nd[1] = 1024 - q2, wo[1] = q2o;
+        } else if (nthr == 3) {
+            const uint32_t h0 = rc[0], h1 = rc[1];
+            const uint32_t c1 = h0 & 0xffffu, c1o = h0 >> 16, c2 = h1 & 0xffffu, c2o = h1 >> 16;
+            ln[0] = 0,  nd[0] = c1,        wo[0] = 5;
+            ln[1] = c1, nd[1] = c2 - c1,   wo[1] = c1o;
+            ln[2] = c2, nd[2] = 1024 - c2, wo[2] = c2o;
+        } else {
+            const uint32_t h0 = rc[2], h1 = rc[3], h2 = rc[4];
+            const uint32_t q1 = h0 & 0xffffu, q1o = h0 >> 16;
+            const uint32_t q2 = h1 & 0xffffu, q2o = h1 >> 16;
+            const uint32_t q3 = h2 & 0xffffu, q3o = h2 >> 16;
+            ln[0] = 0,  nd[0] = q1,        wo[0] = 5;
+            ln[1] = q1, nd[1] = q2 - q1,   wo[1] = q1o;
+            ln[2] = q2, nd[2] = q3 - q2,   wo[2] = q2o;
+            ln[3] = q3, nd[3] = 1024 - q3, wo[3] = q3o;
+        }
+        uint32_t ci = 0, n_ln = 0, n_nd = 0, n_wo = 5;
+        if (uN) { n_ln = ln[ci], n_nd = nd[ci], n_wo = wo[ci]; ++ci; }
+#ifdef CFD_BMBOX
+        if (uB) {
+            S[M_JOB] = reinterpret_cast<uint32_t>(gs);
+            S[M_JOB + 1] = reinterpret_cast<uint32_t>(rc + wo[ci]);
+            S[M_JOB + 2] = nd[ci] | (1u << 30);
+            S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + ln[ci]);
+            S[M_N] = 1;
+            ++ci;
+        }
+#endif
+#ifdef CFD_TMBOX
+        if (uU) {
+            S[T_JOB] = reinterpret_cast<uint32_t>(gs);
+            S[T_JOB + 1] = reinterpret_cast<uint32_t>(rc + wo[ci]);
+            S[T_JOB + 2] = nd[ci] | (1u << 30);
+            S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + ln[ci]);
+            S[T_N] = 1;
+            ++ci;
+        }
+#endif
+#ifdef CFD_DMP
+        if (uM || uP) {
+            S[D_SRC] = reinterpret_cast<uint32_t>(gs);
+            S[D_IX] = reinterpret_cast<uint32_t>(rc);
+            S[D_OUT] = reinterpret_cast<uint32_t>(o);
+#ifdef CFD_DMP_M
+            if (uM) { S[D_MOFF] = ln[ci] | ((nd[ci] | 0x8000u) << 16); S[D_MCMD] = wo[ci]; ++ci; }
+#endif
+#ifdef CFD_DMP_P
+            if (uP) { S[D_POFF] = ln[ci] | ((nd[ci] | 0x8000u) << 16); S[D_PCMD] = wo[ci]; ++ci; }
+#endif
+        }
+#endif
+        (void)ci; (void)nB; (void)nU; (void)nM; (void)nP;
+        asm volatile("" ::: "memory");
+        invalidate_l1_cache();
+#ifdef CFD_DMP_M
+        if (uM) S[D_MSEQ] = ++mseq;
+#endif
+#ifdef CFD_DMP_P
+        if (uP) S[D_PSEQ] = ++pseq;
+#endif
+#ifdef CFD_BMBOX
+        if (uB) S[M_SEQ] = ++bseq;
+#endif
+#ifdef CFD_TMBOX
+        if (uU) S[T_SEQ] = ++tseq;
+#endif
+        if (uN) cfd_gather_run(gs, rc + n_wo, n_nd, o + n_ln);
+#ifdef CFD_BMBOX
+        if (uB && !WAIT_UNTIL(S[M_DONE] == bseq, 21)) return false;
+#endif
+#ifdef CFD_TMBOX
+        if (uU && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) return false;
+#endif
+#ifdef CFD_DMP_M
+        if (uM && !WAIT_UNTIL(S[D_MDONE] == mseq, 23)) return false;
+#endif
+#ifdef CFD_DMP_P
+        if (uP && !WAIT_UNTIL(S[D_PDONE] == pseq, 24)) return false;
+#endif
+        return true;
+    };
+#endif
+#endif
 
     // BRISC zeroes the sync region and loads the tables before it releases `go` (1 = run, 2 = its barrier failed)
     bool run = true;
@@ -726,94 +889,33 @@ void kernel_main() {
 #ifdef CFD_DENSE
                         if (dn) {
                             // dense twin (tabstream.py): section 0 is this tile's 1,024 source lanes as uint16 in lane
-                            // order (sn[0] == 512) or a run-copy command stream (CFD_RUNCOPY, sn[0] < 512). Halo and
-                            // zero lanes go on top once both helper threads have answered.
+                            // order, so every lane is gathered once with a sequential store across up to 5 RISCs;
+                            // halo values and zero lanes go on top once every helper has answered
                             const uint32_t* const gs = A + parts[0] * 1024;
+                            const uint16_t* const ix = reinterpret_cast<const uint16_t*>(sp[0]);
                             uint32_t* const o = dst + 1024 * t;
-#ifdef CFD_RUNCOPY
-                            if (sn[0] < 512) {
-                                const uint32_t* const rc = sp[0];
-#if defined(CFD_BGTS) && defined(CFD_TGTS)
-                                const uint32_t c1 = rc[0] & 0xffffu, c1_off = rc[0] >> 16;
-                                const uint32_t c2 = rc[1] & 0xffffu, c2_off = rc[1] >> 16;
-                                S[M_JOB] = reinterpret_cast<uint32_t>(gs);
-                                S[M_JOB + 1] = reinterpret_cast<uint32_t>(rc + c2_off);
-                                S[M_JOB + 2] = (1024 - c2) | 1u << 30;
-                                S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + c2);
-                                S[M_N] = 1;
-                                asm volatile("" ::: "memory");
-                                S[M_SEQ] = ++bseq;
-                                S[T_JOB] = reinterpret_cast<uint32_t>(gs);
-                                S[T_JOB + 1] = reinterpret_cast<uint32_t>(rc + c1_off);
-                                S[T_JOB + 2] = (c2 - c1) | 1u << 30;
-                                S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + c1);
-                                S[T_N] = 1;
-                                asm volatile("" ::: "memory");
-                                S[T_SEQ] = ++tseq;
-                                gather_run(gs, rc + 3, c1, o);
-                                if (!WAIT_UNTIL(S[M_DONE] == bseq, 21)) { run = false; break; }
-                                if (!WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
-#elif defined(CFD_BGTS)
-                                const uint32_t m2 = rc[2] & 0xffffu, m2_off = rc[2] >> 16;
-                                S[M_JOB] = reinterpret_cast<uint32_t>(gs);
-                                S[M_JOB + 1] = reinterpret_cast<uint32_t>(rc + m2_off);
-                                S[M_JOB + 2] = (1024 - m2) | 1u << 30;
-                                S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + m2);
-                                S[M_N] = 1;
-                                asm volatile("" ::: "memory");
-                                S[M_SEQ] = ++bseq;
-                                gather_run(gs, rc + 3, m2, o);
-                                if (!WAIT_UNTIL(S[M_DONE] == bseq, 21)) { run = false; break; }
-#elif defined(CFD_TGTS)
-                                const uint32_t m2 = rc[2] & 0xffffu, m2_off = rc[2] >> 16;
-                                S[T_JOB] = reinterpret_cast<uint32_t>(gs);
-                                S[T_JOB + 1] = reinterpret_cast<uint32_t>(rc + m2_off);
-                                S[T_JOB + 2] = (1024 - m2) | 1u << 30;
-                                S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + m2);
-                                S[T_N] = 1;
-                                asm volatile("" ::: "memory");
-                                S[T_SEQ] = ++tseq;
-                                gather_run(gs, rc + 3, m2, o);
-                                if (!WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
+#ifdef CFD_DSHARE
+                            static_assert(CFD_DN + CFD_DB + CFD_DU + CFD_DM + CFD_DP == 64, "dshare sum");
+                            constexpr uint32_t dN = 16 * CFD_DN, dB = 16 * CFD_DB, dU = 16 * CFD_DU, dM = 16 * CFD_DM, dP = 16 * CFD_DP;
 #else
-                                gather_run(gs, rc + 3, 1024, o);
+#ifdef CFD_BGTS
+                            constexpr uint32_t dB = 1024 - 1024 * CFD_BGTS / 8;
+#else
+                            constexpr uint32_t dB = 0;
 #endif
+#ifdef CFD_TGTS
+                            constexpr uint32_t dU = 1024 * CFD_TGTS / 8 < (1024 - dB) ? 1024 * CFD_TGTS / 8 : 0;
+#else
+                            constexpr uint32_t dU = 0;
+#endif
+                            constexpr uint32_t dN = 1024 - dB - dU, dM = 0, dP = 0;
+#endif
+#ifdef CFD_RUNCOPY
+                            if (sn[0] && sn[0] < 512) {
+                                if (!runcopy_tile(gs, sp[0], o, dN, dB, dU, dM, dP)) { run = false; break; }
                             } else
 #endif
-                            {
-                                const uint16_t* const ix = reinterpret_cast<const uint16_t*>(sp[0]);
-                                uint32_t lo = 1024;
-#ifdef CFD_BGTS
-                                lo = 1024 * CFD_BGTS / 8;
-                                S[M_JOB] = reinterpret_cast<uint32_t>(gs);
-                                S[M_JOB + 1] = reinterpret_cast<uint32_t>(ix + lo);
-                                S[M_JOB + 2] = (1024 - lo) | 1u << 31;
-                                S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + lo);
-                                S[M_N] = 1;
-                                asm volatile("" ::: "memory");
-                                S[M_SEQ] = ++bseq;
-#endif
-#ifdef CFD_TGTS
-                                const uint32_t dq = 1024 * CFD_TGTS / 8 < lo ? 1024 * CFD_TGTS / 8 : 0;
-                                if (dq) {
-                                    lo -= dq;
-                                    S[T_JOB] = reinterpret_cast<uint32_t>(gs);
-                                    S[T_JOB + 1] = reinterpret_cast<uint32_t>(ix + lo);
-                                    S[T_JOB + 2] = dq | 1u << 31;
-                                    S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + lo);
-                                    S[T_N] = 1;
-                                    asm volatile("" ::: "memory");
-                                    S[T_SEQ] = ++tseq;
-                                }
-#endif
-                                gather16(gs, ix, lo, o);
-#ifdef CFD_BGTS
-                                if (!WAIT_UNTIL(S[M_DONE] == bseq, 21)) { run = false; break; }
-#endif
-#ifdef CFD_TGTS
-                                if (dq && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
-#endif
-                            }
+                            if (!dense_tile(gs, ix, o, dN, dB, dU, dM, dP)) { run = false; break; }
                             scatter(hbuf(parts[1]), sp[1], sn[1], dt);
                             for (uint32_t e = 0; e < sn[2]; ++e) dt[sp[2][e]] = 0;
                         } else
@@ -953,9 +1055,12 @@ void kernel_main() {
                 const uint32_t e0 = pc + 1;
                 // pe: the last patched entry's word offset. CFD_TABSTREAM without CFD_TRID patches any number of
                 // entries per stream (--pseg 3), each from its own tables; the other builds keep one (encode.py)
-                uint32_t p = e0, pe = 0;
+                uint32_t p = e0, pe = 0, p_first = 0;
                 for (uint32_t e = 0; e < ne; ++e) {
-                    if ((N[p + 1] >> 4) & SM) pe = p;
+                    if ((N[p + 1] >> 4) & SM) {
+                        if (!p_first) p_first = p;
+                        pe = p;
+                    }
                     p += 2 + 2 * (N[p + 1] & 0xf);
                 }
                 pc = p;
@@ -964,6 +1069,26 @@ void kernel_main() {
                 uint32_t ql[8], nl[8], qh[8], nh[8], cl[8], ch[8], cz = 0;   // up to 8 gather parts (encode.py)
 #ifdef CFD_TABSTREAM
                 uint32_t qi = 0, tm = 0;
+#if defined(CFD_SPREFETCH) && !defined(CFD_TRID) && !defined(CFD_DEFER)
+                uint32_t pbuf = 0;
+                bool pflight = false, pre_win = false;
+                auto pf_load = [&](uint32_t pp, uint32_t tt, uint32_t b) {
+                    const uint32_t mw = N[pp + 1];
+                    const uint32_t npk = mw & 0xf;
+                    const uint32_t ent = T[(mw >> 4) & SM];
+                    load_tile(ent & 0xfffff, 2 * npk + 1, tt, b, ent >> 20);
+                    pflight = true;
+                };
+                auto next_pat_after = [&](uint32_t tc, uint32_t ec, uint32_t pc_, uint32_t& nt_o, uint32_t& pp_o) -> bool {
+                    uint32_t pp = pc_ + 2 + 2 * (N[pc_ + 1] & 0xf);
+                    for (uint32_t ee = ec + 1; ee < ne; ++ee, pp += 2 + 2 * (N[pp + 1] & 0xf))
+                        if ((N[pp + 1] >> 4) & SM) { nt_o = tc; pp_o = pp; return true; }
+                    if (tc + 1 < tn) { nt_o = tc + 1; pp_o = p_first; return true; }
+                    return false;
+                };
+                // overlap tile 0's first patched table read with the halo waits below (as in N_GATHER)
+                if (p_first && run) pf_load(p_first, 0, 0);
+#endif
                 for (uint32_t e = 0, pp = e0; e < ne && run; ++e, pp += 2 + 2 * (N[pp + 1] & 0xf)) {
                     if (!((N[pp + 1] >> 4) & SM)) continue;
                     np_ = N[pp + 1] & 0xf;
@@ -976,13 +1101,14 @@ void kernel_main() {
                             if (!WAIT_UNTIL(S[4 * s] >= hcnt[s] * nsend[s], 16)) { run = false; break; }
                         }
                 }
-                (void)pe, (void)qz, (void)nz, (void)ql, (void)nl, (void)qh, (void)nh, (void)cl, (void)ch, (void)cz;
+                (void)pe, (void)p_first, (void)qi, (void)tm, (void)qz, (void)nz, (void)ql, (void)nl, (void)qh, (void)nh, (void)cl, (void)ch, (void)cz;
 #ifdef CFD_TRID
                 // tile 0's tables go out now, tile t + 1's once tile t is patched (two staging buffers, as in GATHER),
                 // so the patched page rarely waits for its tables
                 if (pe && run) load_tile(qi, 2 * np_ + 1, 0, 0, tm);
 #endif
 #else
+                (void)p_first;
                 if (pe) {
                     np_ = N[pe + 1] & 0xf;
                     uint32_t q = T[(N[pe + 1] >> 4) & SM];   // T[1 + map]
@@ -1002,7 +1128,12 @@ void kernel_main() {
                     qz = q + 1;
                 }
 #endif
-                if (!run) break;
+                if (!run) {
+#if defined(CFD_SPREFETCH) && defined(CFD_TABSTREAM) && !defined(CFD_TRID) && !defined(CFD_DEFER)
+                    if (pflight) noc_async_read_barrier();
+#endif
+                    break;
+                }
                 uint32_t pend = 0;
 #ifdef CFD_TRID
                 // up to RING pages in flight, slot k's reads under id 1 + k: after every issue the slots whose reads
@@ -1067,6 +1198,14 @@ void kernel_main() {
                     const uint32_t lo = t * 1024, hi = lo + 1024;
                     p = e0;
                     for (uint32_t e = 0; e < ne && run; ++e) {
+#if defined(CFD_SPREFETCH) && defined(CFD_TABSTREAM) && !defined(CFD_TRID) && !defined(CFD_DEFER)
+                        if (pre_win) {
+                            pre_win = false;
+                            if (get_write_ptr(cb_in) + PS == in1) drain();
+                            p += 2 + 2 * (N[p + 1] & 0xf);
+                            continue;
+                        }
+#endif
                         const uint32_t d = N[p];
                         const int32_t sh = static_cast<int32_t>(N[p + 1]) >> SS;
 #ifdef CFD_TRID
@@ -1113,6 +1252,32 @@ void kernel_main() {
 #else
                             PSUB(16, tbar(id));
 #endif
+#elif defined(CFD_SPREFETCH) && defined(CFD_TABSTREAM) && !defined(CFD_DEFER)
+                            // earlier unpatched slots + this page's window (if !dn) + prefetched table in sp_[pbuf]
+                            PSUB(16, noc_async_read_barrier());
+                            pflight = false;
+                            const uint32_t cur_b = pbuf;
+                            np_ = N[p + 1] & 0xf;
+                            sp = sp_[cur_b], sn = sn_[cur_b];
+                            if (pend > 1) {
+                                cb_push_back(cb_in, pend - 1);
+                                npages += pend - 1;
+                                pend = 1;
+                            }
+                            {
+                                const uint32_t p_nxt = p + 2 + 2 * np_;
+                                if (e + 1 < ne && !((N[p_nxt + 1] >> 4) & SM) && pg + PS < in1 &&
+                                    cb_pages_reservable_at_back(cb_in, 2)) {
+                                    cb_reserve_back(cb_in, 2);
+                                    window(N[p_nxt], t, static_cast<int32_t>(N[p_nxt + 1]) >> SS, pg + PS);
+                                    pre_win = true;
+                                }
+                                uint32_t nt_pf = 0, pp_pf = 0;
+                                if (next_pat_after(t, e, p, nt_pf, pp_pf)) {
+                                    pbuf = cur_b ^ 1;
+                                    pf_load(pp_pf, nt_pf, pbuf);
+                                }
+                            }
 #else
 #ifdef CFD_TABSTREAM
                             np_ = N[p + 1] & 0xf;
@@ -1147,7 +1312,6 @@ void kernel_main() {
 #endif
 #ifdef CFD_DENSE
                             uint32_t* const pd = const_cast<uint32_t*>(pl) + lo;   // the page's lane 0
-                            uint32_t dkeep = 1024;                                   // dense lanes this core gathers
 #else
                             constexpr bool dn = false;
                             (void)dn;
@@ -1156,30 +1320,11 @@ void kernel_main() {
                             // BRISC scatters the upper (8 - CFD_BPATCH) / 8 of every L1-source local section (vm_brisc.cpp
                             // bsvc); this core does the rest, then waits for its DONE before the page is pushed
                             uint32_t nj = 0, nkeep[8];
-#ifdef CFD_DENSE
-                            if (dn) {   // BRISC gathers the upper share of the tile's lanes (bit 31: dense, bit 30: run-copy)
-                                nkeep[0] = 0;   // (unused on a dense tile)
-#ifdef CFD_RUNCOPY
-                                if (sn[0] < 512) {
-                                    const uint32_t* const rc = sp[0];
-                                    const uint32_t m2 = rc[2] & 0xffffu, m2_off = rc[2] >> 16;
-                                    dkeep = m2;
-                                    S[M_JOB] = reinterpret_cast<uint32_t>(A + N[p + 2] * 1024);
-                                    S[M_JOB + 1] = reinterpret_cast<uint32_t>(rc + m2_off);
-                                    S[M_JOB + 2] = (1024 - m2) | 1u << 30;
-                                    S[M_JOB + 3] = reinterpret_cast<uint32_t>(pd + m2);
-                                    nj = 1;
-                                } else
-#endif
-                                {
-                                    dkeep = 1024 * CFD_BPATCH / 8;
-                                    S[M_JOB] = reinterpret_cast<uint32_t>(A + N[p + 2] * 1024);
-                                    S[M_JOB + 1] = reinterpret_cast<uint32_t>(reinterpret_cast<const uint16_t*>(sp[0]) + dkeep);
-                                    S[M_JOB + 2] = (1024 - dkeep) | 1u << 31;
-                                    S[M_JOB + 3] = reinterpret_cast<uint32_t>(pd + dkeep);
-                                    nj = 1;
-                                }
-                            }
+#ifdef CFD_TPAT
+                            // compute's UNPACK is a third thread on the page: it takes CFD_TPAT / 8 of every share BRISC
+                            // gets a part of, out of what is left to this core (the T mailbox of CFD_TGTS; UNPACK waits for
+                            // this very page in TWAIT(cb_in) and copies from inside that wait, vm_compute.cpp tsvc)
+                            uint32_t nt = 0;
 #endif
                             for (uint32_t k = 0; k < np_ && !dn; ++k) {
                                 const uint32_t sd = N[p + 2 + 2 * k], n = sn[2 * k];
@@ -1192,6 +1337,17 @@ void kernel_main() {
                                     S[M_JOB + 4 * nj + 3] = reinterpret_cast<uint32_t>(pl);
                                     nkeep[k] = h;
                                     ++nj;
+#ifdef CFD_TPAT
+                                    const uint32_t ut = n * CFD_TPAT / 8;
+                                    if (ut && ut < h) {   // entries [h - ut, h); at most np_ <= 8 jobs, the mailbox holds 13
+                                        S[T_JOB + 4 * nt] = reinterpret_cast<uint32_t>(A + sd * 1024);
+                                        S[T_JOB + 4 * nt + 1] = reinterpret_cast<uint32_t>(sp[2 * k] + h - ut);
+                                        S[T_JOB + 4 * nt + 2] = ut;
+                                        S[T_JOB + 4 * nt + 3] = reinterpret_cast<uint32_t>(pl);
+                                        nkeep[k] = h - ut;
+                                        ++nt;
+                                    }
+#endif
                                 }
                             }
                             if (nj) {
@@ -1199,6 +1355,13 @@ void kernel_main() {
                                 asm volatile("" ::: "memory");
                                 S[M_SEQ] = ++bseq;
                             }
+#ifdef CFD_TPAT
+                            if (nt) {
+                                S[T_N] = nt;
+                                asm volatile("" ::: "memory");
+                                S[T_SEQ] = ++tseq;
+                            }
+#endif
 #endif
                             for (uint32_t k = 0; k < np_; ++k) {
                                 const uint32_t sd = N[p + 2 + 2 * k];
@@ -1209,21 +1372,34 @@ void kernel_main() {
 #endif
 #ifdef CFD_DENSE
                                 if (dn) {
-#ifdef CFD_RUNCOPY
-                                    if (sn[0] < 512)
-                                        gather_run(A + sd * 1024, sp[0] + 3, dkeep, pd);
-                                    else
-#endif
-                                        gather16(A + sd * 1024, reinterpret_cast<const uint16_t*>(sp[0]), dkeep, pd);
+#ifdef CFD_PSHARE
+                                    static_assert(CFD_PN + CFD_PB + CFD_PU + CFD_PM + CFD_PP == 64, "pshare sum");
+                                    constexpr uint32_t pN = 16 * CFD_PN, pB = 16 * CFD_PB, pU = 16 * CFD_PU, pM = 16 * CFD_PM, pP = 16 * CFD_PP;
+#else
 #ifdef CFD_BPATCH
-                                    // BRISC's lanes include halo and zero lanes: those are written after its DONE
-                                    if (nj) {
-                                        bool okb = true;
-                                        PSUB(18, okb = WAIT_UNTIL(S[M_DONE] == bseq, 21));
-                                        if (!okb) { run = false; break; }
-                                        nj = 0;
-                                    }
+                                    constexpr uint32_t pB = 1024 - 1024 * CFD_BPATCH / 8;
+#else
+                                    constexpr uint32_t pB = 0;
 #endif
+#if defined(CFD_BPATCH) && defined(CFD_TPAT)
+                                    constexpr uint32_t pU = 1024 * CFD_TPAT / 8 < (1024 - pB) ? 1024 * CFD_TPAT / 8 : 0;
+#else
+                                    constexpr uint32_t pU = 0;
+#endif
+                                    constexpr uint32_t pN = 1024 - pB - pU, pM = 0, pP = 0;
+#endif
+#ifdef CFD_RUNCOPY
+                                    if (sn[0] && sn[0] < 512) {
+                                        if (!runcopy_tile(A + sd * 1024, sp[0], pd, pN, pB, pU, pM, pP)) {
+                                            run = false;
+                                            break;
+                                        }
+                                    } else
+#endif
+                                    if (!dense_tile(A + sd * 1024, reinterpret_cast<const uint16_t*>(sp[0]), pd, pN, pB, pU, pM, pP)) {
+                                        run = false;
+                                        break;
+                                    }
                                 } else
 #endif
 #ifdef CFD_BPATCH
@@ -1257,6 +1433,13 @@ void kernel_main() {
                                 PSUB(18, okb = WAIT_UNTIL(S[M_DONE] == bseq, 21));   // part 18 (GATHER halo wait, 0 in STREAM runs)
                                 if (!okb) { run = false; break; }
                             }
+#ifdef CFD_TPAT
+                            if (nt) {
+                                bool okt = true;
+                                PSUB(18, okt = WAIT_UNTIL(S[T_DONE] == tseq, 22));
+                                if (!okt) { run = false; break; }
+                            }
+#endif
 #endif
 #ifdef CFD_TRID
                             if (t + 1 < tn) load_tile(qi, 2 * np_ + 1, t + 1, (t + 1) & 1, tm);
@@ -1287,6 +1470,14 @@ void kernel_main() {
                         }
 #ifdef CFD_TRID
                         retire(false);
+#elif defined(CFD_SPREFETCH) && defined(CFD_TABSTREAM) && !defined(CFD_DEFER)
+                        if (pat) {
+                            cb_push_back(cb_in, 1);
+                            ++npages;
+                            pend = pre_win ? 1 : 0;
+                        } else if (pg + PS == in1) {
+                            drain();
+                        }
 #else
                         if (pat || pg + PS == in1) drain();
 #endif
@@ -1297,6 +1488,9 @@ void kernel_main() {
                 if (run) retire(true);
 #else
                 if (run) drain();
+#if defined(CFD_SPREFETCH) && defined(CFD_TABSTREAM) && !defined(CFD_DEFER)
+                if (!run && (pflight || pend)) noc_async_read_barrier();
+#endif
 #endif
                 break;
             }

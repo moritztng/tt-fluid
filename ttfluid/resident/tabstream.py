@@ -127,7 +127,7 @@ def _enc_seg(seg, rmin):
         L = len(lit)
         words.append(L)
         words.extend(_half(lit))
-        cost += L * 7.47 + 10.0
+        cost += L * 6.91 + 8.0
         lit.clear()
 
     for s0, e0 in zip(starts, ends):
@@ -136,7 +136,7 @@ def _enc_seg(seg, rmin):
             flush_lit()
             words.append((1 << 31) | (L << 16) | int(seg[s0]))
             run_lanes += L
-            cost += L * 3.82 + 10.0
+            cost += L * 2.10 + 8.0
         else:
             lit.extend(seg[s0:e0].tolist())
     flush_lit()
@@ -144,11 +144,11 @@ def _enc_seg(seg, rmin):
 
 
 def encode_runcopy(tile_idx, tile_dc, max_src, rmin=4, weights=(1, 1, 1), brk=0):
-    """Encode one 1024-lane dense tile as a run-copy stream (< 512 words) with a 3-word thread-split header,
+    """Encode one 1024-lane dense tile as a run-copy stream (< 512 words) with a 5-word thread-split header,
     or return None to fall back to a plain 512-word dense tile.
 
-    Header words 0..2: c1 | c1_off<<16, c2 | c2_off<<16, m2 | m2_off<<16 for 3-thread ([0,c1), [c1,c2), [c2,1024))
-    and 2-thread ([0,m2), [m2,1024)) balanced splits; 1-thread runs straight through [0,1024) from word 3.
+    Header words 0..4: c1|c1_off<<16, c2|c2_off<<16 (3-thread), q1|q1_off<<16, q2|q2_off<<16, q3|q3_off<<16
+    (4-thread, with q2 also serving as the balanced 2-thread midpoint); 1-thread runs from word 5.
     Don't-care lanes (overwritten by halo or zero sections) bridge runs while staying within [0, max_src]."""
     v = tile_idx.copy()
     if tile_dc.any():
@@ -166,40 +166,54 @@ def encode_runcopy(tile_idx, tile_dc, max_src, rmin=4, weights=(1, 1, 1), brk=0)
     cont[1:] = v[1:] == v[:-1] + 1
     starts = np.flatnonzero(~cont)
     ends = np.r_[starts[1:], 1024]
-    cost = np.full(1024, 7.47)
+    cost = np.full(1024, 6.91)
     is_run = np.zeros(1024, dtype=bool)
     for s0, e0 in zip(starts, ends):
         if e0 - s0 >= rmin:
-            cost[s0:e0] = 3.82
-            cost[s0] += 10.0
+            cost[s0:e0] = 2.10
+            cost[s0] += 8.0
             is_run[s0:e0] = True
     nr = ~is_run
     lit_s = np.flatnonzero(nr & np.r_[True, ~nr[:-1]])
     if len(lit_s):
-        cost[lit_s] += 10.0
+        cost[lit_s] += 8.0
     cc = np.cumsum(cost)
     tot = float(cc[-1])
     wn, wt, wb = weights
     ws = float(wn + wt + wb)
     c1 = int(np.clip(np.searchsorted(cc, tot * wn / ws), 1, 1022))
     c2 = int(np.clip(np.searchsorted(cc, tot * (wn + wt) / ws), c1 + 1, 1023))
-    m2 = int(np.clip(np.searchsorted(cc, tot * 0.5), c1, c2))
-    w0, r0, k0 = _enc_seg(v[:c1], rmin)
-    w1, r1, k1 = _enc_seg(v[c1:m2], rmin)
-    w2, r2, k2 = _enc_seg(v[m2:c2], rmin)
-    w3, r3, k3 = _enc_seg(v[c2:], rmin)
-    c1_off = 3 + len(w0)
-    m2_off = c1_off + len(w1)
-    c2_off = m2_off + len(w2)
-    words = [c1 | (c1_off << 16), c2 | (c2_off << 16), m2 | (m2_off << 16)] + w0 + w1 + w2 + w3
+    q1 = int(np.clip(np.searchsorted(cc, tot * 0.25), 1, 1021))
+    q2 = int(np.clip(np.searchsorted(cc, tot * 0.50), q1 + 1, 1022))
+    q3 = int(np.clip(np.searchsorted(cc, tot * 0.75), q2 + 1, 1023))
+    pts = sorted({0, 1024, c1, c2, q1, q2, q3})
+    off = {0: 5}
+    body = []
+    tot_runs = 0
+    seg_cost = {}
+    for a, b in zip(pts[:-1], pts[1:]):
+        w_ab, r_ab, k_ab = _enc_seg(v[a:b], rmin)
+        body.extend(w_ab)
+        tot_runs += r_ab
+        seg_cost[(a, b)] = k_ab
+        off[b] = 5 + len(body)
+    words = [
+        c1 | (off[c1] << 16),
+        c2 | (off[c2] << 16),
+        q1 | (off[q1] << 16),
+        q2 | (off[q2] << 16),
+        q3 | (off[q3] << 16),
+    ] + body
     if len(words) >= 512:
         return None
-    # Per-tile win gate: keep plain DENSE if balanced 3T cost does not beat plain DENSE 384-lane gather16
-    if not brk and max(k0, k1 + k2, k3) >= 384 * 7.47:
+    # Per-tile win gate: keep plain DENSE if balanced 4T cost does not beat plain DENSE 256-lane d16a16
+    def _span_cost(lo, hi):
+        return sum(seg_cost[(a, b)] for a, b in zip(pts[:-1], pts[1:]) if lo <= a and b <= hi)
+    if not brk and max(_span_cost(0, q1), _span_cost(q1, q2), _span_cost(q2, q3), _span_cost(q3, 1024)) >= 256 * 6.91:
         return None
     if brk:
         left = brk
-        p = 3
+        p = 5
         while p < len(words) and left > 0:
             w = words[p]
             if w >> 31:
@@ -212,7 +226,7 @@ def encode_runcopy(tile_idx, tile_dc, max_src, rmin=4, weights=(1, 1, 1), brk=0)
                 p += 1
             else:
                 p += 1 + ((w + 1) >> 1)
-    return words, r0 + r1 + r2 + r3
+    return words, tot_runs
 
 
 def bpatch_auto(loc, bpatch_min):
@@ -394,11 +408,13 @@ def _walk_stream(L, B, mid, nparts, T):
 
 
 def _unrun(w):
-    """Exact Python mirror of vm_ncrisc/vm_brisc/vm_compute gather_run: verifies 1T, 2T and 3T splits match."""
-    assert 3 <= len(w) < 512, f"bad run-copy tile length {len(w)}"
+    """Exact Python mirror of vm_gather.h cfd_gather_run: verifies 1T, 2T, 3T and 4T splits match."""
+    assert 5 <= len(w) < 512, f"bad run-copy tile length {len(w)}"
     c1, c1_off = int(w[0] & 0xFFFF), int(w[0] >> 16)
     c2, c2_off = int(w[1] & 0xFFFF), int(w[1] >> 16)
-    m2, m2_off = int(w[2] & 0xFFFF), int(w[2] >> 16)
+    q1, q1_off = int(w[2] & 0xFFFF), int(w[2] >> 16)
+    q2, q2_off = int(w[3] & 0xFFFF), int(w[3] >> 16)
+    q3, q3_off = int(w[4] & 0xFFFF), int(w[4] >> 16)
 
     def dec(off, nd, expect_end=None):
         out = []
@@ -424,10 +440,11 @@ def _unrun(w):
             assert p == expect_end, f"run-copy end offset {p} != {expect_end}"
         return np.array(out, np.int64)
 
-    d1 = dec(3, 1024, len(w))
-    d2 = np.concatenate([dec(3, m2, m2_off), dec(m2_off, 1024 - m2, len(w))])
-    d3 = np.concatenate([dec(3, c1, c1_off), dec(c1_off, c2 - c1, c2_off), dec(c2_off, 1024 - c2, len(w))])
-    assert (d1 == d2).all() and (d1 == d3).all(), "run-copy 1T/2T/3T split mismatch"
+    d1 = dec(5, 1024, len(w))
+    d2 = np.concatenate([dec(5, q2, q2_off), dec(q2_off, 1024 - q2, len(w))])
+    d3 = np.concatenate([dec(5, c1, c1_off), dec(c1_off, c2 - c1, c2_off), dec(c2_off, 1024 - c2, len(w))])
+    d4 = np.concatenate([dec(5, q1, q1_off), dec(q1_off, q2 - q1, q2_off), dec(q2_off, q3 - q2, q3_off), dec(q3_off, 1024 - q3, len(w))])
+    assert (d1 == d2).all() and (d1 == d3).all() and (d1 == d4).all(), "run-copy 1T/2T/3T/4T split mismatch"
     return d1
 
 

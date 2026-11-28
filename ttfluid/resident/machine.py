@@ -985,7 +985,43 @@ def box_rank(owner, mesh, P, per_piece=False):
     return rank
 
 
-def sliced_lanes(owner, counts, P, Q=0, banded=None):
+def export_key(owner, fo, fn):
+    """Per cell 0 if no other core reads it through a face, else a positive key that sorts cells by their receiver
+    set (the cores owning their face neighbours, ascending; sets compare lexicographically, the first D receivers
+    count). sliced_lanes(hkey=) then puts a core's exported cells behind its interior ones inside each face-count
+    class, grouped by receiver, so a halo send list is a few long runs instead of one run per two lanes."""
+    owner = np.asarray(owner, np.int64)
+    fo, fn = np.asarray(fo, np.int64), np.asarray(fn, np.int64)
+    a, b = owner[fo], owner[fn]
+    x = a != b
+    key = np.zeros(len(owner), np.int64)
+    if not x.any():
+        return key
+    B = int(owner.max()) + 2
+    D = max(1, min(7, int(62 // np.log2(B))))
+    pr = np.unique(np.r_[fo[x], fn[x]] * B + np.r_[b[x], a[x]])     # (cell, receiver), by cell then receiver
+    c, r = pr // B, pr % B
+    first = np.r_[True, c[1:] != c[:-1]]
+    j = np.arange(len(c)) - np.maximum.accumulate(np.where(first, np.arange(len(c)), 0))   # the receiver's rank in its cell's set
+    k = j < D
+    np.add.at(key, c[k], (r[k] + 1) * B ** (D - 1 - j[k]))
+    return key
+
+
+def halo_runs(send):
+    """(words, runs, words in runs of 16 or more) of a halo plan's send lists {(sender, receiver): lanes}."""
+    w = n = big = 0
+    for lanes in send.values():
+        q = np.asarray(lanes, np.int64)
+        if not len(q):
+            continue
+        h = np.flatnonzero(np.r_[True, np.diff(q) != 1])
+        L = np.diff(np.r_[h, len(q)])
+        w, n, big = w + len(q), n + len(L), big + int(L[L >= 16].sum())
+    return w, n, big
+
+
+def sliced_lanes(owner, counts, P, Q=0, banded=None, hkey=None):
     """Lanes of a partition with every core's cells sorted by face count, widest first (then by index): ELL slot k's
     real entries are then lanes [0, n_k) of each core, n_k = the core's cells with more than k faces. Q > 0 (layout
     rcbq<Q>): each run of equal face count is quarter-interleaved within itself (_quarter), so index neighbours are a
@@ -993,13 +1029,13 @@ def sliced_lanes(owner, counts, P, Q=0, banded=None):
     banded = (L, rank), --order rcm and box: cells by slot class instead (L[count - 1], the tiles the cell's last slot
     spans, fewest first), then by rank (rcm_rank, box_rank). Slot k is still inside its first L[k] tiles, which is all
     a narrow register needs, and the cells that span every tile keep the order of the rank. With Q the runs that are
-    quartered are the slot classes."""
+    quartered are the slot classes. hkey (export_key): inside a class cells sort by hkey before their index."""
     lane = np.zeros(len(owner), np.int64)
     if banded is not None:
         counts = np.asarray(banded[0])[counts - 1]
-        order = np.lexsort((banded[1], counts, owner))
+        order = np.lexsort((banded[1], counts, owner) if hkey is None else (banded[1], hkey, counts, owner))
     else:
-        order = np.lexsort((np.arange(len(owner)), -counts, owner))
+        order = np.lexsort((np.arange(len(owner)), -counts, owner) if hkey is None else (np.arange(len(owner)), hkey, -counts, owner))
     cnt = np.bincount(owner, minlength=P)
     pos = np.arange(len(owner)) - np.repeat(np.cumsum(cnt) - cnt, cnt)
     if Q:
@@ -1052,7 +1088,7 @@ def slot_extents(code, space, cells, slotfold, L, T):
 class Machine:
     def __init__(self, prog, mesh, P, nslot=NSLOT, log=print, layout="rcb", tiles=None, l1_vec=None, fuse=False, scratch_cap=32,
                  span_homes=False, hoist=False, cap_min=False, sched=False, amg_vec=False, ptiles=False, bcast_run=False, joint_red=False, fold1=False,
-                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0, lsplit=False, order="index"):
+                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0, lsplit=False, order="index", hpack=False, gsmin=0.0):
         # two-stage reductions: fold the chip's partials, then the K chip sums; no joint reductions then. Needed when
         # K * P partials do not fit one fold tile, and the default from 8 chips (r13 2x4: 520.3 vs 546.9 ms/it)
         self.red2 = bool(chip_cores) and ((P > LANES or P >= 8 * chip_cores) if red2 is None else red2)
@@ -1069,6 +1105,7 @@ class Machine:
         self.hlate = hlate     # a halo goes out right before its first gather, not after its source's last write
         self.hre = hre         # >0: a halo last read more than hre MIR back is sent again, not held in its slot
         self.pseg = pseg
+        self.gsmin = float(gsmin)   # _split_gathers: least share of a map's values its shift must cover to split it
         self.narrow_on, self.narrow, self.narrow_slot, self.pre_h, self.narrow_home = narrow, set(), {}, {}, set()   # narrow: bf16 DRAM pages for eligible constants (_narrow)
         self.coff, self.cpages, self.hpages, self.dslots = {}, 0, 0, []
         self.F = prog.dtype.type
@@ -1082,6 +1119,7 @@ class Machine:
             log(f"cse: {n0} -> {len(code)} instructions" + (" (index arrays by content)" if int(cse_ir) >= 2 else ""))
         code = dce(code)
         self.sliced, self.ext = sliced, {}
+        self.stiles = {}     # scratch register -> tile count of the vector it stands for (_scratch, tiles)
         if sliced:
             code, D = self._sliced(code, prog, mesh, P, tiles, chip_cores if chip_line else None, log)
         n0 = sum(1 for i in code if i[0] == "copy")
@@ -1129,11 +1167,13 @@ class Machine:
             # unit of the unpacker's and the NoC's addresses (Small k2, 220 cores, ttfluid.tools.residcensus: 24.0 % of
             # the local neighbour entries at their map's shift against 1.1 % unquartered and 3.3 % by cell id)
             Q = int(layout[4:]) if layout.startswith("rcbq") else LANES // 4 if order == "box" else 0
+            assert not hpack or (sliced and not Q), "--hpack sorts the --sliced rcb lanes"
+            hkey = export_key(own, *mesh_faces(mesh)) if hpack else None   # exported cells last in their face-count class, by receiver set
             banded = None if order == "index" else (
                 self.slotL,
                 rcm_rank(own, mesh_faces(mesh), P) if order == "rcm" else box_rank(own, mesh, P, per_piece=(order == "boxu")),
             )
-            self.lay = Layout(prog, own, P, sliced_lanes(own, face_counts(mesh), P, Q, banded) if sliced else None, amg_vec=amg_vec, ptiles=ptiles,
+            self.lay = Layout(prog, own, P, sliced_lanes(own, face_counts(mesh), P, Q, banded, hkey) if sliced else None, amg_vec=amg_vec, ptiles=ptiles,
                               follow=order != "index")
         self.T = max(self.lay.T, tiles or 1)   # tiles: force more tiles per vector than needed (testing)
         self.Ts = {n: (self.T if t == self.lay.T else t) for n, t in self.lay.Ts.items()}   # T: the slot stride
@@ -1160,6 +1200,8 @@ class Machine:
             self._mad()
         self._fetches()
         self.maps.finish(hrun)
+        hw = halo_runs(self.maps.plans[0]["send"])
+        log("halo send lists (cells plan): %d words in %d runs, %.1f %% of the words in runs of 16 or more%s" % (hw[0], hw[1], 100.0 * hw[2] / max(hw[0], 1), " (--hpack)" if hpack else ""))
         assert not (hsplit and len(self.maps.plans) > 1), "hsplit reads plan 0 only (vm_ncrisc N_HALO)"
         self._split_gathers()
         self._halos()
@@ -1245,6 +1287,11 @@ class Machine:
         regs += [r for x in blks for _, r in x[2]]
         regs += [u[2] for x in blks for u in x[1] if u[0] == "ldr" and u[2] is not None and not stk(x, u)]  # patch sources
         ts = {self.size(r) for r in regs if r != "__anchor__" and self.is_vec(r)}
+        # a vector the run keeps in a one-tile scratch register still counts with its own extent: a short ELL slot
+        # whose gather destination went to scratch (a reader-built page under pseg) would otherwise loop over the
+        # tiles of its source and coefficient, T instead of L_k, building and multiplying pages of zeros
+        st = getattr(self, "stiles", {})
+        ts |= {st[r] for r in regs if r in st}
         ts |= {self.Ts[b.name] if b.name in self.lay.wide else 1
                for b in (self.space[u[2]].stack[0] for x in blks for u in x[1] if stk(x, u))}
         if self.sliced and ts:      # a block runs over its narrowest vector; wider ones are read at their first tiles
@@ -1655,6 +1702,12 @@ class Machine:
                     ncov = int(cover.sum())
             if ncov < min_per_core * self.P:
                 continue
+            # gsmin: the 24 values a core date from a 32-cycle scalar copy. With dense tables and three gather threads
+            # a patched value is ~9 cycles of wall, and the split costs a block over every tile of the destination
+            # plus a C -> N handshake: a shift (or zero fill) that covers under this share of the map's values is
+            # left to the gather, which then writes every lane itself. Same values in the same lanes
+            if self.gsmin and ncov < self.gsmin * (len(t["core"]) + len(t["zc"])):
+                continue
             self.base[mid] = best             # None: zero fill
             self.maps.tab[mid] = Maps.drop(t, cover)
             nshift += ncov if best is not None else 0
@@ -1937,9 +1990,11 @@ class Machine:
                         sts.append((slot, r))
                     elif r not in after:
                         ren[r] = self._tmp(SCRATCH)
+                        self.stiles[ren[r]] = self.size(r)
                         sts.append((slot, ren[r]))
                     elif r in later:
                         ren[r] = self._tmp(SCRATCH)
+                        self.stiles[ren[r]] = self.size(r)
                         sts += [(slot, r), (slot, ren[r])]
                     else:
                         sts.append((slot, r))
