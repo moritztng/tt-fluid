@@ -229,6 +229,34 @@ def state_pages(img):
     return [tuple(r) for r in m]
 
 
+def download_state_pages(md, t, P, HPG, ranges):
+    """d -> device d's homes as (P, HPG, LANES) uint32 with only the page ranges read (the rest zero). Each range is
+    one slice of every core's homes on the whole mesh, so all chips cut it at once, and one read: the host reads the
+    state pages and not the whole matrix, and not chip after chip."""
+    import ttnn
+    try:
+        x = ttnn.reshape(t, ttnn.Shape([P, HPG, LANES]))
+        parts = []
+        for lo, hi in ranges:
+            y = ttnn.slice(x, [0, lo, 0], [P, hi, LANES])
+            parts.append(ttnn.to_torch(y, mesh_composer=ttnn.ConcatMeshToTensor(md, dim=0)).numpy().view(np.uint32))
+            ttnn.deallocate(y)
+    except Exception as e:   # a ttnn without the mesh slice: chip by chip
+        print("download_state_pages: mesh slice failed (%s), reading chip by chip" % str(e).splitlines()[0][:120], flush=True)
+        return lambda d: download_home_pages(t, d, P, HPG, ranges)
+    return spread_pages(parts, P, HPG, ranges)
+
+
+def spread_pages(parts, P, HPG, ranges):
+    """d -> (P, HPG, LANES) uint32 from one (devices * P, hi - lo, LANES) array per page range, in device order."""
+    def pages(d):
+        out = np.zeros((P, HPG, LANES), np.uint32)
+        for (lo, hi), h in zip(ranges, parts):
+            out[:, lo:hi] = h[d * P:(d + 1) * P]
+        return out
+    return pages
+
+
 def download_home_pages(t, d, P, HPG, ranges):
     """Device d's homes as (P, HPG, LANES) uint32 with only the page ranges read (the rest zero): each range is a slice
     of every core's homes, cut on the device, so the host reads the state pages and not the whole matrix."""

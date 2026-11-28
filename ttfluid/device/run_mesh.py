@@ -970,11 +970,7 @@ def report_copies(rr, snap, done, pr, wall, clk):
         ttnn.deallocate(t)
     stamp("case %d: outputs read on CQ 1" % rr)
 
-    def home_pages(d):   # device d's homes with only the state page ranges filled, as download_home_pages
-        out = np.zeros((P, HPG, image_dev.LANES), np.uint32)
-        for (lo, hi), h in zip(pr, hp):
-            out[:, lo:hi] = h[d * P:(d + 1) * P]
-        return out
+    home_pages = image_dev.spread_pages(hp, P, HPG, pr)   # device d's homes with only the state page ranges filled
     tk = core0_ticks(o)
     print("run %d wall %.3f s core0 ticks %s aiclk %s" % (rr, wall, tk, clk), flush=True)
     report(o, [wall], [tk], [clk], None, ".c%d" % rr, hist=hist, home_pages=home_pages)
@@ -994,11 +990,12 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
             for q in range(min(nrow, H))]
     if rows_legs is not None:
         rows, nrow = rows_legs, len(rows_legs)
-    if IMG is not None:   # chip by chip: chip k's DRAM homes come back from the device that ran block k
+    if IMG is not None:   # chip k's DRAM homes come back from the device that ran block k
         dev_of = {DEVBLK[d]: d for d in range(K)}
         pr = image_dev.state_pages(IMG)
+        home_pages = home_pages or image_dev.download_state_pages(md, t_home, P, HPG, pr)
         dev_state = IMG.state(lambda k: o[k * P:(k + 1) * P, 1024:].reshape(P, nv, 1024).view(np.float32),
-                              lambda k: (home_pages or (lambda d: image_dev.download_home_pages(t_home, d, P, HPG, pr)))(dev_of[k]).view(np.float32))
+                              lambda k: home_pages(dev_of[k]).view(np.float32))
         print("state: %d of %d home pages read, ranges %s" % (sum(h - l for l, h in pr), HPG, pr), flush=True)
         stamp("state downloaded")
     else:
