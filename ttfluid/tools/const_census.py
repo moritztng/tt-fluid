@@ -107,7 +107,8 @@ def census(prog, m, core, derived, log=print):
     sel = {}
     pages, seen = {}, {}
     cls, two_vals, nvals, pagekey = {}, {}, {}, {}
-    for r in consts:
+    at, uni = {}, {}     # page of the core's constant array -> (constant, tile); uniform page -> its bit pattern
+    for r in sorted(m.coff, key=m.coff.get):     # every stored constant: a read may land on a neighbour's page
         sp = m.space[r]
         if sp.name not in sel:
             k = np.nonzero(m.lay.owner[sp.name] == core)[0]
@@ -127,6 +128,7 @@ def census(prog, m, core, derived, log=print):
                 c = "zero"
             elif len(u) == 1:
                 c = "uniform"
+                uni[(r, t)] = int(u[0])
             elif len(u) == 2:
                 c = "two"
                 two_vals[(r, t)] = tuple(float(x) for x in u.view(np.float32))
@@ -143,21 +145,26 @@ def census(prog, m, core, derived, log=print):
             seen.setdefault(key, (r, t))
             pagekey[(r, t)] = seen[key]
             cls[(r, t)] = c
+            at[m.coff[r] + t] = (r, t)
     # page reads per outer iteration: a read in a tile loop of bt passes reads the constant's first bt tiles (a
     # --sliced block loops over its narrowest vector)
     # A one-tile constant in a tile loop is read every pass.
     nread, nreg = Counter(), Counter()
     by_phase, cls_phase = Counter(), defaultdict(Counter)
-    shifted = patched = overrun = 0
+    shifted = patched = overrun = beyond = 0
     for r, shift, pat, bt, ph, j, inseg in rd:
         nreg[r] += 1
         n = m.size(r)
         for t in range(bt):
-            if t >= n > 1:
-                overrun += 1
+            # the reader fetches page coff + t whatever the constant's own tile count (vm_ncrisc.cpp dpage), so a
+            # pass beyond it lands on the pages stored behind it: classed as what is fetched
+            k = at.get(m.coff[r] + t)
+            if k is None:
+                beyond += 1      # past the core's last constant page
                 continue
-            nread[(r, min(t, n - 1))] += 1
-            cls_phase[ph][cls[(r, min(t, n - 1))]] += 1
+            overrun += t >= n
+            nread[k] += 1
+            cls_phase[ph][cls[k]] += 1
         by_phase[ph] += bt
         shifted += bt * (shift != 0)
         patched += bt * pat
@@ -189,6 +196,10 @@ def census(prog, m, core, derived, log=print):
             reg_cls[r][c] += 1
             reg_w[r][c] += nread[(r, t)]
     never = sum(1 for k in cls if not nread[k])
+    pal = Counter()
+    for k, v in uni.items():
+        pal[v] += nread[k]
+    pal = [(float(np.uint32(v).view(np.float32)), f"{v:08x}", int(n)) for v, n in pal.most_common() if n]
     # read pages that are distinct by content (zero and uniform pages aside): what a shared home would store
     homes = len({pagekey[k] for k, c in cls.items() if nread[k] and c not in ("zero", "uniform")})
     out = dict(core=core, cells=cells, T=int(m.T), consts=len(consts), streamed=len(m.streamed), cpages=int(m.cpages),
@@ -204,6 +215,7 @@ def census(prog, m, core, derived, log=print):
                consts_whole={c: int(sum(1 for r in consts if set(reg_cls[r]) == {c})) for c in CLASSES},
                derived={str(r): [d[0]] + [int(x) for x in d[1:]] for r, d in derived.items() if r in set(consts)},
                pages_never_read=int(never), distinct_content_pages=int(homes), overrun_page_reads=int(overrun),
+               beyond_page_reads=int(beyond), uniform_values=pal[:64], uniform_distinct=len(pal),
                by_class_phase={p: {c: int(v) for c, v in d.items()} for p, d in cls_phase.items()},
                l1_home_page_reads=hot_cum,
                regs={str(r): dict(space=m.space[r].name, tiles=int(m.size(r)), reads=int(nreg[r]),
@@ -219,7 +231,9 @@ def census(prog, m, core, derived, log=print):
     log(f"  by phase: {dict(by_phase)}; shifted {shifted}, reader-patched {patched}, B_FETCH pages {out['fetch_pages']}")
     log(f"  pages stored {len(cls)}, never read in the outer body {never}; distinct by content among the read "
         f"non-zero, non-uniform pages: {homes}")
-    log(f"  page reads the N most-read stored pages take (L1 homes): {hot_cum}; reads past a constant's tiles {overrun}")
+    log(f"  page reads the N most-read stored pages take (L1 homes): {hot_cum}; reads past a constant's own tiles "
+        f"{overrun} (classed as the page fetched), past the core's pages {beyond}")
+    log(f"  uniform pages: {len(pal)} distinct values; page reads by value: {[(v, n) for v, _, n in pal[:16]]}")
     for p, d in cls_phase.items():
         if sum(d.values()) > 1000:
             log(f"  {p}: " + ", ".join(f"{c} {d[c]}" for c in CLASSES if d[c]))
