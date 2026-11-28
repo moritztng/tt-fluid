@@ -64,6 +64,11 @@ def loop(m, x):
     return m.tiles([x]) if any(pertile(m, r) for r in regs) or any(u[0] == "ldr" for u in x[1]) else 1
 
 
+def passes(m, ins, x):
+    """Tile-loop passes of block x of MIR instruction ins: a fused run loops all its blocks with the run's tile count."""
+    return m.tiles([y for y in ins[1] if y[0] == "blk"]) if ins[0] == "seg" else loop(m, x)
+
+
 def units_of(m, mir, idxs):
     """[(j, k, x, level, reads, writes)] of one straight-line piece. x: a block (k-th of a fused run), a gather, halo,
     red, red2, fetch or out. reads and writes are VALUES (register, version): version 0 is the piece's input, every
@@ -89,7 +94,7 @@ def units_of(m, mir, idxs):
                             if h is not None:
                                 rd.append((("H", h), False))
                 df = [r for _, r in x[2] if r != "__anchor__"]
-                acc = loop(m, x) > 1          # a one-tile value written by a tile loop is a sum over tiles
+                acc = passes(m, ins, x) > 1   # a one-tile value written by a tile loop is a sum over tiles
             elif op == "gather":
                 for s, h in x[3]:
                     rd.append((s, True))
@@ -188,7 +193,7 @@ def census(prog, m, core, gcache, tsort, budgets):
                 readers[(ri, v)].add(L)
             V = dict((v[0], v) for v in rv)       # register -> the value this unit reads
             if x[0] == "blk":
-                bt = loop(m, x)
+                bt = passes(m, mir[j], x)
                 c["blocks"] += bt
                 for u in x[1]:
                     if u[0] in ("ld", "rvf", "lds"):
