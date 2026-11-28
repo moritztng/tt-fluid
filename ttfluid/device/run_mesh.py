@@ -104,6 +104,9 @@ ap.add_argument("--bgts", type=int, default=0, help="K in 1..7: BRISC scatters t
                 "--tabstream GATHER tile, NCRISC the rest (CFD_BGTS, the --bpatch mailbox); 0 off. Data movement only: bit-exact")
 ap.add_argument("--tgts", type=int, default=0, help="J in 1..7: compute's UNPACK copies the top J / 8 of every L1-source and halo section of a "
                 "--tabstream GATHER tile (of what --bgts leaves NCRISC) from inside its waits (CFD_TGTS, a second mailbox); 0 off. Bit-exact")
+ap.add_argument("--tpat", type=int, default=0, help="J in 1..7: compute's UNPACK also takes J / 8 of the local L1-source lanes of every page "
+                "NCRISC patches or gathers in a STREAM op (dense or sparse), out of what --bpatch leaves NCRISC (CFD_TPAT, the --tgts "
+                "mailbox: UNPACK waits for that very page and copies from inside the wait); 0 off. A run flag. Data movement only: bit-exact")
 ap.add_argument("--amg", action="store_true", help="p PCG preconditioned by smoothed aggregation (ttfluid.resident.sa), aggregates on the K x 72 global cores; "
                 "the coarse levels are chip-local (sa.setup chip_cores): only the fine level exchanges between chips")
 ap.add_argument("--amg-kind", default="sa", choices=["sa"])
@@ -585,6 +588,7 @@ assert 0 <= a.bpatch < 8 and not (a.bpatch and not a.tabstream), "--bpatch K: 1.
 assert 0 <= a.bgts < 8 and not (a.bgts and not a.tabstream), "--bgts K: 1..7 with --tabstream"
 assert not a.tsort or a.tabstream, "--tsort 1 needs --tabstream"
 assert 0 <= a.tgts < 8 and not (a.tgts and not a.tabstream) and a.tgts < (a.bgts or 8), "--tgts J: 1..7 with --tabstream, below --bgts"
+assert 0 <= a.tpat < (a.bpatch or 1) and not (a.tpat and not a.tgts), "--tpat J: 1..7 with --tgts (its mailbox), below --bpatch"
 # + the B-patch mailbox (vm_brisc.cpp bsvc) and the T-gather one before it (vm_compute.cpp tsvc)
 SYNCB = -(-(E0 + 1616 + (256 if a.bpatch or a.bgts or a.tgts else 0) + (256 if a.tgts else 0)) // 4096) * 4096
 
@@ -680,6 +684,7 @@ def kd(src, ct, cfg, rt=None, crt=None):
         ([("CFD_BGTS", str(a.bgts))] if a.bgts and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_DENSE", "1")] if a.tabdense and src in ("vm_ncrisc.cpp", "vm_brisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_TGTS", str(a.tgts))] if a.tgts and src in ("vm_ncrisc.cpp", "vm_compute.cpp") else []) + \
+        ([("CFD_TPAT", str(a.tpat))] if a.tpat and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_GTILE", "1")] if a.gtile and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_NARROW", str(CB_H))] if a.narrow and src == "vm_compute.cpp" else []) + \
         ([("CFD_NARROW_OUT", str(CB_OH))] if a.narrow >= 2 and src == "vm_compute.cpp" else [])
@@ -983,7 +988,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         h[:, w] += h[:, w + 400] << 32
     root = [k * P for k in range(K)]
     gws = sorted(gtab)
-    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
+    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, tpat=a.tpat, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
                plan=info, sizes=E.sizes(), l1=l1, rows=nrow, walls=walls, ticks=ticks,
                ms_device=[max(t) / amax / 1e3 for t in ticks], aiclk=clks,
                same_history_all_chips=bool(all(np.array_equal(hist_all[0, :nrow], hist_all[k, :nrow]) for k in range(K))),

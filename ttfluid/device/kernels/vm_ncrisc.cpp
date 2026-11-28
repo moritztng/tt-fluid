@@ -32,6 +32,9 @@ constexpr uint32_t SS = 14, SM = 0x3ff;
 constexpr uint32_t SS = 16, SM = 0xfff;
 #endif
 
+#if defined(CFD_TPAT) && (!defined(CFD_TGTS) || !defined(CFD_BPATCH) || !defined(CFD_TABSTREAM))
+#error "CFD_TPAT: the T mailbox of CFD_TGTS and the page shares of CFD_BPATCH, streamed tables"
+#endif
 #if defined(CFD_DENSE) && (!defined(CFD_TABSTREAM) || defined(CFD_WIDE) || defined(CFD_DEFER) || defined(CFD_TRID))
 #error "CFD_DENSE: streamed 16-bit tables, the plain ring (no CFD_DEFER, no CFD_TRID)"
 #endif
@@ -1073,6 +1076,12 @@ void kernel_main() {
                             // BRISC scatters the upper (8 - CFD_BPATCH) / 8 of every L1-source local section (vm_brisc.cpp
                             // bsvc); this core does the rest, then waits for its DONE before the page is pushed
                             uint32_t nj = 0, nkeep[8];
+#ifdef CFD_TPAT
+                            // compute's UNPACK is a third thread on the page: it takes CFD_TPAT / 8 of every share BRISC
+                            // gets a part of, out of what is left to this core (the T mailbox of CFD_TGTS; UNPACK waits for
+                            // this very page in TWAIT(cb_in) and copies from inside that wait, vm_compute.cpp tsvc)
+                            uint32_t nt = 0;
+#endif
 #ifdef CFD_DENSE
                             if (dn) {   // BRISC gathers the upper (8 - CFD_BPATCH) / 8 of the tile's lanes (bit 31: dense)
                                 dkeep = 1024 * CFD_BPATCH / 8;
@@ -1082,6 +1091,16 @@ void kernel_main() {
                                 S[M_JOB + 2] = (1024 - dkeep) | 1u << 31;
                                 S[M_JOB + 3] = reinterpret_cast<uint32_t>(pd + dkeep);
                                 nj = 1;
+#ifdef CFD_TPAT
+                                if (1024 * CFD_TPAT / 8 < dkeep) {   // UNPACK: the CFD_TPAT / 8 of the lanes below BRISC's
+                                    dkeep -= 1024 * CFD_TPAT / 8;
+                                    S[T_JOB] = reinterpret_cast<uint32_t>(A + N[p + 2] * 1024);
+                                    S[T_JOB + 1] = reinterpret_cast<uint32_t>(reinterpret_cast<const uint16_t*>(sp[0]) + dkeep);
+                                    S[T_JOB + 2] = (1024 * CFD_TPAT / 8) | 1u << 31;
+                                    S[T_JOB + 3] = reinterpret_cast<uint32_t>(pd + dkeep);
+                                    nt = 1;
+                                }
+#endif
                             }
 #endif
                             for (uint32_t k = 0; k < np_ && !dn; ++k) {
@@ -1095,6 +1114,17 @@ void kernel_main() {
                                     S[M_JOB + 4 * nj + 3] = reinterpret_cast<uint32_t>(pl);
                                     nkeep[k] = h;
                                     ++nj;
+#ifdef CFD_TPAT
+                                    const uint32_t ut = n * CFD_TPAT / 8;
+                                    if (ut && ut < h) {   // entries [h - ut, h); at most np_ <= 8 jobs, the mailbox holds 13
+                                        S[T_JOB + 4 * nt] = reinterpret_cast<uint32_t>(A + sd * 1024);
+                                        S[T_JOB + 4 * nt + 1] = reinterpret_cast<uint32_t>(sp[2 * k] + h - ut);
+                                        S[T_JOB + 4 * nt + 2] = ut;
+                                        S[T_JOB + 4 * nt + 3] = reinterpret_cast<uint32_t>(pl);
+                                        nkeep[k] = h - ut;
+                                        ++nt;
+                                    }
+#endif
                                 }
                             }
                             if (nj) {
@@ -1102,6 +1132,13 @@ void kernel_main() {
                                 asm volatile("" ::: "memory");
                                 S[M_SEQ] = ++bseq;
                             }
+#ifdef CFD_TPAT
+                            if (nt) {
+                                S[T_N] = nt;
+                                asm volatile("" ::: "memory");
+                                S[T_SEQ] = ++tseq;
+                            }
+#endif
 #endif
                             for (uint32_t k = 0; k < np_; ++k) {
                                 const uint32_t sd = N[p + 2 + 2 * k];
@@ -1121,6 +1158,14 @@ void kernel_main() {
                                         if (!okb) { run = false; break; }
                                         nj = 0;
                                     }
+#ifdef CFD_TPAT
+                                    if (nt) {
+                                        bool okt = true;
+                                        PSUB(18, okt = WAIT_UNTIL(S[T_DONE] == tseq, 22));
+                                        if (!okt) { run = false; break; }
+                                        nt = 0;
+                                    }
+#endif
 #endif
                                 } else
 #endif
@@ -1155,6 +1200,13 @@ void kernel_main() {
                                 PSUB(18, okb = WAIT_UNTIL(S[M_DONE] == bseq, 21));   // part 18 (GATHER halo wait, 0 in STREAM runs)
                                 if (!okb) { run = false; break; }
                             }
+#ifdef CFD_TPAT
+                            if (nt) {
+                                bool okt = true;
+                                PSUB(18, okt = WAIT_UNTIL(S[T_DONE] == tseq, 22));
+                                if (!okt) { run = false; break; }
+                            }
+#endif
 #endif
 #ifdef CFD_TRID
                             if (t + 1 < tn) load_tile(qi, 2 * np_ + 1, t + 1, (t + 1) & 1, tm);
