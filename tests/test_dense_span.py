@@ -37,7 +37,26 @@ def test_dense_tables_and_span_keep_the_result(mesh):
     assert "tabstream check: streamed walk == cursor walk" in r.stdout
 
 
+@pytest.mark.parametrize("mesh", ["1,1", "1,2"])
+@pytest.mark.parametrize("l1", ["2", "1"])
+def test_span3_shares_colour_0_and_keeps_the_result(mesh, l1):
+    # --tiles 20 forces T=20 > nsmall/3 so vectors spill to DRAM and --span 3 exercises both colour 0 sharing and Krylov loops
+    ref = last_row(run("--mesh", mesh, "--tiles", "20", "--l1", l1, "--lsplit", "2", "--cse", "2"))
+    r = run("--mesh", mesh, "--tiles", "20", "--l1", l1, "--lsplit", "2", "--cse", "2",
+            "--tabdense", "1", "--span", "3", "--tscheck", "--emu-check")
+    assert last_row(r) == ref
+    served = re.search(r"span 3: (\d+) gathers read colour 0", r.stdout)
+    dense = re.search(r"tabdense 1: \d+ twin maps, (\d+) of \d+ \(core, twin\) tables dense", r.stdout)
+    assert served and int(served.group(1)) > 0, "no gather read colour 0: the test did not exercise --span 3"
+    assert dense and int(dense.group(1)) > 0, "no dense table was built under --span 3"
+    assert "tabstream check: streamed walk == cursor walk" in r.stdout
+
+
 def test_a_broken_dense_table_fails_the_check():
     r = run("--mesh", "1,1", *DENSE, "--tabdense-break", "8")
     assert r.returncode != 0
     assert "dense index differs" in r.stderr
+    r3 = run("--mesh", "1,1", "--tiles", "20", "--l1", "2", "--lsplit", "2", "--cse", "2",
+             "--tabdense", "1", "--span", "3", "--tscheck", "--tabdense-break", "8")
+    assert r3.returncode != 0
+    assert "dense index differs" in r3.stderr
