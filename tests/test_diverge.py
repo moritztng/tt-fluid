@@ -30,8 +30,8 @@ def _history(n, poison=False, pocket=False, case=CASE):
 
 def _pocket(s, cell=6000, depth=2, value=-1000.0):
     """A pocket of negative omega: the cell and its neighbours to the given depth (13 cells). On Small the explicit
-    non-orthogonal correction of omega's laplacian leaves one in the wake; bound() then gives a cell whose face
-    neighbours are all negative exactly omegaMin."""
+    non-orthogonal correction of omega's laplacian leaves one; bound() then gives a cell whose face neighbours are
+    all negative exactly omegaMin."""
     m = s.mesh
     o, n = m.owner[:m.nInternalFaces], m.neighbour
     sel = {cell}

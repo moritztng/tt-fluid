@@ -190,9 +190,19 @@ comparison of both boards' final states against two earlier builds.
 
 ### A known behaviour of the case
 
-On long runs (about 2,200 iterations) HPC_motorbike Small can produce a NaN on the device. The same discretisation in fp64
-on the host floors omega in the same cell and fails the same way, so it belongs to the model and mesh, not to fp32 or
-the device. tt-fluid stops a run one iteration after any field becomes non-finite.
+HPC_motorbike Small has gone NaN on the device in two cases: after about 2,200 iterations on a 1x2 block, and in
+iteration 337 of one of nine start states on a 2x2 block. Device states around both events and a host replay of the
+first show the chain. The explicit non-orthogonal correction of omega's laplacian pulls a pocket of cells below zero.
+`bound()` gives a cell whose face neighbours are all negative exactly the floor `omegaMin`. The cross-diffusion source
+divides by omega, so one iteration later that cell is near 1e18 when the floor is 1e-15 (8.0e17 and 3.7e18 in the two
+events). In the next omega solve PBiCGStab's dot product `r0 . r` leaves the fp32 range and the fields are NaN from
+there on; the same solve carried out in double precision stays finite.
+
+The floor was OpenFOAM's double-precision `SMALL` in single-precision arithmetic. OpenFOAM's single-precision `SMALL`
+is 1e-6 (ESI `floatScalarSMALL`), and tt-fluid now floors omega there when it computes in fp32 (1e-15 in fp64;
+`omegaMin` and `kMin` in the RAS dictionary override the defaults). A run whose residuals still become non-finite ends in that iteration: the device
+program leaves its outer loop, and `run_mesh` prints `DIVERGED` with the iteration, saves the state and exits with
+code 4. `tests/test_diverge.py` reproduces the chain on pitzDaily, from the pocket to the NaN.
 
 ## 4. Drag and lift against OpenFOAM (occDrivAer, coarse mesh)
 
