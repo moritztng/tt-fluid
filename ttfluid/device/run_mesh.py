@@ -98,6 +98,9 @@ ap.add_argument("--amg", action="store_true", help="p PCG preconditioned by smoo
 ap.add_argument("--amg-kind", default="sa", choices=["sa"])
 ap.add_argument("--amg-stack", action="store_true", help="as run_vm.py: stacked coarse SpMV")
 ap.add_argument("--amg-vec", action="store_true", help="as run_vm.py: coarse values are vector registers (--l1 auto may home them in DRAM)")
+ap.add_argument("--order", default="index", choices=("index", "rcm"), help="with --sliced: the cells of a core inside each slot class. index: by cell id. "
+                "rcm: reverse Cuthill-McKee on the core's cell graph, so face neighbours are a few tiles apart and a small --gcache holds them. "
+                "Sums run in another order, so the state is not bitwise the index order's")
 ap.add_argument("--sliced", action="store_true", help="sorted rcb lanes; report what sliced ELL slots would save (machine.slot_extents)")
 ap.add_argument("--lsched", action="store_true", help="reorder straight-line IR runs for fewer live vectors (machine._lsched)")
 ap.add_argument("--ptiles", action="store_true", help="wide patch spaces take their own tile count (default: the cells' T)")
@@ -202,7 +205,7 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "order") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
@@ -286,7 +289,7 @@ else:
                     l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
                     joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
                     bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg)
+                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, order=a.order)
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))

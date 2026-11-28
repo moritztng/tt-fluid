@@ -903,13 +903,45 @@ def face_counts(mesh):
                        minlength=mesh.nCells)
 
 
-def sliced_lanes(owner, counts, P, Q=0):
+def rcm_rank(owner, faces, P):
+    """Rank of every cell in the reverse Cuthill-McKee order of its core's cell graph (the faces inside the core). Face
+    neighbours then sit a cross-section of the core apart, a few tiles, where the mesher's cell index puts the
+    children of a refined cell anywhere on the core."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import reverse_cuthill_mckee
+    fo, fn = (np.asarray(f, np.int64) for f in faces)
+    inner = owner[fo] == owner[fn]
+    fo, fn = fo[inner], fn[inner]
+    by = np.argsort(owner[fo], kind="stable")
+    fo, fn = fo[by], fn[by]
+    fstart = np.searchsorted(owner[fo], np.arange(P + 1))
+    cells = np.argsort(owner, kind="stable")
+    cnt = np.bincount(owner, minlength=P)
+    start = np.cumsum(cnt) - cnt
+    loc = np.empty(len(owner), np.int64)
+    loc[cells] = np.arange(len(owner)) - np.repeat(start, cnt)
+    rank = np.empty(len(owner), np.int64)
+    for i in range(P):
+        a, b = loc[fo[fstart[i]:fstart[i + 1]]], loc[fn[fstart[i]:fstart[i + 1]]]
+        A = csr_matrix((np.ones(2 * len(a), np.int8), (np.r_[a, b], np.r_[b, a])), shape=(cnt[i], cnt[i]))
+        rank[cells[start[i]:start[i] + cnt[i]][reverse_cuthill_mckee(A, symmetric_mode=True)]] = np.arange(cnt[i])
+    return rank
+
+
+def sliced_lanes(owner, counts, P, Q=0, banded=None):
     """Lanes of a partition with every core's cells sorted by face count, widest first (then by index): ELL slot k's
     real entries are then lanes [0, n_k) of each core, n_k = the core's cells with more than k faces. Q > 0 (layout
     rcbq<Q>): each run of equal face count is quarter-interleaved within itself (_quarter), so index neighbours are a
-    4-lane shift and the [0, n_k) sets do not change."""
+    4-lane shift and the [0, n_k) sets do not change.
+    banded = (L, rank), --order rcm: cells by slot class instead (L[count - 1], the tiles the cell's last slot spans,
+    fewest first), then by rank (rcm_rank). Slot k is still inside its first L[k] tiles, which is all a narrow register
+    needs, and the cells that span every tile keep the band of the rank."""
     lane = np.zeros(len(owner), np.int64)
-    order = np.lexsort((np.arange(len(owner)), -counts, owner))
+    if banded is not None:
+        assert not Q, "--order rcm and rcbq<Q> both order the lanes"
+        order = np.lexsort((banded[1], np.asarray(banded[0])[counts - 1], owner))
+    else:
+        order = np.lexsort((np.arange(len(owner)), -counts, owner))
     cnt = np.bincount(owner, minlength=P)
     pos = np.arange(len(owner)) - np.repeat(np.cumsum(cnt) - cnt, cnt)
     if Q:
@@ -962,7 +994,7 @@ def slot_extents(code, space, cells, slotfold, L, T):
 class Machine:
     def __init__(self, prog, mesh, P, nslot=NSLOT, log=print, layout="rcb", tiles=None, l1_vec=None, fuse=False, scratch_cap=32,
                  span_homes=False, hoist=False, cap_min=False, sched=False, amg_vec=False, ptiles=False, bcast_run=False, joint_red=False, fold1=False,
-                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0):
+                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, order="index"):
         # two-stage reductions: fold the chip's partials, then the K chip sums; no joint reductions then. Needed when
         # K * P partials do not fit one fold tile, and the default from 8 chips (r13 2x4: 520.3 vs 546.9 ms/it)
         self.red2 = bool(chip_cores) and ((P > LANES or P >= 8 * chip_cores) if red2 is None else red2)
@@ -1036,10 +1068,12 @@ class Machine:
         else:
             own = self._own if sliced else rcb(mesh.C, P, chips=P // chip_cores if chip_cores and chip_line else None, faces=mesh_faces(mesh))
             Q = int(layout[4:]) if layout.startswith("rcbq") else 0
-            self.lay = Layout(prog, own, P, sliced_lanes(own, face_counts(mesh), P, Q) if sliced else None, amg_vec=amg_vec, ptiles=ptiles)
+            banded = (self.slotL, rcm_rank(own, mesh_faces(mesh), P)) if order == "rcm" else None
+            self.lay = Layout(prog, own, P, sliced_lanes(own, face_counts(mesh), P, Q, banded) if sliced else None, amg_vec=amg_vec, ptiles=ptiles)
         self.T = max(self.lay.T, tiles or 1)   # tiles: force more tiles per vector than needed (testing)
         self.Ts = {n: (self.T if t == self.lay.T else t) for n, t in self.lay.Ts.items()}   # T: the slot stride
         assert not sliced or layout == "rcb" or layout.startswith("rcbq"), "--sliced sorts rcb lanes"
+        assert order == "index" or sliced and layout == "rcb", "--order rcm orders the lanes of --layout rcb --sliced"
         if sliced:      # the prefix property every narrow register relies on (spmd: lanes come from prep --sliced)
             fc, ln = face_counts(mesh), self.lay.lane[prog.cells.name]
             for k, Lk in enumerate(self.slotL):
