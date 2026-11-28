@@ -9,11 +9,14 @@
 # ends the cell at 1.5x that, so a screen that thrashes cannot eat the cells after it. "auto" picks the next k from the two MPS cells before it: 8 (or 6) while packing still
 # pays and host RAM allows, else 3. The batch makespan (launch of the first case to exit of the last) is the number:
 # cases per GPU-hour = k x 3600 / makespan.
-# Usage: pack_plan.sh <work-dir> <deadline-seconds>    env CELLS ("1:off 2:mps 4:mps auto 2:off"), IT (800), GPUS ("0"), WRITE
+# Usage: pack_plan.sh <work-dir> <deadline-seconds>    env CELLS ("1:off 2:mps 4:mps auto 2:off"), IT (800), GPUS ("0"), WRITE, CPG
 # GPUS="0 1 ... 7" fills a whole box: a cell then runs k cases on EACH listed GPU in one batch (cases _c0.. in GPU
 # order), so the makespan carries the shared host; per_case stays makespan / k, the per-GPU figure the price uses. One
 # MPS control daemon serves every GPU (NVIDIA: one per node). WRITE=1 has every case write its final fields (binary)
 # inside the wall, the counterpart of the state download a Tenstorrent run is charged.
+# CPG=<n> pins the cases of each GPU to n physical cores of their own, one thread each, taken from the cores that are
+# idlest when the plan starts: the host share the priced box has per GPU (2x 56 cores under 8 GPUs = 14), so a rented
+# host with more cores cannot flatter a packed cell. Without it the cases float over every CPU the container may use.
 # Expects in <work-dir>: mbs_np1/ (the case), libspumaBoundFix_spdp.so, and the spumaS bundle unpacked under /opt.
 set -u
 W=$1; DL=$2; T0=$(date +%s); H=$(cd $(dirname $0) && pwd)
@@ -25,6 +28,11 @@ nvidia-smi --query-gpu=index,name,memory.total,clocks.max.sm,clocks.max.mem,powe
 nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv   # anything listed here is a co-tenant
 lscpu | grep -E "Model name|^CPU\(s\)|Socket"; nproc; free -g | head -2
 : > $W/cells.tsv
+PIN=()   # PIN[j] = taskset list of the j-th GPU in GPUS
+if [ -n "${CPG:-}" ]; then
+  mapfile -t PIN < <(python3 $H/pin_cores.py $CPG $NG) && [ ${#PIN[@]} = $NG ] || { stamp "PLAN-FAILED: no $CPG idle physical cores for each of $NG GPUs"; exit 1; }
+  stamp "CPG=$CPG: ${PIN[*]}"
+fi
 
 cell() {
   local k=$1 mode=$2 var=${3:-} it=${4:-$IT} need=${5:-${NEED:-$(( 400 + 500 * $1 ))}} tag fvs L pool g i j=0 pids=() ta tb
@@ -42,9 +50,10 @@ cell() {
     nvidia-cuda-mps-control -d; stamp "$tag MPS daemon rc=$?"
   fi
   stamp "$tag: $k cases x $it it on GPU $GS, pool $pool GiB each, ${L}s left"
-  for g in $GS; do for i in $(seq 1 $k); do
+  local gi=-1
+  for g in $GS; do gi=$((gi+1)); for i in $(seq 1 $k); do
     R=$W/${tag}_c$j; rm -rf $R; mkdir -p $R; cp -al $W/mbs_np1/constant $W/mbs_np1/0 $R/; cp -r $W/mbs_np1/system $R/
-    CUDA_VISIBLE_DEVICES=$g SPUMA=spumaS BFX=$W/libspumaBoundFix_spdp.so timeout -s TERM $L \
+    CUDA_VISIBLE_DEVICES=$g SPUMA=spumaS BFX=$W/libspumaBoundFix_spdp.so ${PIN[$gi]:+taskset -c ${PIN[$gi]}} timeout -s TERM $L \
       bash $H/spuma_run.sh $R $it $pool $fvs 1 ${WRITE:+$it} > $W/run_${tag}_c$j.out 2>&1 &
     pids+=($!); j=$((j+1))
   done; done
