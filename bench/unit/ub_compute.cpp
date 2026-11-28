@@ -2,7 +2,7 @@
 // against lean forms. Each cell runs NS acquire/commit/release sections of NB units; the three TRISCs meet at a
 // barrier before a cell (each after tensix_sync, so its Tensix queue is empty) and stamp the wall clock when their
 // own part of the cell has drained. Header words: 32 + 4 id + {0 unpack, 1 math, 2 pack} = cycles, + 3 = units.
-// Tiles of cb_v: 0-7 input, 8-11 stock-load check, 12-15 lean-load check, 16-21 op results, 20-23 pack scratch
+// Tiles of cb_v: 0-7 input, 8-11 stock-load check, 12-15 lean-load check, 16-25 op results, 20-23 pack scratch
 // (the pack cell runs before the checks).
 #include <cstdint>
 
@@ -13,6 +13,11 @@
 #include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "api/compute/eltwise_unary/where.h"
 #include "api/compute/eltwise_unary/addcmul.h"
+#include "api/compute/binary_max_min.h"
+#include "api/compute/copy_dest_values.h"
+#include "api/compute/eltwise_unary/negative.h"
+#include "api/compute/eltwise_unary/comp.h"
+#include "api/compute/eltwise_unary/fill.h"
 
 constexpr uint32_t NB = 4;   // fp32 tiles of one DEST half
 // UB_BREAK (unit_costs.py --break-arm): 1 = the lean-load check moves one tile where it claims four, 2 = the fused
@@ -125,6 +130,43 @@ template <typename F>
     tmp_.set_end_ops(TT_OP_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D),
                      TT_OP_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D));
     tmp_.program();
+}
+// r = s0 * s1 + s2 as a mul and an add (two roundings, as the two stock ops), written back to slot 2 at three cycles
+// per row. The load of s1 schedules the mul for the next cycle (result in the loaded register, readable two cycles
+// on); the load of s2 schedules the add two cycles after itself (result in LReg[16]) and the store of LReg[16] to
+// s2's address four cycles after itself. UB_BREAK 2 runs the add one cycle early, before the product is readable.
+[[gnu::always_inline]] inline void pipe_chain_init() {
+    addr_mod_t{.srca = {.incr = 0}, .srcb = {.incr = 0}, .dest = {.incr = 2}}.set(ADDR_MOD_6);
+    TTI_SFPMUL(p_sfpu::LREG2, 0, p_sfpu::LCONST_0, 12, 0);                  // InstructionTemplate[0]: VD = L2 * VB + 0
+    TTI_SFPADD(p_sfpu::LCONST_1, p_sfpu::LREG0, 0, 13, 0);                  // InstructionTemplate[1]: VD = 1 * L0 + VC
+    constexpr uint32_t mul_bits = 0x80 | (0 << 3) | 4;                      // loaded register is VB and the result
+    constexpr uint32_t add_bits = 0x40 | ((UB_BREAK == 2 ? 0 : 1) << 3) | 5, store_bits = 0x40 | (3 << 3) | 3;   // result and store through LReg[16]
+    TTI_SFPLOADI(0, sfpi::SFPLOADI_MOD0_LOWER, (mul_bits << 8) | 0);
+    TTI_SFPLOADI(0, sfpi::SFPLOADI_MOD0_UPPER, 0);
+    TTI_SFPCONFIG(0, 4 + 0, 0);                                             // Sequence[0] from LREG0: MAD unit only
+    TTI_SFPLOADI(0, sfpi::SFPLOADI_MOD0_LOWER, (add_bits << 8) | 0);
+    TTI_SFPLOADI(0, sfpi::SFPLOADI_MOD0_UPPER, (store_bits << 8) | 0);
+    TTI_SFPCONFIG(0, 4 + 1, 0);                                             // Sequence[1] from LREG0
+    TTI_SFPCONFIG(0x020, 8, 1);                                             // Misc: macro 1's store takes the load's Mod0, delays in cycles
+    load_replay_buf(0, 3, [] {
+        TTI_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::FP32, ADDR_MOD_7, 0);
+        TTI_SFPLOADMACRO((0 << 2) | 0, InstrModLoadStore::FP32, ADDR_MOD_7, 64);
+        TTI_SFPLOADMACRO((1 << 2) | 1, InstrModLoadStore::FP32, ADDR_MOD_6, 128);
+    });
+    ckernel::ckernel_template tmp_(4, 8, lltt::replay_insn(0, 3));
+    tmp_.set_end_ops(TT_OP_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D),
+                     TT_OP_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D));
+    tmp_.program();
+}
+[[gnu::always_inline]] inline void pipe_chain_tile() {
+    SFPU_BEGIN();
+    ckernel::ckernel_template::run();
+    TTI_SFPNOP;
+    TTI_SFPNOP;
+    TTI_SFPNOP;
+    TTI_SFPNOP;
+    TTI_SFPNOP;
+    SFPU_END();
 }
 [[gnu::always_inline]] inline void pipe_tile() {
     SFPU_BEGIN();
@@ -246,6 +288,26 @@ void kernel_main() {
     // 18: one add per tile through the load macro, in place, two cycles per row
     MATH((pipe_add_init()));
     CELL(18, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); MATH(({ for (uint32_t j = 0; j < NB; ++j) pipe_tile(); })); SEC_END(); });
+    // 19: mul then add fused through the load macro, three cycles per row
+    MATH((pipe_chain_init()));
+    CELL(19, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); MATH(({ for (uint32_t j = 0; j < NB; ++j) pipe_chain_tile(); })); SEC_END(); });
+    // 20-27: the stock tile ops the VM calls and the table did not have yet
+    div_binary_tile_init();
+    CELL(20, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); for (uint32_t j = 0; j < NB; ++j) div_binary_tile(0, 1, 2); SEC_END(); });
+    binary_max_tile_init();
+    CELL(21, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); for (uint32_t j = 0; j < NB; ++j) binary_max_tile(0, 1, 2); SEC_END(); });
+    binary_min_tile_init();
+    CELL(22, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); for (uint32_t j = 0; j < NB; ++j) binary_min_tile(0, 1, 2); SEC_END(); });
+    negative_tile_init();
+    CELL(23, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); for (uint32_t j = 0; j < NB; ++j) negative_tile(0); SEC_END(); });
+    abs_tile_init();
+    CELL(24, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); for (uint32_t j = 0; j < NB; ++j) abs_tile(0); SEC_END(); });
+    gtz_tile_init();
+    CELL(25, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); for (uint32_t j = 0; j < NB; ++j) gtz_tile(0); SEC_END(); });
+    fill_tile_init();
+    CELL(26, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); for (uint32_t j = 0; j < NB; ++j) fill_tile_bitcast(0, 0x3f800000u); SEC_END(); });
+    copy_dest_values_init();
+    CELL(27, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); for (uint32_t j = 0; j < NB; ++j) copy_dest_values<DataFormat::Float32>(0, 1); SEC_END(); });
 
     // checks (mask bit 31). Stock load of tiles 0-3 packed to 8-11; lean load of tiles 4-7 packed to 12-15
     if (mask & 0x80000000u) {
@@ -306,6 +368,25 @@ void kernel_main() {
         tile_regs_commit();
         tile_regs_wait();
         pack_tile<true>(1, cb_v, 23);
+        tile_regs_release();
+        // r = t0 * t1 + t2: stock mul then stock add -> 24, the pipelined chain -> 25
+        mul_binary_tile_init();
+        tile_regs_acquire();
+        for (uint32_t j = 0; j < 3; ++j) copy_tile(cb_v, j, j);
+        mul_binary_tile(0, 1, 3);
+        add_binary_tile_init();
+        add_binary_tile(3, 2, 3);
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile<true>(3, cb_v, 24);
+        tile_regs_release();
+        MATH((pipe_chain_init()));
+        tile_regs_acquire();
+        for (uint32_t j = 0; j < 3; ++j) copy_tile(cb_v, j, j);
+        MATH((pipe_chain_tile()));
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile<true>(2, cb_v, 25);
         tile_regs_release();
     }
     barrier();

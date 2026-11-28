@@ -22,13 +22,20 @@ FUS = {"add": 1, "sub": 1, "mul": 1, "mad": 2, "msb": 2, "where": 3, "max": 2, "
        "gtz": 4, "gez": 4, "ltz": 4, "lez": 4, "eqz": 4, "nez": 4}
 BODY_FIX = 17       # cycles per body and tile outside the instructions (measured)
 CYC = 32            # cycles per SFPU instruction over one tile (32 steps of 32 lanes, measured 1.00 per step)
-# stock tile ops, cycles per fp32 tile. Measured: add sub mul mad msb where (kernel-unit-costs.md); fold from flx-asm's
-# hood profile. The rest are EST from the instruction count of the stock loop (17 + 32 n) until they are measured.
+# stock tile ops, cycles per fp32 tile, measured on Blackhole (state/flx/rows/kernel-unit-costs.md, runs u6 and u8);
+# sub is the add with another mode bit, the other comparisons are gtz with another test. EST: sqrt, tanh, log, exp
+# (not measured), fold (flx-asm's hood profile, in situ).
 STOCK = {"add": 231.8, "sub": 231.8, "mul": 231.8, "mad": 305.8, "msb": 305.8, "where": 164.8,
-         "max": 209.0, "min": 209.0, "div": 817.0, "neg": 145.0, "abs": 145.0, "sqrt": 721.0, "tanh": 900.0,
-         "log": 900.0, "exp": 900.0, "gtz": 273.0, "gez": 273.0, "ltz": 273.0, "lez": 273.0, "eqz": 273.0,
-         "nez": 273.0, "fill": 81.0, "cpd": 113.0, "fold": 3500.0}
-MEASURED = {"add", "sub", "mul", "mad", "msb", "where", "fold"}
+         "max": 144.5, "min": 144.5, "div": 1099.8, "neg": 167.8, "abs": 167.8, "sqrt": 721.0, "tanh": 900.0,
+         "log": 900.0, "exp": 900.0, "gtz": 335.8, "gez": 335.8, "ltz": 335.8, "lez": 335.8, "eqz": 335.8,
+         "nez": 335.8, "fill": 107.8, "cpd": 135.8, "fold": 3500.0}
+MEASURED = {"add", "sub", "mul", "mad", "msb", "where", "max", "min", "div", "neg", "abs", "gtz", "gez", "ltz", "lez",
+            "eqz", "nez", "fill", "cpd"}
+# a body issued through the load macro (SFPLOADMACRO, runs u7 and u8): one load-style instruction per cycle, each
+# scheduling up to one op per SFPU sub-unit. Measured: 17 + 32 * 2 + 3 for an in-place add, 17 + 32 * 3 + 5 for
+# mul then add from three operands. PIPE_FLUSH and PIPE_CFG (instructions to set templates and sequences) are EST.
+PIPE_FLUSH = 5
+PIPE_CFG = 9
 
 Ev = namedtuple("Ev", "kind name out ins uop")    # kind: L load, K constant, A fusable op, N stock op
 
@@ -169,7 +176,7 @@ def plan(uops, stores, slots=4, lregs=8, maxlen=32, hoist=True):
             for h in hoisted[:nh]:
                 out.append(("load", h))
                 res.add(h.out)
-            out.append(("body", dict(ops=ops, ins=ins, outs=outs_, n=ninstr)))
+            out.append(("body", dict(ops=ops, ins=ins, outs=outs_, n=ninstr, last=last)))
             res |= outs_
             res = {v for v in res if live(v, last)}
             i = last + 1
@@ -197,6 +204,23 @@ def cost(pl):
         elif k == "fill":
             blk += STOCK["fill"]
     return blk, stock, nb, ni, nin, nst
+
+
+def pipe_cost(pl, uses, n):
+    """EST, lower bound of a body through the load macro: one cycle per row for every Dest operand and for every result
+    that cannot be stored onto the slot of an operand that dies in the body. Assumes every op rides on a load (true
+    for chains within 4 instruction templates; trees and long bodies will need plain instructions on top)."""
+    blk, i = 0.0, 0
+    for k, p in pl:
+        if k == "body":
+            dead = sum(1 for v in p["ins"] if not any(a > p["last"] for a in uses[v]))
+            rows = max(len(p["ins"]), 1) + max(0, len(p["outs"]) - dead)
+            blk += BODY_FIX + PIPE_FLUSH + PIPE_CFG + CYC * rows
+        elif k == "stock":
+            blk += STOCK[p.name]
+        elif k == "fill":
+            blk += STOCK["fill"]
+    return blk
 
 
 def stock_cost(uops):

@@ -57,6 +57,7 @@ if __name__ == "__main__":
                 c, _, nb, ni, nin, nst = bg.cost(pl)
                 d = r[p]
                 d["cyc"] += c * passes
+                d["pipe"] = d.get("pipe", 0.0) + bg.pipe_cost(pl, uses, len(ev)) * passes
                 d["bodies"] += nb * passes
                 d["instr"] += ni * passes
                 d["fused"] += nin * passes
@@ -76,6 +77,9 @@ if __name__ == "__main__":
             print(f"  {p:10s} {d['cyc'] / T / 1e6:7.3f} M  = {d['cyc'] / max(r['stock'], 1):.2f}x stock; bodies {d['bodies'] / T:.0f} per tile-it, "
                   f"{d['instr'] / max(d['bodies'], 1):.1f} instr and {d['fused'] / max(d['bodies'], 1):.2f} ops per body, "
                   f"{(d['cyc'] - 0) / max(d['fused'] + d['left'], 1):.0f} cyc per op, {d['left'] / T:.0f} stock ops left per tile-it")
+            print(f"  {p + ' pipe':15s} {d['pipe'] / T / 1e6:7.3f} M  = {d['pipe'] / max(r['stock'], 1):.2f}x stock (EST lower bound through the load macro: one cycle per row per Dest operand)")
+        left = {k: v * bg.STOCK[k] / T / 1e6 for k, v in r["kinds"].items() if k in bg.STOCK and k not in bg.FUS and k not in ("fill", "cpd")}
+        print("  ops that stay stock, M cycles per tile-it:", {k: round(v, 3) for k, v in sorted(left.items(), key=lambda x: -x[1])}, "sum %.3f" % sum(left.values()))
         print("  kinds per tile-it:", {k: round(v / T) for k, v in r["kinds"].most_common()})
         print("  hoist4 bodies (operands, ops, results): tiles", [(k, v) for k, v in r["shape"].most_common(12)])
     if a.json:
