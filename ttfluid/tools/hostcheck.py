@@ -23,4 +23,4 @@ for n, f in zip(("U", "p", "k", "omega", "nut"), s.fields()):
     worst = max(worst, rel)
     print("%-6s rel L2 %.3e max |d| %.3e of %.3e" % (n, rel, np.abs(x - y).max(), np.abs(x).max()))
 print("%s %s against the host solver with slots by %s, %d it: worst %.3e (tol %.0e)" % ("PASS" if worst <= tol else "FAIL", sys.argv[2].split("/")[-1], sys.argv[3], len(hist), worst, tol))
-sys.exit(worst > tol)
+sys.exit(int(worst > tol))
