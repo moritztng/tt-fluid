@@ -9,7 +9,7 @@ included. Two Blackhole chips of a p300 board have two links between them: --arc
 Options as run_vm.py, plus --mesh R,C (the chips' mesh; K = R * C partition blocks are placed on it so that
 neighbouring blocks are neighbouring chips).
 """
-import argparse, collections, json, os, pickle, re, sys, threading, time
+import argparse, collections, json, os, pickle, re, sys, threading, time, zlib
 from pathlib import Path
 
 import numpy as np
@@ -83,6 +83,7 @@ ap.add_argument("--l1-check", action="store_true", help="open the mesh, size eve
 ap.add_argument("--gcache", type=int, default=-1, help="as run_vm.py: N gather tile cache slots of 4 KB; -1 (default): T + 1, a whole vector, "
                "so a DRAM-homed gather source is fetched once per part whatever T is; fewer if the L1 is short")
 ap.add_argument("--icache", type=int, default=1, help="as run_vm.py: compute skips a repeated op _init (CFD_ICACHE)")
+ap.add_argument("--blocks", type=int, default=0, help="1: the fusable ops of every block run as generated SFPU bodies, one program a row (C_BLK: resident/blklower.py, blockgen.py, kernels/blk_exec.h; define CFD_BLK). 0: one stock tile op per op word")
 ap.add_argument("--sched", type=int, default=3, help="as run_vm.py: 1 greedy reorder of each fused run's blocks so values die early, 2 greedy or depth-first, 3 (default) the same at min-store cut points (Machine(sched=K))")
 ap.add_argument("--dedup", type=int, default=0, help="as run_vm.py: a fused run streams each DRAM page once (Machine(dedup=True))")
 ap.add_argument("--tsort", type=int, default=None, help="as run_vm.py: tabstream residue entries sorted by source tile (CFD_TSORT). "
@@ -202,7 +203,7 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "blocks") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
@@ -225,6 +226,9 @@ if a.from_images:   # the device run from per-chip images (lower/image_dev.py): 
     if IMG.shared["flags"].get("phase") and not a.phase:   # images lowered with --phase carry the markers: run with CFD_PHASE
         a.phase = True
         print("images lowered with --phase: CFD_PHASE on", flush=True)
+    if IMG.shared["flags"].get("blocks") and not a.blocks:   # images encoded with bodies carry C_BLK words: run with CFD_BLK
+        a.blocks = int(IMG.shared["flags"]["blocks"])
+        print("images lowered with --blocks %d: CFD_BLK on" % a.blocks, flush=True)
     if a.tsort is None:   # CFD_TSORT reads four entries per cached tile: only right on tables lowered sorted
         a.tsort = int(IMG.shared["flags"].get("tsort", 0))
     mp = m.maps
@@ -252,7 +256,7 @@ else:
     elif a.mcache and os.path.exists(a.mcache):
         with mcache_open("rb") as f:
             saved, prog, m = pickle.load(f)
-        saved, low = ({k: v for k, v in d.items() if k != "tsort"} for d in (saved, LOWER))   # tsort is in the encoding, not the Machine
+        saved, low = ({k: v for k, v in d.items() if k not in ("tsort", "blocks")} for d in (saved, LOWER))   # tsort and blocks are in the encoding, not the Machine
         assert saved == low, ("--mcache: lowering flags differ", {k: (saved.get(k), low[k]) for k in low if saved.get(k) != low[k]})
         print("machine from %s in %.1f s" % (a.mcache, time.time() - t0), flush=True)
     else:
@@ -337,6 +341,9 @@ else:
     ttfluid.resident.encode.WIDE = a.wide or m.T > 64   # over 65,536 lanes a core: 22-bit gather entries (ttfluid/resident/encode.py)
     assert a.tabstream or not ttfluid.resident.encode.WIDE, "T=%d > 64 needs --tabstream" % m.T
     assert not (ttfluid.resident.encode.WIDE and (a.tgts or a.gtile)), "--tgts / --gtile hand over 16-bit gather entries (vm_compute tsvc): not with wide ones"
+    if a.blocks:   # body() lowers each block's fusable ops into generated bodies (every Encoded() below)
+        assert not a.load, "--blocks: a --load file is already encoded"
+        ttfluid.resident.encode.BLOCKS = dict(plan={}, gen={})
     if not a.load:
         E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
         if a.tscheck:   # as run_vm.py: NCRISC's streamed walk replayed against the cursor tables, every core
@@ -354,6 +361,8 @@ else:
                 k -= 1
         if a.gtile:
             print("gtile: %d gathers hand over per tile" % E.gtile_n, flush=True)
+        if a.blocks:
+            print("blocks: %s" % json.dumps(ttfluid.resident.encode.BLK_STAT), flush=True)
     if a.gruns:
         from ttfluid.lower import gruns
         assert E.tab_stream, "--gruns reads the tabstream tables"
@@ -628,6 +637,8 @@ else:
 defs = [("CFD_PROF", "1")] * a.prof + [("CFD_STOP", str(a.stop))] * bool(a.stop) + [("CFD_CP", str(m.cpages)), ("CFD_MESH", str(K)), ("CFD_NSH", str(NSH)), ("CFD_SYNCB", str(SYNCB)), ("CFD_GB", str(GB)), ("CFD_RB", str(RB)), ("CFD_CONS", str(E0 + 512))] + ([("CFD_RED2", "1")] if m.red2 else []) + \
        ([("CFD_TABSTREAM", str(CB_TS))] if a.tabstream else []) + ([("CFD_WIDE", "1")] if ttfluid.resident.encode.WIDE else []) + ([("CFD_BSCAL", "1")] if a.bscal else []) + ([("CFD_OS", str(a.os))] if a.os else [])
 
+BLKREV = zlib.crc32((DEV / "blk_exec.h").read_bytes()) | 1   # CFD_BLK's value: an edited header is a new kernel for the JIT cache
+
 
 def kd(src, ct, cfg, rt=None, crt=None):
     k = ttnn.KernelDescriptor(kernel_source=str(DEV / src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -637,6 +648,7 @@ def kd(src, ct, cfg, rt=None, crt=None):
     if crt is not None:
         k.common_runtime_args = list(crt)
     k.defines = defs + ([("CFD_ICACHE", "1")] if a.icache and src == "vm_compute.cpp" else []) + \
+        ([("CFD_BLK", str(BLKREV))] if a.blocks and src == "vm_compute.cpp" else []) + \
         ([("CFD_PHASE", "1")] if a.phase and src in ("vm_compute.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_TSORT", "1")] if a.tsort and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_BPATCH", str(a.bpatch))] if a.bpatch and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
@@ -945,7 +957,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         h[:, w] += h[:, w + 400] << 32
     root = [k * P for k in range(K)]
     gws = sorted(gtab)
-    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
+    res = dict(blocks=a.blocks, blk_stat=dict(ttfluid.resident.encode.BLK_STAT), jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
                plan=info, sizes=E.sizes(), l1=l1, rows=nrow, walls=walls, ticks=ticks,
                ms_device=[max(t) / amax / 1e3 for t in ticks], aiclk=clks,
                same_history_all_chips=bool(all(np.array_equal(hist_all[0, :nrow], hist_all[k, :nrow]) for k in range(K))),

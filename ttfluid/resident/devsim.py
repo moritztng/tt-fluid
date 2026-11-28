@@ -219,6 +219,8 @@ class DevSim:
                 pcs[ag] = int(S[pc + 2]) if self._branch(ag, bri, f0) else pc + 3
             elif op == E.C_LDS:
                 pcs[ag] = pc + 2
+            elif op == E.C_BLK:     # a generated body: its program is inline, no protocol effect
+                pcs[ag] = pc + 1 + (w >> 16)
             elif op in (E.C_LDR, E.C_LDRH):
                 if q[(i, "rin")] == 0:
                     return None

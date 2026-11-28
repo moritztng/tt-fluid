@@ -182,6 +182,9 @@ class Encoded:
         self.cores = np.arange(m.P) if cores is None else np.asarray(cores)
         assert not (tab_stream and getattr(m, "hrun", False)), "hrun marks the L1 gather tables"
         assert tab_stream or not WIDE, "wide gather entries carry the lane within its tile: only the streamed walk"
+        if BLOCKS:      # the counts are of this encoding (run_mesh encodes again per --l1 auto step)
+            BLK_STAT.clear()
+            BLK_STAT.update(bodies=0, words=0)
         self.loop_pages = 1     # paged: the most code pages the ring holds at once (a tile loop's body, or an N_CODE's
         #   pages past compute's release point); the ring needs more than this
         P = pdev or m.P
