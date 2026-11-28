@@ -5,7 +5,10 @@ from pathlib import Path
 import numpy as np
 
 from ttfluid.resident import program
-from ttfluid.resident.machine import Machine, _cfg_dom, cse, pull_gather
+from ttfluid.resident.census import region_of
+from ttfluid.resident.devsim import DevSim
+from ttfluid.resident.encode import Encoded
+from ttfluid.resident.machine import DBASE, Machine, _cfg_dom, cse, pull_gather
 from ttfluid.resident.memu import MachineEmu
 from ttfluid.resident.trace import SCALAR, Space
 from ttfluid.solver.simple import SimpleFoam
@@ -110,3 +113,31 @@ def test_pitzdaily_cse_3_4_and_bound_fallback_bitwise():
             me.run()
             digs.append(_digest(me))
         assert len(set(digs)) == 1, f"zero_k={zero_k} digests differ across cse 2/3/4: {digs}"
+
+
+def test_gbatch_pseg_span_bitwise_and_devsim():
+    """--gbatch 1 (with pseg=0 and pseg=3, l1=1 and l1=2) cuts nhalo to 1, eliminates DRAM outer halos,
+    matches --cse 2 bit-for-bit on pitzDaily, and passes DevSim with dense tables."""
+    s = SimpleFoam(CASE, backend="ell", dtype=np.float32, log=lambda *a: None, ell_order="face")
+    prog = program.build(s, 2, phase=True)
+    mref = Machine(prog, s.mesh, P=4, log=lambda *a: None, cse_ir=2, **KW)
+    meref = MachineEmu(mref)
+    meref.run()
+    ref_dig = _digest(meref)
+    for extra in (
+        dict(cse_ir=4, gbatch=True, pseg=0),
+        dict(cse_ir=4, gbatch=True, pseg=3),
+        dict(cse_ir=4, gbatch=True, pseg=3, l1_vec=2, lsplit=1),
+    ):
+        kw = {**KW, **extra}
+        m = Machine(prog, s.mesh, P=4, log=lambda *a: None, **kw)
+        reg = region_of(m.mir)
+        dram_oh = sum(1 for j, ins in enumerate(m.mir) if reg[j] == "outer" and ins[0] == "halo" and m.phys[ins[2]] >= DBASE)
+        assert m.nhalo == 1, f"{extra}: expected nhalo=1, got {m.nhalo}"
+        assert dram_oh == 0, f"{extra}: expected 0 DRAM outer halos, got {dram_oh}"
+        me = MachineEmu(m)
+        me.run()
+        assert _digest(me) == ref_dig, f"{extra}: digest mismatch {_digest(me)} != {ref_dig}"
+        E = Encoded(m, page=True, pdev=4, tab_stream=True, tab_sort=True, tab_dense=530)
+        DevSim(E, me.branches).run()
+

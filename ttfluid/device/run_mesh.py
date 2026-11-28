@@ -148,6 +148,8 @@ ap.add_argument("--cap", type=int, default=32, help="as run_vm.py: scratch cap, 
 ap.add_argument("--lsplit", type=int, default=0, help="1: a vector that holds an L1 colour across a Krylov loop it is not used in is parked in DRAM "
                 "for the loop, so the loop's own vectors take the colour (Machine(lsplit)); 2: also a colour holder the loop touches less often than "
                 "a vector it left in DRAM (the solve's own solution register). Data movement only: same values. Needs a lowering")
+ap.add_argument("--gbatch", type=int, default=0, help="1: group outer-body single-source gathers by source before halo allocation "
+                "(cuts halo slots and L1 span fills), serve pending DRAM halos and pseg patched loads from the L1 span (Machine(gbatch=True)), bit-exact")
 ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3, 4 need --tabstream (mesh has no trid). Default 0 keeps the built images unchanged")
 ap.add_argument("--os", type=int, default=0, help="1: BRISC built for size (#pragma GCC optimize Os), 2: NCRISC too, for a program over the kernel config buffer")
 ap.add_argument("--prof", action="store_true", help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores")
@@ -233,7 +235,7 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit", "gbatch") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
@@ -332,7 +334,7 @@ else:
                     l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
                     joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
                     bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=a.cse, hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span, lsplit=a.lsplit)
+                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=a.cse, hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span, lsplit=a.lsplit, gbatch=bool(a.gbatch))
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))

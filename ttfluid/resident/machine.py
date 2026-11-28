@@ -1270,7 +1270,7 @@ def slot_extents(code, space, cells, slotfold, L, T):
 class Machine:
     def __init__(self, prog, mesh, P, nslot=NSLOT, log=print, layout="rcb", tiles=None, l1_vec=None, fuse=False, scratch_cap=32,
                  span_homes=False, hoist=False, cap_min=False, sched=False, amg_vec=False, ptiles=False, bcast_run=False, joint_red=False, fold1=False,
-                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0, lsplit=False):
+                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0, lsplit=False, gbatch=False):
         # two-stage reductions: fold the chip's partials, then the K chip sums; no joint reductions then. Needed when
         # K * P partials do not fit one fold tile, and the default from 8 chips (r13 2x4: 520.3 vs 546.9 ms/it)
         self.red2 = bool(chip_cores) and ((P > LANES or P >= 8 * chip_cores) if red2 is None else red2)
@@ -1287,6 +1287,7 @@ class Machine:
         self.hlate = hlate     # a halo goes out right before its first gather, not after its source's last write
         self.hre = hre         # >0: a halo last read more than hre MIR back is sent again, not held in its slot
         self.pseg = pseg
+        self.gbatch = bool(gbatch)
         self.narrow_on, self.narrow, self.narrow_slot, self.pre_h, self.narrow_home = narrow, set(), {}, {}, set()   # narrow: bf16 DRAM pages for eligible constants (_narrow)
         self.coff, self.cpages, self.hpages, self.dslots = {}, 0, 0, []
         self.F = prog.dtype.type
@@ -1380,6 +1381,8 @@ class Machine:
         self.maps.finish(hrun)
         assert not (hsplit and len(self.maps.plans) > 1), "hsplit reads plan 0 only (vm_ncrisc N_HALO)"
         self._split_gathers()
+        if self.gbatch:
+            self._group_gathers()
         self._halos()
         self.scratch_cap, self.span_homes, self.hoist, self.cap_min = scratch_cap, span_homes, hoist, cap_min
         self.span = span
@@ -1889,6 +1892,98 @@ class Machine:
             out.append(ins)
         self.mir = out
 
+    def _group_gathers(self):
+        """gbatch: inside each straight-line outer-body piece (before _halos), pull subsequent single-source
+        gathers of the same vector source next to the first gather of that source under RAW/WAR/WAW. Cuts peak
+        live halos (freeing CB_HALO L1 for --l1) and L1 span refills without changing any computed value."""
+        from .census import region_of
+        reg = region_of(self.mir)
+        out, cur, moved = [], [], 0
+
+        def flush():
+            nonlocal moved
+            if len(cur) > 2:
+                piece, dm = self._group_gathers_piece(cur)
+                out.extend(piece)
+                moved += dm
+            else:
+                out.extend(cur)
+            cur.clear()
+
+        for j, ins in enumerate(self.mir):
+            if reg[j] == "outer" and ins[0] not in ("label", "jump", "jumpif"):
+                cur.append(ins)
+            else:
+                flush()
+                out.append(ins)
+        flush()
+        self.mir = out
+        self._log(f"gbatch: {moved} outer gathers grouped by source")
+
+    def _group_gathers_piece(self, piece):
+        units, i = [], 0
+        while i < len(piece):
+            ins, nxt = piece[i], piece[i + 1] if i + 1 < len(piece) else None
+            pair = (ins[0] == "blk" and nxt is not None and nxt[0] == "gather" and nxt[2] in self.base
+                    and any(x == nxt[1] for _, x in ins[2]))
+            units.append([ins, nxt] if pair else [ins])
+            i += 2 if pair else 1
+
+        def ginfo(u):
+            g = u[-1]
+            if g[0] != "gather":
+                return None
+            srcs = {x for x, _ in g[3]}
+            if len(u) == 2:
+                b = u[0]
+                if len(b[2]) != 1 or b[2][0][1] != g[1]:
+                    return None
+                v = b[1][-1]
+                if v[0] == "lds":
+                    srcs.add(v[2])
+                elif v[0] != "fill":
+                    return None
+            if len(srcs) != 1:
+                return None
+            s = next(iter(srcs))
+            if not self.is_vec(s) or s == g[1] or s in self.fetched_from:
+                return None
+            return s, g[1]
+
+        info = [ginfo(u) for u in units]
+        ud = [({r for x in u for r in _mir_uses(x)} - {"__anchor__"},
+               {r for x in u for r in _mir_defs(x)}) for u in units]
+        for k, u in enumerate(units):
+            if len(u) == 2:
+                ud[k] = (ud[k][0] - ud[k][1], ud[k][1])
+
+        done, res, moved = [False] * len(units), [], 0
+        for k in range(len(units)):
+            if done[k]:
+                continue
+            done[k] = True
+            res.append(units[k])
+            if info[k] is None:
+                continue
+            s = info[k][0]
+            touched = set()
+            for j in range(k + 1, len(units)):
+                if done[j]:
+                    continue
+                uj, dj = ud[j]
+                if s in dj:
+                    break
+                if info[j] is not None and info[j][0] == s:
+                    dst = info[j][1]
+                    if dst not in touched and s not in dj:
+                        done[j] = True
+                        res.append(units[j])
+                        touched |= dj
+                        moved += 1
+                        continue
+                touched |= uj | dj
+        return [x for u in res for x in u], moved
+
     # ---- halos: one push per (straight-line segment, source value), hoisted to just after the source's last write
     def _segments(self):
         """Segment tile-loop fusion, step 1: wrap each maximal run of vector blocks that can run tile by tile as
@@ -1904,6 +1999,8 @@ class Machine:
         defs, rd, shifted = set(), set(), set()
         pdefs, puses = set(), set()      # what the deferred instructions write / read
         self.cuts = Counter()       # why runs ended (census only)
+        one_src = self.gbatch and self.pseg >= 3 and self.span > 0
+        gsrc_cur = None
 
         def close():
             out.extend(pre)
@@ -1911,8 +2008,9 @@ class Machine:
             out.extend(post)
             for x in (pre, cur, post, defs, rd, shifted, pdefs, puses):
                 x.clear()
-            nonlocal npatch
+            nonlocal npatch, gsrc_cur
             npatch = 0
+            gsrc_cur = None
         mir, skip, npatch = self.mir, False, 0
         labels = {ins[1]: i for i, ins in enumerate(mir) if ins[0] == "label"}
         depth = np.zeros(len(mir) + 1, int)     # pseg 2, 3: only in the outer iteration's body, not in a solve's loop
@@ -1932,6 +2030,10 @@ class Machine:
                 u, dst = ins[1][-1], nxt[1]
                 src = u[2] if u[0] == "lds" else None
                 srcs = {x for x, _ in nxt[3]} | ({src} if src is not None else set())
+                gsrc = next(iter(srcs)) if len(srcs) == 1 else None
+                if one_src and cur and gsrc_cur is not None and gsrc != gsrc_cur:
+                    self.cuts["span-src"] += 1
+                    close()
                 if (not npatch or self.pseg >= 3) and not srcs & (defs | pdefs) and dst not in defs | rd | shifted | pdefs | puses:
                     page = ("blk", [("ldr", 0, src, u[3] if src is not None else 0, nxt[2], nxt[3])], [(0, dst)])
                     if cur and self.tiles([page]) != self.tiles(cur):     # one tile count per segment, as below
@@ -1941,6 +2043,8 @@ class Machine:
                     defs.add(dst)
                     rd |= srcs
                     shifted |= srcs
+                    if one_src and gsrc is not None:
+                        gsrc_cur = gsrc
                     npatch, skip = 1, True
                     self.cuts["pseg"] += 1
                     continue
@@ -2625,6 +2729,8 @@ class Machine:
     # unchanged: the same lanes are read, from a copy. With --span 1 a served gather whose destination is in L1 stays
     # a block and a gather op (two syncs); --span 2 makes it one reader page as well, like the DRAM destinations.
     def _span_fill(self, mir, D, base):
+        if self.gbatch:
+            return self._span_fill_gbatch(mir, D, base)
         out, cur, held, nfill, npage, skipped = [], None, None, 0, 0, Counter()
         self.span_held = set()
         i = 0
@@ -2666,6 +2772,184 @@ class Machine:
         self._log("span: %d gathers read the L1 span at tile %d, %d fills (static), kept on today's path: %s" % (
             npage, base, nfill, ", ".join("%s %d" % kv for kv in sorted(skipped.items())) or "none"))
         return out
+
+    def _span_fill_gbatch(self, mir, D, base):
+        """Extended _span_fill for gbatch: also redirects pending DRAM halos to read the L1 span (kd=0 L1 halo
+        instead of scalar 4-byte DRAM reads), serves pseg patched loads inside fused segs and unsplit/fill gathers
+        from the span, and turns plain ldrs of the span-held source inside the same seg into L1 ld/lds."""
+        out, cur, held, nfill, npage, l1_halos, skipped = [], None, None, 0, 0, 0, Counter()
+        self.span_held = set()
+        pending_halo, h_to_src = {}, {}
+
+        def drop_halo_for_src(s):
+            if s in pending_halo:
+                for _, h in pending_halo.pop(s):
+                    h_to_src.pop(h, None)
+
+        def drop_halo_used(ins):
+            for r in _mir_uses(ins):
+                if isinstance(r, tuple) and r[0] == "H" and r[1] in h_to_src:
+                    s = h_to_src.pop(r[1])
+                    if s in pending_halo:
+                        pending_halo[s] = [(idx, h) for idx, h in pending_halo[s] if h != r[1]]
+                        if not pending_halo[s]:
+                            del pending_halo[s]
+
+        def ensure_span(src):
+            nonlocal cur, held, nfill, l1_halos
+            if cur != src:
+                held = self._tmp(self.space[src])
+                if src in self.ext:
+                    self.ext[held] = self.ext[src]
+                self.phys[held] = base
+                self.span_held.add(held)
+                out.append(("blk", [("ld", 0, src)], [(0, held)]))
+                cur, nfill = src, nfill + 1
+                if src in pending_halo:
+                    for pidx, ph in pending_halo.pop(src):
+                        h_to_src.pop(ph, None)
+                        out[pidx] = None
+                        out.append(("halo", ph, held))
+                        l1_halos += 1
+
+        i = 0
+        while i < len(mir):
+            ins = mir[i]
+            nxt = mir[i + 1] if i + 1 < len(mir) else None
+            if ins[0] in ("label", "jump", "jumpif"):
+                cur = None
+                pending_halo.clear()
+                h_to_src.clear()
+                out.append(ins)
+                i += 1
+                continue
+            if ins[0] == "halo":
+                h, s = ins[1], ins[2]
+                if s in D and s not in self.alias:
+                    if cur == s:
+                        out.append(("halo", h, held))
+                        l1_halos += 1
+                    else:
+                        pending_halo.setdefault(s, []).append((len(out), h))
+                        h_to_src[h] = s
+                        out.append(ins)
+                    i += 1
+                    continue
+            if ins[0] == "seg":
+                seg_defs = set(_mir_defs(ins))
+                cand = Counter()
+                for b in ins[1]:
+                    if b[0] != "blk":
+                        continue
+                    for u in b[1]:
+                        if u[0] == "ldr" and u[4] is not None:
+                            srcs = {x for x, _ in u[5]} | ({u[2]} if u[2] is not None else set())
+                            if len(srcs) == 1:
+                                s0 = next(iter(srcs))
+                                if s0 in D and s0 not in self.alias and s0 not in seg_defs:
+                                    cand[s0] += 1
+                if cand:
+                    src = cur if cur in cand else cand.most_common(1)[0][0]
+                    ensure_span(src)
+                    new_blks = []
+                    for b in ins[1]:
+                        if b[0] != "blk":
+                            new_blks.append(b)
+                            continue
+                        nu = []
+                        for u in b[1]:
+                            if u[0] == "ldr" and u[4] is not None:
+                                srcs = {x for x, _ in u[5]} | ({u[2]} if u[2] is not None else set())
+                                if srcs == {src}:
+                                    nu.append(("ldr", u[1], held if u[2] == src else None, u[3], u[4],
+                                               [(held, h) for _, h in u[5]]))
+                                    npage += 1
+                                    continue
+                            elif u[0] == "ldr" and u[4] is None and u[2] == src:
+                                if u[3] == 0:
+                                    nu.append(("ld", u[1], held))
+                                    continue
+                                if u[3] % 4 == 0:
+                                    nu.append(("lds", u[1], held, u[3]))
+                                    continue
+                            nu.append(u)
+                        new_blks.append(("blk", nu, b[2]))
+                    ins = ("seg", new_blks)
+                drop_halo_used(ins)
+                for d in seg_defs:
+                    if d == cur:
+                        cur = None
+                    drop_halo_for_src(d)
+                out.append(ins)
+                i += 1
+                continue
+            src, kind = None, None
+            if ins[0] == "blk" and nxt is not None and nxt[0] == "gather" and len(ins[2]) == 1 and \
+                    nxt[1] == ins[2][0][1] and nxt[2] in self.base:
+                u = ins[1][-1]
+                if u[0] == "lds" and u[2] in D and (len(ins[1]) == 1 or (len(ins[1]) == 2 and ins[1][0][2] == "__anchor__")):
+                    why = "constant" if u[2] in self.alias else "parts" if any(x != u[2] for x, h in nxt[3]) \
+                        else "self" if nxt[1] == u[2] else None
+                    if why is None:
+                        src, kind = u[2], "lds"
+                    else:
+                        skipped[why] += 1
+                elif u[0] == "fill" and (len(ins[1]) == 1 or (len(ins[1]) == 2 and ins[1][0][2] == "__anchor__")):
+                    srcs = {x for x, _ in nxt[3]}
+                    if len(srcs) == 1:
+                        s0 = next(iter(srcs))
+                        if s0 in D and s0 not in self.alias and nxt[1] != s0 and (cur == s0 or s0 in pending_halo):
+                            src, kind = s0, "fill"
+            elif ins[0] == "blk" and len(ins[1]) == 1 and ins[1][0][0] == "ldr" and ins[1][0][4] is not None:
+                u = ins[1][0]
+                srcs = {x for x, _ in u[5]} | ({u[2]} if u[2] is not None else set())
+                if len(srcs) == 1:
+                    s0 = next(iter(srcs))
+                    if s0 in D and s0 not in self.alias and s0 not in _mir_defs(ins):
+                        src, kind = s0, "ldr_blk"
+            elif ins[0] == "gather":
+                srcs = {x for x, _ in ins[3]}
+                if len(srcs) == 1:
+                    s0 = next(iter(srcs))
+                    if s0 in D and s0 not in self.alias and ins[1] != s0 and (cur == s0 or s0 in pending_halo):
+                        src, kind = s0, "unsplit"
+            if src is not None:
+                ensure_span(src)
+                if kind == "lds":
+                    u = ins[1][-1]
+                    out.append(("blk", list(ins[1][:-1]) + [("lds", u[1], held, u[3])], ins[2]))
+                    out.append(("gather", nxt[1], nxt[2], [(held, h) for _, h in nxt[3]]))
+                    npage += 1
+                    i += 2
+                    continue
+                if kind == "fill":
+                    out.append(ins)
+                    out.append(("gather", nxt[1], nxt[2], [(held, h) for _, h in nxt[3]]))
+                    npage += 1
+                    i += 2
+                    continue
+                if kind == "ldr_blk":
+                    u = ins[1][0]
+                    out.append(("blk", [("ldr", u[1], held if u[2] == src else None, u[3], u[4],
+                                         [(held, h) for _, h in u[5]])], ins[2]))
+                    npage += 1
+                    i += 1
+                    continue
+                out.append(("gather", ins[1], ins[2], [(held, h) for _, h in ins[3]]))
+                npage += 1
+                i += 1
+                continue
+            drop_halo_used(ins)
+            for d in _mir_defs(ins):
+                if d == cur:
+                    cur = None
+                drop_halo_for_src(d)
+            out.append(ins)
+            i += 1
+        self.span_stat = (nfill, npage, dict(skipped), l1_halos)
+        self._log("span: %d gathers read the L1 span at tile %d, %d fills (static), %d L1 halos, kept on today's path: %s" % (
+            npage, base, nfill, l1_halos, ", ".join("%s %d" % kv for kv in sorted(skipped.items())) or "none"))
+        return [x for x in out if x is not None]
 
     def _overlay(self, regs, T, isv):
         """wplace 2: home a vector register (heaviest first) on consecutive one-tile slots that no register live with it
