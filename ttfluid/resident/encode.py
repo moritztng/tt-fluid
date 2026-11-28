@@ -32,7 +32,8 @@ C_MAD, C_MSB = 41, 42   # a = d + b c, a = d - b c
 C_LDRH = 43             # C_LDR of a bf16 page (Machine narrow), widened to fp32 in Dest
 C_STWH = 44             # C_STW packed to bf16 (Machine narrow 2)
 C_PH = 45               # phase marker (Encoded(phase=...)): phase id in the top 16 bits; vm_compute CFD_PHASE
-C_BLK = 46              # a generated SFPU body (BLOCKS): n << 16, then its n-word program inline (blockgen.program)
+C_BLK = 46              # a generated SFPU body (BLOCKS): n << 16, then its n-word program inline (blockgen.program);
+                        # with BLOCKS["tab"]: W(C_BLK, 1) | offset << 16, the program sits in the MATH kernel's table
 # BLOCKS (run_mesh --blocks, tools): None = every op its stock word. Else dict(plan=..., gen=...): each block is lowered
 # by blklower.lower_block(**plan) and its bodies by blockgen.program(**gen); the kernel needs CFD_BLK. The arithmetic
 # and its order are the uop list's, so memu stays the reference and the state digest must not move.
@@ -280,10 +281,20 @@ class Encoded:
                 k = u[0]
                 if k == "body":
                     ws = blockgen.program(u[1], brk=BLOCKS.get("brk", 0), **gen)
-                    assert len(ws) < PW, "a body program must fit a code page"
                     BLK_STAT["bodies"] += 1
-                    BLK_STAT["words"] += len(ws)
-                    c(W(C_BLK) | len(ws) << 16, *ws)
+                    tab = BLOCKS.get("tab")
+                    if tab is None:     # inline: the program follows its op word
+                        assert len(ws) < PW, "a body program must fit a code page"
+                        BLK_STAT["words"] += len(ws)
+                        c(W(C_BLK) | len(ws) << 16, *ws)
+                    else:               # table: one op word a body, equal programs share one entry (run_mesh --blktab)
+                        k = tuple(int(x) for x in ws)
+                        if k not in tab:
+                            tab[k] = sum(len(p) for p in tab)
+                        assert tab[k] < 1 << 16, "the body table is over 64 K words"
+                        BLK_STAT["words"] += 1
+                        BLK_STAT["programs"], BLK_STAT["table words"] = len(tab), sum(len(p) for p in tab)
+                        c(W(C_BLK, 1) | tab[k] << 16)
                 elif k == "ld":
                     c(W(C_LD, u[1]) | tf(u[2]) | phys[u[2]] << 16)
                 elif k == "lds":      # offset load: lane l reads lane l + u[3] (a multiple of 4 = 16 B)
