@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `run_mesh --cache DIR`: a lowering reads the case, the traced program and the partition back from DIR when their
+  flags, input files and source did not change. Images are byte-equal to an uncached lowering's.
+- `run_mesh --stages FILE`: seconds and peak memory of every lowering stage.
+
+### Changed
+- Image files are written sparse in one pass and digested without a copy; the bytes are unchanged.
+
 ## [0.1.0] - 2026-10-19
 
 First public release.

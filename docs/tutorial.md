@@ -85,6 +85,11 @@ This traces one SIMPLE iteration of the full case, partitions it over the two ch
 it, and writes one image per chip. It runs on the CPU only. It refuses to start if the write would leave the disk with
 less than 200 GB free (`--min-free-gb`).
 
+If you lower the same case again with other flags or after a code change, add `--cache DIR` and set `PYTHONHASHSEED`
+to a fixed value. The case read, the traced program and the partition are kept in DIR and read back when nothing they
+depend on has changed. The images are byte for byte the ones an uncached lowering writes. `--stages FILE` records the
+seconds and peak memory of every stage of the lowering.
+
 The pressure solve is Jacobi-preconditioned CG (`--amg-depth 0` builds no coarse level). On Blackhole that is faster
 than an aggregation V-cycle: it needs about six times as many iterations, but each costs a twentieth.
 
