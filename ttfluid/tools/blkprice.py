@@ -36,7 +36,7 @@ if __name__ == "__main__":
     for j, ins in enumerate(mir):
         if ins[0] not in ("blk", "seg"):
             continue
-        r = R.setdefault(reg[j], dict(stock=0.0, kinds=Counter(), est=0.0, blocks=0, tiles=0, shape=Counter(),
+        r = R.setdefault(reg[j], dict(stock=0.0, kinds=Counter(), est=0.0, blocks=0, tiles=0, shape=Counter(), seq=Counter(), ride=Counter(),
                                       **{p: dict(cyc=0.0, bodies=0, instr=0, fused=0, left=0) for p in POL}))
         blks = [ins] if ins[0] == "blk" else [x for x in ins[1] if x[0] == "blk"]
         bt = m.tiles(blks)
@@ -66,6 +66,17 @@ if __name__ == "__main__":
                     for k, q in pl:
                         if k == "body":
                             r["shape"][(len(q["ins"]), len(q["ops"]), len(q["outs"]))] += passes
+                            # which ops could ride on the load of one of their operands: an operand read from Dest
+                            # whose first use in the body is this op (D), against already loaded (d), intermediate (i)
+                            # and constant (k) inputs
+                            seen, inside, sig, ride = set(), {x.out for x in q["ops"]}, [], 0
+                            for x in q["ops"]:
+                                cls = "".join("i" if v in inside else "k" if v not in q["ins"] else "d" if v in seen else "D" for v in x.ins)
+                                seen |= set(x.ins)
+                                ride += "D" in cls
+                                sig.append(x.name + ":" + cls)
+                            r["seq"][(" ".join(sig), len(q["ins"]), len(q["outs"]))] += passes
+                            r["ride"][(len(q["ops"]), ride)] += passes
     T = m.T
     print(a.path.split("/")[-1], "T", T, "nslot", m.nslot)
     for name, r in sorted(R.items()):
@@ -82,7 +93,15 @@ if __name__ == "__main__":
         print("  ops that stay stock, M cycles per tile-it:", {k: round(v, 3) for k, v in sorted(left.items(), key=lambda x: -x[1])}, "sum %.3f" % sum(left.values()))
         print("  kinds per tile-it:", {k: round(v / T) for k, v in r["kinds"].most_common()})
         print("  hoist4 bodies (operands, ops, results): tiles", [(k, v) for k, v in r["shape"].most_common(12)])
+        tot = max(sum(r["seq"].values()), 1)
+        nops = sum(k[0] * v for k, v in r["ride"].items())
+        print("  hoist4: ops that can ride on a load %d of %d per tile-it; bodies where every op rides %.0f %% of body tiles; distinct bodies %d"
+              % (sum(k[1] * v for k, v in r["ride"].items()) / T, nops / T, 100 * sum(v for k, v in r["ride"].items() if k[0] == k[1]) / tot, len(r["seq"])))
+        acc = 0
+        for (sig, ni, no), v in r["seq"].most_common(40):
+            acc += v
+            print("   %5.1f %% (cum %5.1f)  in %d out %d  %s" % (100 * v / tot, 100 * acc / tot, ni, no, sig))
     if a.json:
         json.dump({n: dict(stock=r["stock"], est=r["est"], blocks=r["blocks"], tiles=r["tiles"], kinds=dict(r["kinds"]),
-                           **{p: r[p] for p in POL}, shape={str(k): v for k, v in r["shape"].items()}) for n, r in R.items()} |
+                           **{p: r[p] for p in POL}, shape={str(k): v for k, v in r["shape"].items()}, seq={str(k): v for k, v in r["seq"].most_common(400)}) for n, r in R.items()} |
                   {"T": T, "nslot": m.nslot, "path": a.path}, open(a.json, "w"), indent=1)
