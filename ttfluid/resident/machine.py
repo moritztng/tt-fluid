@@ -25,6 +25,7 @@ import bisect
 import hashlib
 import os
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -433,32 +434,53 @@ class Maps:
     def __init__(self, prog, lay):
         self.prog, self.lay = prog, lay
         self.key2id, self.maps, self.lanes = {}, [], []
+        self._aid2id, self._aid_refs = {}, []
         self.group = None   # cores per chip on a mesh of chips (Machine(chip_cores=))
         self.cores = None   # (lo, hi): finish builds the tables of these cores only
 
     def map_of(self, dst_space, parts, lanes=None):
         """lanes: a register narrower than its space (--sliced) takes only its first `lanes` lanes on each core."""
+        akey = (dst_space.name, lanes) + tuple((self.prog.space[s].name, _aid(d), _aid(p)) for s, d, p in parts)
+        mid = self._aid2id.get(akey)
+        if mid is not None:
+            return mid
+        raw_parts = parts
         if lanes is not None:
             ln = self.lay.lane[dst_space.name]
-            parts = [(s, np.asarray(d)[ln[d] < lanes], np.asarray(p)[ln[np.asarray(d)] < lanes]) for s, d, p in parts]
-        key = (dst_space.name, lanes) + tuple((self.prog.space[s].name, d.tobytes(), np.asarray(p).tobytes())
-                                              for s, d, p in parts)
-        if key not in self.key2id:
-            self.key2id[key] = len(self.maps)
+            sliced = []
+            for s, d, p in parts:
+                da = np.asarray(d)
+                sel = ln[da] < lanes
+                sliced.append((s, da[sel], np.asarray(p)[sel]))
+            parts = sliced
+
+        def _dig(a):
+            a = np.ascontiguousarray(a)
+            return (a.shape, a.dtype.str, hashlib.blake2b(a.reshape(-1).view(np.uint8), digest_size=16).digest())
+
+        key = (dst_space.name, lanes) + tuple((self.prog.space[s].name, _dig(d), _dig(p)) for s, d, p in parts)
+        mid = self.key2id.get(key)
+        if mid is None:
+            mid = len(self.maps)
+            self.key2id[key] = mid
             self.maps.append((dst_space, [(self.prog.space[s], np.asarray(d), np.asarray(p)) for s, d, p in parts]))
             self.lanes.append(lanes)
-        return self.key2id[key]
+        self._aid2id[akey] = mid
+        self._aid_refs.append(raw_parts)
+        return mid
 
     def finish(self, hrun=False):
+        self.key2id.clear()
+        self._aid2id.clear()
+        self._aid_refs.clear()
         lay, P = self.lay, self.lay.P
         cells = self.prog.cells.name
-        remote = [set() for _ in range(P)]
-        remote_x = {}      # other spaces read across cores (multigrid levels): one more halo plan each
+        rem_pairs = defaultdict(list)
         self.flat = []
         for dsp, parts in self.maps:
             n = dsp.n
-            which = np.full(n, -1)
-            src = np.zeros(n, np.int64)
+            which = np.full(n, -1, np.int16 if len(parts) < 32767 else np.int32)
+            src = np.zeros(n, np.int32)
             for k, (ssp, d, p) in enumerate(parts):
                 assert ssp is not SCALAR, "scalar gather source"
                 which[d] = k
@@ -470,18 +492,27 @@ class Maps:
                 so = lay.owner[ssp.name][src[e]]
                 loc = so == own_d[e]
                 if not loc.all():
-                    if ssp.name != cells and ssp.name not in remote_x:
-                        remote_x[ssp.name] = [set() for _ in range(P)]
-                    rs = remote if ssp.name == cells else remote_x[ssp.name]
-                    for i, c in zip(own_d[e[~loc]], src[e[~loc]]):
-                        rs[i].add(int(c))
+                    rem = e[~loc]
+                    rem_pairs[ssp.name].append((own_d[rem].astype(np.int64) << 32) | src[rem].astype(np.int64))
                 rows.append((k, e.astype(np.int32), loc, src[e].astype(np.int32)))
             del which, src      # each row keeps its own sources: the unwritten lanes are the elements no row names
             self.flat.append((dsp, rows))
+
+        def _remote_for(name):
+            plist = rem_pairs.get(name)
+            if not plist:
+                return [np.zeros(0, np.int64) for _ in range(P)]
+            u = np.unique(np.concatenate(plist))
+            owners = (u >> 32).astype(np.int32)
+            srcs = (u & 0xFFFFFFFF).astype(np.int64)
+            sp = np.searchsorted(owners, np.arange(P + 1))
+            return [srcs[sp[i]:sp[i + 1]] for i in range(P)]
+
         # halo layout: plan 0 is the cell space (the only plan of a one-space program, encoded as before), plan q > 0
         # one per other space read across cores. A plan has its own receive lists, senders and halo slots.
         assert not (hrun and self.group), "hrun is single-chip only (its gap lanes break the 16-B sender-chip groups)"
-        self.plans = [self._plan(cells, remote, hrun)] + [self._plan(nm, remote_x[nm], False) for nm in sorted(remote_x)]
+        other = sorted(nm for nm in rem_pairs if nm != cells)
+        self.plans = [self._plan(cells, _remote_for(cells), hrun)] + [self._plan(nm, _remote_for(nm), False) for nm in other]
         self.plan_of = {pl["space"]: q for q, pl in enumerate(self.plans)}
         pl = self.plans[0]
         self.halo_cells, self.pos, self.halo_pos = pl["cells"], pl["posa"], pl["pos"]
@@ -509,9 +540,11 @@ class Maps:
                 C.append(own_d[e]); L.append(lane_d[e]); Pt.append(np.full(len(e), k))
                 K.append(np.where(loc, 0, 1))
                 idx = lay.lane[ssp.name][se].copy()
-                hp = self.plans[self.plan_of[ssp.name]]["pos"] if not loc.all() else None
-                for j in np.nonzero(~loc)[0]:
-                    idx[j] = hp[own_d[e[j]]][int(se[j])]
+                if not loc.all():
+                    pl_s = self.plans[self.plan_of[ssp.name]]
+                    rem = np.nonzero(~loc)[0]
+                    q = (own_d[e[rem]].astype(np.int64) << 32) | se[rem].astype(np.int64)
+                    idx[rem] = pl_s["lookup_v"][np.searchsorted(pl_s["lookup_k"], q)]
                 I.append(idx)
             z = np.nonzero(unw)[0]
             if self.lanes[m] is not None:
@@ -539,7 +572,10 @@ class Maps:
         where a fabric write of the run lands."""
         lay, P = self.lay, self.lay.P
         own, lc = lay.owner[name], lay.lane[name]
-        hc = [np.array(sorted(r, key=lambda c: (own[c], lc[c])), np.int64) for r in remote]
+        hc = []
+        for r in remote:
+            a = np.asarray(r, np.int64) if isinstance(r, np.ndarray) else np.fromiter(r, np.int64, len(r))
+            hc.append(a[np.lexsort((lc[a], own[a]))] if len(a) else a)
         posa = []
         for h in hc:
             q = np.arange(len(h))
@@ -601,8 +637,19 @@ class Maps:
         for (j, i) in send:
             senders[i].append(j)
             receivers[j].append(i)
+        lk, lv = [], []
+        for i, h in enumerate(hc):
+            if len(h):
+                lk.append((np.int64(i) << 32) | h)
+                lv.append(np.array([pos[i][int(c)] for c in h], np.int32) if hrun else posa[i].astype(np.int32))
+        if lk:
+            lookup_k, lookup_v = np.concatenate(lk), np.concatenate(lv)
+            o = np.argsort(lookup_k)
+            lookup_k, lookup_v = lookup_k[o], lookup_v[o]
+        else:
+            lookup_k, lookup_v = np.zeros(0, np.int64), np.zeros(0, np.int32)
         return dict(space=name, cells=hc, pos=pos, posa=posa, hlanes=hlanes, hstart=hstart, hmax=hmax, send=send,
-                    recv_off=recv_off, senders=senders, receivers=receivers)
+                    recv_off=recv_off, senders=senders, receivers=receivers, lookup_k=lookup_k, lookup_v=lookup_v)
 
     @staticmethod
     def drop(t, cover=None):
@@ -913,13 +960,50 @@ def face_counts(mesh):
                        minlength=mesh.nCells)
 
 
-def sliced_lanes(owner, counts, P, Q=0):
+def export_key(owner, fo, fn):
+    """Per cell 0 if no other core reads it through a face, else a positive key that sorts cells by their receiver
+    set (the cores owning their face neighbours, ascending; sets compare lexicographically, the first D receivers
+    count). sliced_lanes(hkey=) then puts a core's exported cells behind its interior ones inside each face-count
+    class, grouped by receiver, so a halo send list is a few long runs instead of one run per two lanes."""
+    owner = np.asarray(owner, np.int64)
+    fo, fn = np.asarray(fo, np.int64), np.asarray(fn, np.int64)
+    a, b = owner[fo], owner[fn]
+    x = a != b
+    key = np.zeros(len(owner), np.int64)
+    if not x.any():
+        return key
+    B = int(owner.max()) + 2
+    D = max(1, min(7, int(62 // np.log2(B))))
+    pr = np.unique(np.r_[fo[x], fn[x]] * B + np.r_[b[x], a[x]])     # (cell, receiver), by cell then receiver
+    c, r = pr // B, pr % B
+    first = np.r_[True, c[1:] != c[:-1]]
+    j = np.arange(len(c)) - np.maximum.accumulate(np.where(first, np.arange(len(c)), 0))   # the receiver's rank in its cell's set
+    k = j < D
+    np.add.at(key, c[k], (r[k] + 1) * B ** (D - 1 - j[k]))
+    return key
+
+
+def halo_runs(send):
+    """(words, runs, words in runs of 16 or more) of a halo plan's send lists {(sender, receiver): lanes}."""
+    w = n = big = 0
+    for lanes in send.values():
+        q = np.asarray(lanes, np.int64)
+        if not len(q):
+            continue
+        h = np.flatnonzero(np.r_[True, np.diff(q) != 1])
+        L = np.diff(np.r_[h, len(q)])
+        w, n, big = w + len(q), n + len(L), big + int(L[L >= 16].sum())
+    return w, n, big
+
+
+def sliced_lanes(owner, counts, P, Q=0, hkey=None):
     """Lanes of a partition with every core's cells sorted by face count, widest first (then by index): ELL slot k's
     real entries are then lanes [0, n_k) of each core, n_k = the core's cells with more than k faces. Q > 0 (layout
     rcbq<Q>): each run of equal face count is quarter-interleaved within itself (_quarter), so index neighbours are a
-    4-lane shift and the [0, n_k) sets do not change."""
+    4-lane shift and the [0, n_k) sets do not change. hkey (export_key): inside a face-count class the cells sort by
+    hkey before their index, which keeps the [0, n_k) sets."""
     lane = np.zeros(len(owner), np.int64)
-    order = np.lexsort((np.arange(len(owner)), -counts, owner))
+    order = np.lexsort((np.arange(len(owner)), -counts, owner) if hkey is None else (np.arange(len(owner)), hkey, -counts, owner))
     cnt = np.bincount(owner, minlength=P)
     pos = np.arange(len(owner)) - np.repeat(np.cumsum(cnt) - cnt, cnt)
     if Q:
@@ -972,7 +1056,7 @@ def slot_extents(code, space, cells, slotfold, L, T):
 class Machine:
     def __init__(self, prog, mesh, P, nslot=NSLOT, log=print, layout="rcb", tiles=None, l1_vec=None, fuse=False, scratch_cap=32,
                  span_homes=False, hoist=False, cap_min=False, sched=False, amg_vec=False, ptiles=False, bcast_run=False, joint_red=False, fold1=False,
-                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0, lsplit=False):
+                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0, lsplit=False, hpack=False, gsmin=0.0):
         # two-stage reductions: fold the chip's partials, then the K chip sums; no joint reductions then. Needed when
         # K * P partials do not fit one fold tile, and the default from 8 chips (r13 2x4: 520.3 vs 546.9 ms/it)
         self.red2 = bool(chip_cores) and ((P > LANES or P >= 8 * chip_cores) if red2 is None else red2)
@@ -989,6 +1073,7 @@ class Machine:
         self.hlate = hlate     # a halo goes out right before its first gather, not after its source's last write
         self.hre = hre         # >0: a halo last read more than hre MIR back is sent again, not held in its slot
         self.pseg = pseg
+        self.gsmin = float(gsmin)   # _split_gathers: least share of a map's values its shift must cover to split it
         self.narrow_on, self.narrow, self.narrow_slot, self.pre_h, self.narrow_home = narrow, set(), {}, {}, set()   # narrow: bf16 DRAM pages for eligible constants (_narrow)
         self.coff, self.cpages, self.hpages, self.dslots = {}, 0, 0, []
         self.F = prog.dtype.type
@@ -1002,6 +1087,7 @@ class Machine:
             log(f"cse: {n0} -> {len(code)} instructions" + (" (index arrays by content)" if int(cse_ir) >= 2 else ""))
         code = dce(code)
         self.sliced, self.ext = sliced, {}
+        self.stiles = {}     # scratch register -> tile count of the vector it stands for (_scratch, tiles)
         if sliced:
             code, D = self._sliced(code, prog, mesh, P, tiles, chip_cores if chip_line else None, log)
         n0 = sum(1 for i in code if i[0] == "copy")
@@ -1046,7 +1132,9 @@ class Machine:
         else:
             own = self._own if sliced else rcb(mesh.C, P, chips=P // chip_cores if chip_cores and chip_line else None, faces=mesh_faces(mesh))
             Q = int(layout[4:]) if layout.startswith("rcbq") else 0
-            self.lay = Layout(prog, own, P, sliced_lanes(own, face_counts(mesh), P, Q) if sliced else None, amg_vec=amg_vec, ptiles=ptiles)
+            assert not hpack or (sliced and not Q), "--hpack sorts the --sliced rcb lanes"
+            hkey = export_key(own, *mesh_faces(mesh)) if hpack else None   # exported cells last in their face-count class, by receiver set
+            self.lay = Layout(prog, own, P, sliced_lanes(own, face_counts(mesh), P, Q, hkey) if sliced else None, amg_vec=amg_vec, ptiles=ptiles)
         self.T = max(self.lay.T, tiles or 1)   # tiles: force more tiles per vector than needed (testing)
         self.Ts = {n: (self.T if t == self.lay.T else t) for n, t in self.lay.Ts.items()}   # T: the slot stride
         assert not sliced or layout == "rcb" or layout.startswith("rcbq"), "--sliced sorts rcb lanes"
@@ -1071,6 +1159,8 @@ class Machine:
             self._mad()
         self._fetches()
         self.maps.finish(hrun)
+        hw = halo_runs(self.maps.plans[0]["send"])
+        log("halo send lists (cells plan): %d words in %d runs, %.1f %% of the words in runs of 16 or more%s" % (hw[0], hw[1], 100.0 * hw[2] / max(hw[0], 1), " (--hpack)" if hpack else ""))
         assert not (hsplit and len(self.maps.plans) > 1), "hsplit reads plan 0 only (vm_ncrisc N_HALO)"
         self._split_gathers()
         self._halos()
@@ -1156,6 +1246,11 @@ class Machine:
         regs += [r for x in blks for _, r in x[2]]
         regs += [u[2] for x in blks for u in x[1] if u[0] == "ldr" and u[2] is not None and not stk(x, u)]  # patch sources
         ts = {self.size(r) for r in regs if r != "__anchor__" and self.is_vec(r)}
+        # a vector the run keeps in a one-tile scratch register still counts with its own extent: a short ELL slot
+        # whose gather destination went to scratch (a reader-built page under pseg) would otherwise loop over the
+        # tiles of its source and coefficient, T instead of L_k, building and multiplying pages of zeros
+        st = getattr(self, "stiles", {})
+        ts |= {st[r] for r in regs if r in st}
         ts |= {self.Ts[b.name] if b.name in self.lay.wide else 1
                for b in (self.space[u[2]].stack[0] for x in blks for u in x[1] if stk(x, u))}
         if self.sliced and ts:      # a block runs over its narrowest vector; wider ones are read at their first tiles
@@ -1550,22 +1645,47 @@ class Machine:
     def _split_gathers(self, min_per_core=24):
         cells = self.prog.cells.name
         self.base = {}
-        for mid, t in enumerate(self.maps.tab):
+        thresh = min_per_core * self.P
+
+        def _one(mid):
+            t = self.maps.tab[mid]
             dsp, parts = self.maps.maps[mid]
-            best, cover, ncov = None, None, len(t["zc"])
-            for k, (ssp, _, _) in enumerate(parts):
-                if ssp.name != cells or dsp.name != cells:
-                    continue
-                sel = (t["part"] == k) & (t["kind"] == 0)
-                d = t["idx"] - t["lane"]
-                vals, cnt = np.unique(d[sel & (d % 4 == 0)], return_counts=True)
-                if len(cnt) and cnt.max() > ncov:
-                    best, cover = (k, int(vals[np.argmax(cnt)])), sel & (d == vals[np.argmax(cnt)])
-                    ncov = int(cover.sum())
-            if ncov < min_per_core * self.P:
-                continue
-            self.base[mid] = best             # None: zero fill
-            self.maps.tab[mid] = Maps.drop(t, cover)
+            best, ncov = None, len(t["zc"])
+            if dsp.name == cells:
+                loc = t["kind"] == 0
+                for k, (ssp, _, _) in enumerate(parts):
+                    if ssp.name != cells:
+                        continue
+                    sel = loc & (t["part"] == k) if len(parts) > 1 else loc
+                    if not sel.any():
+                        continue
+                    d = t["idx"][sel] - t["lane"][sel]
+                    vals, cnt = np.unique(d[(d & 3) == 0], return_counts=True)
+                    if len(cnt):
+                        j = int(np.argmax(cnt))
+                        if int(cnt[j]) > ncov:
+                            best, ncov = (k, int(vals[j])), int(cnt[j])
+            if ncov < thresh:
+                return mid, None, None
+            # gsmin: the 24 values a core date from a 32-cycle scalar copy. With dense tables and three gather threads
+            # a patched value is ~9 cycles of wall, and the split costs a block over every tile of the destination
+            # plus a C -> N handshake: a shift (or zero fill) that covers under this share of the map's values is
+            # left to the gather, which then writes every lane itself. Same values in the same lanes
+            if self.gsmin and ncov < self.gsmin * (len(t["core"]) + len(t["zc"])):
+                return mid, None, None
+            cover = None if best is None else ((t["kind"] == 0) & (t["part"] == best[0]) & ((t["idx"] - t["lane"]) == best[1]))
+            return mid, best, Maps.drop(t, cover)
+
+        nm = len(self.maps.tab)
+        if nm > 1:
+            with ThreadPoolExecutor(min(8, nm)) as ex:
+                res = list(ex.map(_one, range(nm)))
+        else:
+            res = [_one(mid) for mid in range(nm)]
+        for mid, best, new_t in res:
+            if new_t is not None:
+                self.base[mid] = best             # None: zero fill
+                self.maps.tab[mid] = new_t
         out = []
         for ins in self.mir:
             if ins[0] == "gather" and ins[2] in self.base:
@@ -1843,9 +1963,11 @@ class Machine:
                         sts.append((slot, r))
                     elif r not in after:
                         ren[r] = self._tmp(SCRATCH)
+                        self.stiles[ren[r]] = self.size(r)
                         sts.append((slot, ren[r]))
                     elif r in later:
                         ren[r] = self._tmp(SCRATCH)
+                        self.stiles[ren[r]] = self.size(r)
                         sts += [(slot, r), (slot, ren[r])]
                     else:
                         sts.append((slot, r))

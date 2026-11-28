@@ -24,6 +24,12 @@
 //   22-24 N ops/gathers/values, 30 B abort reason, 31 B abort pc, 32 N abort reason, 33 N abort pc, 34 ABORT seen,
 //   40-43 at a write barrier timeout: acks expected, acks received, writes issued, writes sent (NoC registers)
 #include "api/dataflow/dataflow_api.h"
+#if defined(CFD_BPATCH) || defined(CFD_BGTS) || defined(CFD_DB) || defined(CFD_PB)
+#define CFD_BMBOX 1
+#endif
+#if defined(CFD_DENSE) && defined(CFD_BMBOX)
+#include "vm_gather.h"
+#endif
 
 // gather entries dest << XS | src, halo send words runlen << HS | src (ttres/encode.py; CFD_WIDE: T > 64 tiles a core)
 #ifdef CFD_WIDE
@@ -103,6 +109,38 @@ static inline uint32_t hsplit_at(const uint32_t* t) {
     }
 #endif
 
+#if defined(CFD_BMBOX)
+// Out-of-line B-patch/gather worker at -O3 so WAIT_UNTIL call sites only emit a 2-instruction sequence check
+// (keeps brisc.elf small and avoids -Os register serialization on the gather loop).
+static __attribute__((noinline, optimize("O3"))) void cfd_bsvc_run(volatile tt_l1_ptr uint32_t* mb, uint32_t q) {
+    for (uint32_t j = 0, nj = mb[8]; j < nj; ++j) {
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(mb[12 + 4 * j]);
+        const uint32_t* xs = reinterpret_cast<const uint32_t*>(mb[12 + 4 * j + 1]);
+        const uint32_t n = mb[12 + 4 * j + 2];
+        uint32_t* out = reinterpret_cast<uint32_t*>(mb[12 + 4 * j + 3]);
+#ifdef CFD_DENSE
+        if (n >> 31) {   // lanes of a dense tile (vm_ncrisc.cpp): out[e] = src[ix[e]]
+            cfd_gather16(src, reinterpret_cast<const uint16_t*>(xs), n & 0x7fffffffu, out);
+            continue;
+        }
+#endif
+        uint32_t e = 0;
+        for (; e + 4 <= n; e += 4) {
+            const uint32_t x0 = xs[e], x1 = xs[e + 1], x2 = xs[e + 2], x3 = xs[e + 3];
+            const uint32_t v0 = src[x0 & XI], v1 = src[x1 & XI], v2 = src[x2 & XI], v3 = src[x3 & XI];
+            out[x0 >> XS] = v0;
+            out[x1 >> XS] = v1;
+            out[x2 >> XS] = v2;
+            out[x3 >> XS] = v3;
+        }
+        for (; e < n; ++e) out[xs[e] >> XS] = src[xs[e] & XI];
+    }
+    asm volatile("" ::: "memory");
+    invalidate_l1_cache();
+    mb[4] = q;
+}
+#endif
+
 void kernel_main() {
 #ifdef CFD_TRACE
     const uint32_t tre_ = get_timestamp_32b();   // kernel entry: compute starts after it, a stale start from the last run before it
@@ -151,7 +189,7 @@ void kernel_main() {
     constexpr uint32_t SYNCB = CFD_SYNCB;         // cb_sync bytes
 #else
     constexpr uint32_t K = 1;
-#if defined(CFD_BPATCH) || defined(CFD_BGTS)
+#if defined(CFD_BMBOX)
     constexpr uint32_t SYNCB = 8192;              // + the B-patch mailbox in the last 256 B
 #else
     constexpr uint32_t SYNCB = 4096;
@@ -263,7 +301,10 @@ void kernel_main() {
             }
         }
     };
-#if defined(CFD_BPATCH) || defined(CFD_BGTS)
+#ifdef CFD_DMP
+    static_assert(E0 + 1616 <= SYNCB - 576, "D-gather mailbox past every sync word");
+#endif
+#if defined(CFD_BMBOX)
     // B-patch mailbox (the last 256 B of cb_sync, past every sync word): NCRISC posts the upper parts of a patched page's L1-source residue sections
     // (src, entries, n, page) and bumps SEQ; BRISC scatters them from inside its waits and answers DONE = SEQ
     constexpr uint32_t MB = SYNCB / 4 - 64;
@@ -272,42 +313,10 @@ void kernel_main() {
     uint32_t bseen = 0;
     auto bsvc = [&]() {
         const uint32_t q = S[M_SEQ];
-        if (q == bseen) return;
-        for (uint32_t j = 0, nj = S[M_N]; j < nj; ++j) {
-            const uint32_t* src = reinterpret_cast<const uint32_t*>(S[M_JOB + 4 * j]);
-            const uint32_t* xs = reinterpret_cast<const uint32_t*>(S[M_JOB + 4 * j + 1]);
-            const uint32_t n = S[M_JOB + 4 * j + 2];
-            uint32_t* out = reinterpret_cast<uint32_t*>(S[M_JOB + 4 * j + 3]);
-            uint32_t e = 0;
-#ifdef CFD_DENSE
-            if (n >> 31) {   // lanes of a dense tile (vm_ncrisc.cpp gather16): out[e] = src[ix[e]]
-                const uint16_t* ix = reinterpret_cast<const uint16_t*>(xs);
-                const uint32_t nd = n & 0x7fffffffu;
-                for (; e + 8 <= nd; e += 8) {
-                    const uint32_t i0 = ix[e], i1 = ix[e + 1], i2 = ix[e + 2], i3 = ix[e + 3];
-                    const uint32_t i4 = ix[e + 4], i5 = ix[e + 5], i6 = ix[e + 6], i7 = ix[e + 7];
-                    const uint32_t v0 = src[i0], v1 = src[i1], v2 = src[i2], v3 = src[i3];
-                    const uint32_t v4 = src[i4], v5 = src[i5], v6 = src[i6], v7 = src[i7];
-                    out[e] = v0, out[e + 1] = v1, out[e + 2] = v2, out[e + 3] = v3;
-                    out[e + 4] = v4, out[e + 5] = v5, out[e + 6] = v6, out[e + 7] = v7;
-                }
-                for (; e < nd; ++e) out[e] = src[ix[e]];
-                continue;
-            }
-#endif
-            for (; e + 4 <= n; e += 4) {
-                const uint32_t x0 = xs[e], x1 = xs[e + 1], x2 = xs[e + 2], x3 = xs[e + 3];
-                const uint32_t v0 = src[x0 & XI], v1 = src[x1 & XI], v2 = src[x2 & XI], v3 = src[x3 & XI];
-                out[x0 >> XS] = v0;
-                out[x1 >> XS] = v1;
-                out[x2 >> XS] = v2;
-                out[x3 >> XS] = v3;
-            }
-            for (; e < n; ++e) out[xs[e] >> XS] = src[xs[e] & XI];
+        if (q != bseen) {
+            cfd_bsvc_run(S + MB, q);
+            bseen = q;
         }
-        asm volatile("" ::: "memory");
-        S[M_DONE] = q;
-        bseen = q;
     };
 #define BSVC() bsvc()
 #else
@@ -334,6 +343,7 @@ void kernel_main() {
     auto wbar = [&](uint32_t why) {
         const uint32_t s_ = get_timestamp_32b();
         while (!ncrisc_noc_nonposted_writes_flushed(noc_index)) {
+            invalidate_l1_cache();
             BSVC();
             if (get_timestamp_32b() - s_ > limit) {
                 hdr[40] = noc_nonposted_writes_acked[noc_index];
@@ -349,6 +359,7 @@ void kernel_main() {
     auto rbar = [&](uint32_t why) {
         const uint32_t s_ = get_timestamp_32b();
         while (!ncrisc_noc_reads_flushed(noc_index)) {
+            invalidate_l1_cache();
             BSVC();
             if (get_timestamp_32b() - s_ > limit) { fail(why); return false; }
         }
@@ -964,7 +975,16 @@ void kernel_main() {
                                         (dd >> 27) & 1 ? 2048 : 4096);
                         rp += 4096;
                     }
+#ifdef CFD_BMBOX
+                    while (!(noc_mode == DM_DYNAMIC_NOC ? ncrisc_dynamic_noc_nonposted_writes_sent(noc_index)
+                                                        : ncrisc_noc_nonposted_writes_sent(noc_index))) {
+                        invalidate_l1_cache();
+                        BSVC();
+                    }
+                    invalidate_l1_cache();
+#else
                     noc_async_writes_flushed();
+#endif
                     cb_pop_front(cb_out, k);
                     nsink += k;
                 }

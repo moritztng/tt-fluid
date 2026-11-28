@@ -17,6 +17,8 @@ descriptor word kind << 28 | value: 0 an L1 tile, 1 a DRAM home at tile offset v
 tile count, so a coarse multigrid level takes its own pages, not a fine vector's T. A page is written at the 32-B phase of its DRAM source (a DRAM
 read must keep the address mod 32), so C_LDR skips `page_phase` 16-B units.
 """
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 
 from .machine import LANES, DBASE, KBASE, NH, widen_bf16
@@ -161,7 +163,7 @@ def hrun_words(lane, idx, rmin=8):
 
 class Encoded:
     def __init__(self, m, page=False, pdev=None, tab_stream=False, look=False, cores=None, tab_sort=False, phase=None,
-                 gtile=False, tab_dense=0, tab_break=0):
+                 gtile=False, tab_dense=0, tab_break=0, arena=True):
         """page: the compute stream is paged from DRAM through a ring NCRISC fills (vm_ncrisc N_CODE): every basic
         block starts on a PW-word page, the padding is C_JMP (in paged mode JMP and BRT end a block and compute moves
         on to the next delivered page), and NCRISC pushes the pages of a MIR instruction before any of its own ops
@@ -552,17 +554,15 @@ class Encoded:
             self.tab_halo = np.array(S["halo_off"], np.uint32)
         else:
             self.tab_stream = None
-        self._arena()
+        if arena:
+            self._arena()
 
     # ---- per-core tables (uint32 words), same layout on every core, padded to one length
     def _tables(self):
         m = self.m
         maps, cores = m.maps, self.cores
         P = len(cores)
-        tabs = [[] for _ in range(P)]
         nm = len(maps.tab)
-        for i in range(P):
-            tabs[i] += [nm] + [0] * nm
         # hrun: halo entries of maps no stream patches carry runs (lane and position consecutive, agreeing mod 4) as a
         # head word with bit 15 set and the run's length after it (vm_ncrisc hscatter moves each with one NoC copy)
         blks = lambda x: x[1] if x[0] == "seg" else [x] if x[0] == "blk" else []
@@ -572,35 +572,64 @@ class Encoded:
         if hrun:
             assert maps.hmax < 0x8000 and not WIDE
         XS = 22 if WIDE else 16   # full-lane words; tabstream keeps their low 32 bits (WIDE: the lane within its tile)
-        for mid, t in enumerate(maps.tab):
-            # each core's entries, in entry order (a stable sort by core)
+        dt = np.int64 if WIDE else np.uint32
+
+        def _build_map(mid):
+            t = maps.tab[mid]
             order = np.argsort(t["core"], kind="stable")
-            lo = np.searchsorted(t["core"][order], cores, "left")
-            hi = np.searchsorted(t["core"][order], cores, "right")
+            co_s = t["core"][order]
+            lo = np.searchsorted(co_s, cores, "left")
+            hi = np.searchsorted(co_s, cores, "right")
             zo = np.argsort(t["zc"], kind="stable")
-            zlo, zhi = np.searchsorted(t["zc"][zo], cores, "left"), np.searchsorted(t["zc"][zo], cores, "right")
+            zc_s = t["zc"][zo]
+            zlo, zhi = np.searchsorted(zc_s, cores, "left"), np.searchsorted(zc_s, cores, "right")
+            use_hrun = hrun and mid not in smaps
+            nparts = t["nparts"]
+            out = [None] * P
+            hs0 = hs1 = 0
             for r in range(P):
-                tw = tabs[r]
-                tw[1 + mid] = len(tw)
                 on = order[lo[r]:hi[r]]
                 part, kind = t["part"][on], t["kind"][on]
                 lane, idx = t["lane"][on].astype(np.int64), t["idx"][on].astype(np.int64)
-                for k in range(t["nparts"]):
+                chunks = []
+                for k in range(nparts):
                     sel = part == k
                     loc = sel & (kind == 0)
                     hal = sel & (kind == 1)
-                    o = np.argsort(lane[loc], kind="stable")
-                    lw = (lane[loc][o] << XS | idx[loc][o]).tolist()
-                    o = np.argsort(lane[hal], kind="stable")
-                    hl, hx = lane[hal][o], idx[hal][o]
-                    hw = (hl << XS | hx).tolist()
-                    if hrun and mid not in smaps:
-                        hw = hrun_words(hl, hx)
-                        self.hrun_stat[0] += len(hl)
-                        self.hrun_stat[1] += len(hl) - len(hw)
-                    tw += [len(lw), len(hw)] + lw + hw     # by destination lane: the reader walks them tile by tile
-                z = np.sort(t["zl"][zo[zlo[r]:zhi[r]]].astype(np.int64))
-                tw += [len(z)] + z.tolist()
+                    ll = lane[loc]
+                    o = np.argsort(ll, kind="stable")
+                    lw = ((ll[o] << XS) | idx[loc][o]).astype(dt)
+                    hl = lane[hal]
+                    o = np.argsort(hl, kind="stable")
+                    hl, hx = hl[o], idx[hal][o]
+                    if use_hrun:
+                        hw_l = hrun_words(hl, hx)
+                        hs0 += len(hl)
+                        hs1 += len(hl) - len(hw_l)
+                        hw = np.asarray(hw_l, dt)
+                    else:
+                        hw = ((hl << XS) | hx).astype(dt)
+                    chunks.append(np.array([len(lw), len(hw)], dt))
+                    if len(lw):
+                        chunks.append(lw)
+                    if len(hw):
+                        chunks.append(hw)
+                z = np.sort(t["zl"][zo[zlo[r]:zhi[r]]].astype(dt))
+                chunks.append(np.array([len(z)], dt))
+                if len(z):
+                    chunks.append(z)
+                out[r] = np.concatenate(chunks)
+            return out, hs0, hs1
+
+        if nm > 1:
+            with ThreadPoolExecutor(min(8, nm)) as ex:
+                map_res = list(ex.map(_build_map, range(nm)))
+        else:
+            map_res = [_build_map(mid) for mid in range(nm)]
+        for _, hs0, hs1 in map_res:
+            self.hrun_stat[0] += hs0
+            self.hrun_stat[1] += hs1
+
         # halo: senders' lists to their receivers, receivers' senders (for credits), per plan. Plan 0 (the cells)
         # sits at tab_halo as in a one-space program; with more plans a directory sits just BELOW tab_halo, read
         # downwards: word tab_halo - 1 - s is halo slot s's plan | its receive buffer's word offset << 8 (slots sized
@@ -608,38 +637,56 @@ class Encoded:
         # bit 31 set when the directory exists (tab_halo keeps its full range). One plan: slot s at s * hmax.
         nq = len(maps.plans)
         self.halo_off, self.halo_dir = [], [0] * P
+        core_parts = []
+        self.tab_len = []
         for r, i in enumerate(cores.tolist()):
-            tw = tabs[r]
+            hdr = np.zeros(1 + nm, dt)
+            hdr[0] = nm
+            pos = 1 + nm
+            parts_r = [hdr]
+            for mid in range(nm):
+                hdr[1 + mid] = pos
+                arr = map_res[mid][0][r]
+                parts_r.append(arr)
+                pos += len(arr)
+            hw = []
             if nq > 1:
-                tw += [0] * (NH - 1 + nq)
+                hw += [0] * (NH - 1 + nq)
                 self.halo_dir[r] = 1
-            h = len(tw)
-            self.halo_off.append(h)
+            h_loc = len(hw)
+            self.halo_off.append(pos + h_loc)
             for q, pl in enumerate(maps.plans):
                 if q:
-                    tw[h - NH - q] = len(tw) - h
+                    hw[h_loc - NH - q] = len(hw) - h_loc
                 recv = sorted(pl["receivers"].get(i, []))
-                tw.append(len(recv))
+                hw.append(len(recv))
                 for x in recv:
                     lanes = pl["send"][(i, x)]
-                    tw += [x, pl["recv_off"][(i, x)], len(lanes)] + runs(np.asarray(lanes))
+                    hw += [x, pl["recv_off"][(i, x)], len(lanes)] + runs(np.asarray(lanes))
                 snd = sorted(pl["senders"].get(i, []))
-                tw.append(len(snd))
-                tw += snd
+                hw.append(len(snd))
+                hw += snd
             if nq > 1:
                 assert nq < 256 and m.hwords < 1 << 24
                 for s in range(NH):
-                    tw[h - 1 - s] = m.halo_plan.get(s, 0) | (m.hoff[s] if s < m.nhalo else 0) << 8
+                    hw[h_loc - 1 - s] = m.halo_plan.get(s, 0) | (m.hoff[s] if s < m.nhalo else 0) << 8
+            hw_arr = np.asarray(hw, dt)
+            parts_r.append(hw_arr)
+            core_parts.append(parts_r)
+            self.tab_len.append(pos + len(hw_arr))
         for mt in maps.tab:
             if WIDE:
                 assert len(mt["idx"]) == 0 or mt["idx"].max() < 1 << 22
             else:
                 assert len(mt["lane"]) == 0 or max(mt["lane"].max(), mt["idx"].max()) < 1 << 16   # zl is uint16
-        self.tab_len = [len(t) for t in tabs]     # each core's own length (tabstream keeps no padding)
-        L = max(len(t) for t in tabs)
-        self.tab = np.zeros((P, L), np.int64 if WIDE else np.uint32)   # WIDE: full lanes until tabstream cuts them
-        for i, t in enumerate(tabs):
-            self.tab[i, :len(t)] = t
+        L = max(self.tab_len)
+        self.tab = np.zeros((P, L), dt)   # WIDE: full lanes until tabstream cuts them
+        for r, parts_r in enumerate(core_parts):
+            off = 0
+            for arr in parts_r:
+                ln = len(arr)
+                self.tab[r, off:off + ln] = arr
+                off += ln
         self.tab_halo = np.array(self.halo_off, np.uint32)
 
     def _halo_word(self):
@@ -659,33 +706,82 @@ class Encoded:
         out[own[sel] - cores[0], lane[sel]] = values[sel]
         return out.reshape(len(cores), n, LANES)
 
-    def _arena(self):
+    def chip_arena(self, rows=None, evict=None):
+        """Build (arena, home, consts) for self.cores[rows] (default all of self.cores) without faulting zero pages.
+        `evict`, when given, is called every 64 constants read from m.pre so mmap'd cache buffers stay out of RSS."""
         m = self.m
-        P = len(self.cores)
-        assert P == m.P or np.array_equal(self.cores, np.arange(self.cores[0], self.cores[0] + P))
-        A = np.zeros((P, m.ntiles, LANES), np.float32)
-        Hm = np.zeros((P, max(m.hpages, 1), LANES), np.float32)   # DRAM homes: page core * hpages + offset + t
+        sub = self.cores if rows is None else self.cores[rows]
+        nP = len(sub)
+        c0 = int(sub[0]) if nP else 0
+        assert nP == m.P or np.array_equal(sub, np.arange(c0, c0 + nP))
+        A = np.zeros((nP, m.ntiles, LANES), np.float32)
+        Hm = np.zeros((nP, max(m.hpages, 1), LANES), np.float32)   # DRAM homes: page core * hpages + offset + t
+        C = np.zeros((nP, max(m.cpages, 1), LANES), np.float32)
+        sp_idx = {}
+
+        def _sp(sp):
+            key = sp.name
+            if key not in sp_idx:
+                own, lane = m.lay.owner[key], m.lay.lane[key]
+                if nP == m.P:
+                    sp_idx[key] = (None, own, lane, int(lane.max()) if lane.size else -1)
+                else:
+                    idx = np.flatnonzero((own >= c0) & (own < c0 + nP))
+                    ln = lane[idx]
+                    sp_idx[key] = (idx, own[idx] - c0, ln, int(ln.max()) if ln.size else -1)
+            return sp_idx[key]
+
+        def _write_into(dst, sp, values, n):
+            idx, oc, ln, lmax = _sp(sp)
+            v = np.asarray(values, np.float32)
+            if idx is not None:
+                v = v[idx]
+            if lmax >= n * LANES:   # --sliced: first n tiles only
+                keep = ln < n * LANES
+                oc, ln, v = oc[keep], ln[keep], v[keep]
+            # check uint32 bit pattern (not v != 0) so -0.0 is preserved bit-for-bit while +0.0 pages stay untouched
+            nz = np.flatnonzero(v.view(np.uint32))
+            if len(nz):
+                ln_nz = ln[nz]
+                dst[oc[nz], ln_nz // LANES, ln_nz % LANES] = v[nz]
+
+        ev_n = 0
+
+        def _tick():
+            nonlocal ev_n
+            if evict is not None:
+                ev_n += 1
+                if ev_n % 64 == 0:
+                    evict()
+
         for r, v in m.pre.items():
             t = m.phys.get(r)
-            if t is None or t >= KBASE:
+            if t is None or t >= KBASE or v is None:
                 continue
             n = m.size(r)
             X, t = (Hm, t - DBASE) if t >= DBASE else (A, t)
-            if v is None:
-                X[:, t:t + n] = 0
-            else:
-                X[:, t:t + n] = self._scatter(m.space[r], np.asarray(v, np.float32), n)
-        self.arena, self.home = A, Hm
-        # DRAM constants: page core * cpages + coff + tile, each constant its own tile count
-        C = np.zeros((P, max(m.cpages, 1), LANES), np.float32)
+            _write_into(X[:, t:t + n], m.space[r], v, n)
+            _tick()
         for r, o in m.coff.items():
             n = m.size(r)
-            C[:, o:o + n] = self._scatter(m.space[r], np.asarray(m.pre[r], np.float32), n)
+            _write_into(C[:, o:o + n], m.space[r], m.pre[r], n)
+            _tick()
         for r, o in m.narrow_slot.items():   # bf16 shadow: lane 2k in the low half of word k, words 512.. unused
             n = m.size(r)
-            h = self._scatter(m.space[r], widen_bf16(m.pre_h[r]), n).view(np.uint32) >> 16
-            C[:, o:o + n].view(np.uint32)[..., :LANES // 2] = np.ascontiguousarray(h.astype(np.uint16)).view(np.uint32)
-        self.consts = C
+            tmp = np.zeros((nP, n, LANES), np.float32)
+            _write_into(tmp, m.space[r], widen_bf16(m.pre_h[r]), n)
+            packed = np.ascontiguousarray((tmp.view(np.uint32) >> 16).astype(np.uint16)).view(np.uint32)
+            dst_u = C[:, o:o + n].view(np.uint32)[..., :LANES // 2]
+            nz = packed != 0
+            if nz.any():
+                dst_u[nz] = packed[nz]
+            _tick()
+        if evict is not None:
+            evict()
+        return A, Hm, C
+
+    def _arena(self):
+        self.arena, self.home, self.consts = self.chip_arena()
 
     def state_from_arena(self, arena, home=None):
         """arena (P, ntiles, LANES) and DRAM homes (P, hpages, LANES) -> state name -> global arrays."""

@@ -14,6 +14,15 @@
 // kind << 28 | value, kind 0 L1 tile, 1 DRAM home slot, 2 DRAM constant, 3 none. Single DRAM words are read
 // 16 at a time into 32-B scratch slots at their phase.
 #include "api/dataflow/dataflow_api.h"
+#if defined(CFD_BPATCH) || defined(CFD_BGTS) || defined(CFD_DB) || defined(CFD_PB)
+#define CFD_BMBOX 1
+#endif
+#if defined(CFD_TGTS) || defined(CFD_DU) || defined(CFD_PU)
+#define CFD_TMBOX 1
+#endif
+#ifdef CFD_DENSE
+#include "vm_gather.h"
+#endif
 
 // gather entries dest << XS | src (ttres/encode.py): 16-bit lanes, or CFD_WIDE (T > 64 tiles a core) 22-bit sources
 // and the destination lane within its tile (tabstream only: the stream walks one destination tile at a time, WT)
@@ -32,6 +41,9 @@ constexpr uint32_t SS = 14, SM = 0x3ff;
 constexpr uint32_t SS = 16, SM = 0xfff;
 #endif
 
+#if defined(CFD_TPAT) && (!defined(CFD_TGTS) || !defined(CFD_BPATCH) || !defined(CFD_TABSTREAM))
+#error "CFD_TPAT: the T mailbox of CFD_TGTS and the page shares of CFD_BPATCH, streamed tables"
+#endif
 #if defined(CFD_DENSE) && (!defined(CFD_TABSTREAM) || defined(CFD_WIDE) || defined(CFD_DEFER) || defined(CFD_TRID))
 #error "CFD_DENSE: streamed 16-bit tables, the plain ring (no CFD_DEFER, no CFD_TRID)"
 #endif
@@ -106,7 +118,7 @@ void kernel_main() {
     constexpr uint32_t CR = get_compile_time_arg_val(17);
     constexpr uint32_t cb_ccode = get_compile_time_arg_val(18);
     constexpr uint32_t W_CREL = 1012;
-#if defined(CFD_BPATCH) || defined(CFD_BGTS)
+#ifdef CFD_BMBOX
     // B-patch mailbox: the last 256 B of cb_sync (vm_brisc.cpp bsvc; a single chip's cb_sync is 8 KB under CFD_BPATCH)
 #ifdef CFD_SYNCB
     constexpr uint32_t MB = CFD_SYNCB / 4 - 64;
@@ -116,12 +128,25 @@ void kernel_main() {
     enum : uint32_t { M_SEQ = MB, M_DONE = MB + 4, M_N = MB + 8, M_JOB = MB + 12 };
     uint32_t bseq = 0;
 #endif
-#ifdef CFD_TGTS
+#ifdef CFD_TMBOX
     // T-gather mailbox: the 256 B of cb_sync before the B one, same layout; compute's UNPACK copies its jobs from
     // inside its own waits (vm_compute.cpp tsvc) and answers DONE = SEQ
     constexpr uint32_t TMB = CFD_SYNCB / 4 - 128;
     enum : uint32_t { T_SEQ = TMB, T_DONE = TMB + 4, T_N = TMB + 8, T_JOB = TMB + 12 };
     uint32_t tseq = 0;
+#endif
+#ifdef CFD_DMP
+    // D-gather mailbox: 64 B before TMB for MATH (trisc1) and PACK (trisc2) on dense tiles
+    constexpr uint32_t DMB = CFD_SYNCB / 4 - 144;
+    enum : uint32_t { D_SRC = DMB, D_IX = DMB + 1, D_OUT = DMB + 2,
+                      D_MSEQ = DMB + 4, D_MOFF = DMB + 5, D_MDONE = DMB + 6,
+                      D_PSEQ = DMB + 8, D_POFF = DMB + 9, D_PDONE = DMB + 10 };
+#ifdef CFD_DMP_M
+    uint32_t mseq = 0;
+#endif
+#ifdef CFD_DMP_P
+    uint32_t pseq = 0;
+#endif
 #endif
     constexpr auto a_const = TensorAccessorArgs<19>();
     constexpr auto a_home = TensorAccessorArgs<a_const.next_compile_time_args_offset()>();
@@ -350,23 +375,6 @@ void kernel_main() {
         }
         asm volatile("" ::: "memory");   // the page is pushed (or the tile used) after this
     };
-#ifdef CFD_DENSE
-    // a dense tile (tabstream.py dense): lane e of the page from source word ix[e], destination order, eight loads
-    // before eight stores (6.4 cycles a lane on BH against 12.1 for a residue entry: tools/gbench.py)
-    auto gather16 = [](const uint32_t* src, const uint16_t* ix, uint32_t n, uint32_t* out) {
-        uint32_t e = 0;
-        for (; e + 8 <= n; e += 8) {
-            const uint32_t i0 = ix[e], i1 = ix[e + 1], i2 = ix[e + 2], i3 = ix[e + 3];
-            const uint32_t i4 = ix[e + 4], i5 = ix[e + 5], i6 = ix[e + 6], i7 = ix[e + 7];
-            const uint32_t v0 = src[i0], v1 = src[i1], v2 = src[i2], v3 = src[i3];
-            const uint32_t v4 = src[i4], v5 = src[i5], v6 = src[i6], v7 = src[i7];
-            out[e] = v0, out[e + 1] = v1, out[e + 2] = v2, out[e + 3] = v3;
-            out[e + 4] = v4, out[e + 5] = v5, out[e + 6] = v6, out[e + 7] = v7;
-        }
-        for (; e < n; ++e) out[e] = src[ix[e]];
-        asm volatile("" ::: "memory");
-    };
-#endif
 #ifdef CFD_HRUN
     // hrun: a halo entry with bit 15 set heads a run (its length in the next word) that agrees with its destination
     // mod 16 B, moved by one NoC copy out of the halo slot instead of word by word (encode.py hrun_words)
@@ -544,6 +552,76 @@ void kernel_main() {
         }                                                                        \
         ok_;                                                                     \
     })
+#ifdef CFD_DENSE
+    // Dispatch a 1,024-lane dense gather across up to 5 RISCs (NCRISC, BRISC, UNPACK, MATH, PACK) with disjoint
+    // contiguous lane slices; waits for every active helper before returning so halo/zero overlays stay bit-exact.
+    auto dense_tile = [&](const uint32_t* gs, const uint16_t* ix, uint32_t* o,
+                          uint32_t nN, uint32_t nB, uint32_t nU, uint32_t nM, uint32_t nP) -> bool {
+        uint32_t off = nN;
+#ifdef CFD_BMBOX
+        if (nB) {
+            S[M_JOB] = reinterpret_cast<uint32_t>(gs);
+            S[M_JOB + 1] = reinterpret_cast<uint32_t>(ix + off);
+            S[M_JOB + 2] = nB | (1u << 31);
+            S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + off);
+            S[M_N] = 1;
+            off += nB;
+        }
+#endif
+#ifdef CFD_TMBOX
+        if (nU) {
+            S[T_JOB] = reinterpret_cast<uint32_t>(gs);
+            S[T_JOB + 1] = reinterpret_cast<uint32_t>(ix + off);
+            S[T_JOB + 2] = nU | (1u << 31);
+            S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + off);
+            S[T_N] = 1;
+            off += nU;
+        }
+#endif
+#ifdef CFD_DMP
+        if (nM || nP) {
+            S[D_SRC] = reinterpret_cast<uint32_t>(gs);
+            S[D_IX] = reinterpret_cast<uint32_t>(ix);
+            S[D_OUT] = reinterpret_cast<uint32_t>(o);
+#ifdef CFD_DMP_M
+            if (nM) { S[D_MOFF] = off | (nM << 16); off += nM; }
+#endif
+#ifdef CFD_DMP_P
+            if (nP) { S[D_POFF] = off | (nP << 16); off += nP; }
+#endif
+        }
+#endif
+        (void)off; (void)nB; (void)nU; (void)nM; (void)nP;
+        asm volatile("" ::: "memory");
+        invalidate_l1_cache();
+#ifdef CFD_DMP_M
+        if (nM) S[D_MSEQ] = ++mseq;
+#endif
+#ifdef CFD_DMP_P
+        if (nP) S[D_PSEQ] = ++pseq;
+#endif
+#ifdef CFD_BMBOX
+        if (nB) S[M_SEQ] = ++bseq;
+#endif
+#ifdef CFD_TMBOX
+        if (nU) S[T_SEQ] = ++tseq;
+#endif
+        if (nN) cfd_gather16(gs, ix, nN, o);
+#ifdef CFD_BMBOX
+        if (nB && !WAIT_UNTIL(S[M_DONE] == bseq, 21)) return false;
+#endif
+#ifdef CFD_TMBOX
+        if (nU && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) return false;
+#endif
+#ifdef CFD_DMP_M
+        if (nM && !WAIT_UNTIL(S[D_MDONE] == mseq, 23)) return false;
+#endif
+#ifdef CFD_DMP_P
+        if (nP && !WAIT_UNTIL(S[D_PDONE] == pseq, 24)) return false;
+#endif
+        return true;
+    };
+#endif
 
     // BRISC zeroes the sync region and loads the tables before it releases `go` (1 = run, 2 = its barrier failed)
     bool run = true;
@@ -704,43 +782,28 @@ void kernel_main() {
 #ifdef CFD_DENSE
                         if (dn) {
                             // dense twin (tabstream.py): section 0 is this tile's 1,024 source lanes as uint16 in lane
-                            // order, so every lane is gathered once with a sequential store. The lanes are split over
-                            // this core, UNPACK and BRISC as --bgts/--tgts split entries; halo values and zero lanes
-                            // go on top once both have answered (their lanes got a dense value first)
+                            // order, so every lane is gathered once with a sequential store across up to 5 RISCs;
+                            // halo values and zero lanes go on top once every helper has answered
                             const uint32_t* const gs = A + parts[0] * 1024;
                             const uint16_t* const ix = reinterpret_cast<const uint16_t*>(sp[0]);
                             uint32_t* const o = dst + 1024 * t;
-                            uint32_t lo = 1024;
+#ifdef CFD_DSHARE
+                            static_assert(CFD_DN + CFD_DB + CFD_DU + CFD_DM + CFD_DP == 64, "dshare sum");
+                            constexpr uint32_t dN = 16 * CFD_DN, dB = 16 * CFD_DB, dU = 16 * CFD_DU, dM = 16 * CFD_DM, dP = 16 * CFD_DP;
+#else
 #ifdef CFD_BGTS
-                            lo = 1024 * CFD_BGTS / 8;
-                            S[M_JOB] = reinterpret_cast<uint32_t>(gs);
-                            S[M_JOB + 1] = reinterpret_cast<uint32_t>(ix + lo);
-                            S[M_JOB + 2] = (1024 - lo) | 1u << 31;
-                            S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + lo);
-                            S[M_N] = 1;
-                            asm volatile("" ::: "memory");
-                            S[M_SEQ] = ++bseq;
+                            constexpr uint32_t dB = 1024 - 1024 * CFD_BGTS / 8;
+#else
+                            constexpr uint32_t dB = 0;
 #endif
 #ifdef CFD_TGTS
-                            const uint32_t dq = 1024 * CFD_TGTS / 8 < lo ? 1024 * CFD_TGTS / 8 : 0;
-                            if (dq) {
-                                lo -= dq;
-                                S[T_JOB] = reinterpret_cast<uint32_t>(gs);
-                                S[T_JOB + 1] = reinterpret_cast<uint32_t>(ix + lo);
-                                S[T_JOB + 2] = dq | 1u << 31;
-                                S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + lo);
-                                S[T_N] = 1;
-                                asm volatile("" ::: "memory");
-                                S[T_SEQ] = ++tseq;
-                            }
+                            constexpr uint32_t dU = 1024 * CFD_TGTS / 8 < (1024 - dB) ? 1024 * CFD_TGTS / 8 : 0;
+#else
+                            constexpr uint32_t dU = 0;
 #endif
-                            gather16(gs, ix, lo, o);
-#ifdef CFD_BGTS
-                            if (!WAIT_UNTIL(S[M_DONE] == bseq, 21)) { run = false; break; }
+                            constexpr uint32_t dN = 1024 - dB - dU, dM = 0, dP = 0;
 #endif
-#ifdef CFD_TGTS
-                            if (dq && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
-#endif
+                            if (!dense_tile(gs, ix, o, dN, dB, dU, dM, dP)) { run = false; break; }
                             scatter(hbuf(parts[1]), sp[1], sn[1], dt);
                             for (uint32_t e = 0; e < sn[2]; ++e) dt[sp[2][e]] = 0;
                         } else
@@ -1074,7 +1137,6 @@ void kernel_main() {
 #endif
 #ifdef CFD_DENSE
                             uint32_t* const pd = const_cast<uint32_t*>(pl) + lo;   // the page's lane 0
-                            uint32_t dkeep = 1024;                                   // dense lanes this core gathers
 #else
                             constexpr bool dn = false;
                             (void)dn;
@@ -1083,16 +1145,11 @@ void kernel_main() {
                             // BRISC scatters the upper (8 - CFD_BPATCH) / 8 of every L1-source local section (vm_brisc.cpp
                             // bsvc); this core does the rest, then waits for its DONE before the page is pushed
                             uint32_t nj = 0, nkeep[8];
-#ifdef CFD_DENSE
-                            if (dn) {   // BRISC gathers the upper (8 - CFD_BPATCH) / 8 of the tile's lanes (bit 31: dense)
-                                dkeep = 1024 * CFD_BPATCH / 8;
-                                nkeep[0] = 0;   // (unused on a dense tile)
-                                S[M_JOB] = reinterpret_cast<uint32_t>(A + N[p + 2] * 1024);
-                                S[M_JOB + 1] = reinterpret_cast<uint32_t>(reinterpret_cast<const uint16_t*>(sp[0]) + dkeep);
-                                S[M_JOB + 2] = (1024 - dkeep) | 1u << 31;
-                                S[M_JOB + 3] = reinterpret_cast<uint32_t>(pd + dkeep);
-                                nj = 1;
-                            }
+#ifdef CFD_TPAT
+                            // compute's UNPACK is a third thread on the page: it takes CFD_TPAT / 8 of every share BRISC
+                            // gets a part of, out of what is left to this core (the T mailbox of CFD_TGTS; UNPACK waits for
+                            // this very page in TWAIT(cb_in) and copies from inside that wait, vm_compute.cpp tsvc)
+                            uint32_t nt = 0;
 #endif
                             for (uint32_t k = 0; k < np_ && !dn; ++k) {
                                 const uint32_t sd = N[p + 2 + 2 * k], n = sn[2 * k];
@@ -1105,6 +1162,17 @@ void kernel_main() {
                                     S[M_JOB + 4 * nj + 3] = reinterpret_cast<uint32_t>(pl);
                                     nkeep[k] = h;
                                     ++nj;
+#ifdef CFD_TPAT
+                                    const uint32_t ut = n * CFD_TPAT / 8;
+                                    if (ut && ut < h) {   // entries [h - ut, h); at most np_ <= 8 jobs, the mailbox holds 13
+                                        S[T_JOB + 4 * nt] = reinterpret_cast<uint32_t>(A + sd * 1024);
+                                        S[T_JOB + 4 * nt + 1] = reinterpret_cast<uint32_t>(sp[2 * k] + h - ut);
+                                        S[T_JOB + 4 * nt + 2] = ut;
+                                        S[T_JOB + 4 * nt + 3] = reinterpret_cast<uint32_t>(pl);
+                                        nkeep[k] = h - ut;
+                                        ++nt;
+                                    }
+#endif
                                 }
                             }
                             if (nj) {
@@ -1112,6 +1180,13 @@ void kernel_main() {
                                 asm volatile("" ::: "memory");
                                 S[M_SEQ] = ++bseq;
                             }
+#ifdef CFD_TPAT
+                            if (nt) {
+                                S[T_N] = nt;
+                                asm volatile("" ::: "memory");
+                                S[T_SEQ] = ++tseq;
+                            }
+#endif
 #endif
                             for (uint32_t k = 0; k < np_; ++k) {
                                 const uint32_t sd = N[p + 2 + 2 * k];
@@ -1122,16 +1197,26 @@ void kernel_main() {
 #endif
 #ifdef CFD_DENSE
                                 if (dn) {
-                                    gather16(A + sd * 1024, reinterpret_cast<const uint16_t*>(sp[0]), dkeep, pd);
+#ifdef CFD_PSHARE
+                                    static_assert(CFD_PN + CFD_PB + CFD_PU + CFD_PM + CFD_PP == 64, "pshare sum");
+                                    constexpr uint32_t pN = 16 * CFD_PN, pB = 16 * CFD_PB, pU = 16 * CFD_PU, pM = 16 * CFD_PM, pP = 16 * CFD_PP;
+#else
 #ifdef CFD_BPATCH
-                                    // BRISC's lanes include halo and zero lanes: those are written after its DONE
-                                    if (nj) {
-                                        bool okb = true;
-                                        PSUB(18, okb = WAIT_UNTIL(S[M_DONE] == bseq, 21));
-                                        if (!okb) { run = false; break; }
-                                        nj = 0;
-                                    }
+                                    constexpr uint32_t pB = 1024 - 1024 * CFD_BPATCH / 8;
+#else
+                                    constexpr uint32_t pB = 0;
 #endif
+#if defined(CFD_BPATCH) && defined(CFD_TPAT)
+                                    constexpr uint32_t pU = 1024 * CFD_TPAT / 8 < (1024 - pB) ? 1024 * CFD_TPAT / 8 : 0;
+#else
+                                    constexpr uint32_t pU = 0;
+#endif
+                                    constexpr uint32_t pN = 1024 - pB - pU, pM = 0, pP = 0;
+#endif
+                                    if (!dense_tile(A + sd * 1024, reinterpret_cast<const uint16_t*>(sp[0]), pd, pN, pB, pU, pM, pP)) {
+                                        run = false;
+                                        break;
+                                    }
                                 } else
 #endif
 #ifdef CFD_BPATCH
@@ -1165,6 +1250,13 @@ void kernel_main() {
                                 PSUB(18, okb = WAIT_UNTIL(S[M_DONE] == bseq, 21));   // part 18 (GATHER halo wait, 0 in STREAM runs)
                                 if (!okb) { run = false; break; }
                             }
+#ifdef CFD_TPAT
+                            if (nt) {
+                                bool okt = true;
+                                PSUB(18, okt = WAIT_UNTIL(S[T_DONE] == tseq, 22));
+                                if (!okt) { run = false; break; }
+                            }
+#endif
 #endif
 #ifdef CFD_TRID
                             if (t + 1 < tn) load_tile(qi, 2 * np_ + 1, t + 1, (t + 1) & 1, tm);
