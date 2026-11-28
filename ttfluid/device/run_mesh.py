@@ -83,7 +83,8 @@ ap.add_argument("--l1-check", action="store_true", help="open the mesh, size eve
 ap.add_argument("--gcache", type=int, default=-1, help="as run_vm.py: N gather tile cache slots of 4 KB; -1 (default): T + 1, a whole vector, "
                "so a DRAM-homed gather source is fetched once per part whatever T is; fewer if the L1 is short")
 ap.add_argument("--icache", type=int, default=1, help="as run_vm.py: compute skips a repeated op _init (CFD_ICACHE)")
-ap.add_argument("--blocks", type=int, default=0, help="1: the fusable ops of every block run as generated SFPU bodies, one program a row (C_BLK: resident/blklower.py, blockgen.py, kernels/blk_exec.h; define CFD_BLK). 0: one stock tile op per op word")
+ap.add_argument("--blocks", type=int, default=0, help="1: the fusable ops of every block run as generated SFPU bodies, one program a row (C_BLK: resident/blklower.py, blockgen.py, kernels/blk_exec.h; define CFD_BLK). 0: one stock tile op per op word. "
+                "2: the A/B's broken arm, the first add of every body subtracts: the state digest must differ")
 ap.add_argument("--sched", type=int, default=3, help="as run_vm.py: 1 greedy reorder of each fused run's blocks so values die early, 2 greedy or depth-first, 3 (default) the same at min-store cut points (Machine(sched=K))")
 ap.add_argument("--dedup", type=int, default=0, help="as run_vm.py: a fused run streams each DRAM page once (Machine(dedup=True))")
 ap.add_argument("--tsort", type=int, default=None, help="as run_vm.py: tabstream residue entries sorted by source tile (CFD_TSORT). "
@@ -344,7 +345,7 @@ else:
     assert not (ttfluid.resident.encode.WIDE and (a.tgts or a.gtile)), "--tgts / --gtile hand over 16-bit gather entries (vm_compute tsvc): not with wide ones"
     if a.blocks:   # body() lowers each block's fusable ops into generated bodies (every Encoded() below)
         assert not a.load, "--blocks: a --load file is already encoded"
-        ttfluid.resident.encode.BLOCKS = dict(plan={}, gen={})
+        ttfluid.resident.encode.BLOCKS = dict(plan={}, gen={}, brk=int(a.blocks == 2))
     if not a.load:
         E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
         if a.tscheck:   # as run_vm.py: NCRISC's streamed walk replayed against the cursor tables, every core

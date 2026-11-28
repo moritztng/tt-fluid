@@ -428,12 +428,17 @@ def _plain(spec, lregs=8):
     return cfg, row
 
 
-def program(spec, form="plain", lregs=8, sym=False):
-    """The inline words of one body, or None when this form cannot run it (the block then keeps its stock words)."""
+def program(spec, form="plain", lregs=8, sym=False, brk=0):
+    """The inline words of one body, or None when this form cannot run it (the block then keeps its stock words).
+    brk: the A/B's broken arm, the first add or sub of the row has its sign flipped (never through accept())."""
     try:
         cfg, row = _plain(spec, lregs)
     except Reject:
         return None
+    if brk:
+        i = next((i for i, x in enumerate(row) if x[0] == "sfpadd"), None)
+        if i is not None:
+            row = row[:i] + [row[i][:5] + (row[i][5] ^ 2,)] + row[i + 1:]
     u = 1 if len(row) >= 4 else 2
     if len(row) * u > 32:
         return None
