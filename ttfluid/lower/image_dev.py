@@ -177,10 +177,12 @@ def upload(md, K, DEVBLK, shape, fill, name=None):
     ttnn.copy_host_to_device_tensor(h, t)
     if prof:
         ttnn.synchronize_device(md)
-        mb = shape[0] * shape[1] * 4 / 2**20
-        print("upload %s: %d chips x %.0f MB, host shards %.2f s, write %.2f s (%.0f MB/s over the mesh)"
-              % (name, K, mb, t1 - t0, time.time() - t1, K * mb / max(time.time() - t1, 1e-9)), flush=True)
+        t2 = time.time()
     del h
+    if prof:
+        mb = shape[0] * shape[1] * 4 / 2**20
+        print("upload %s: %d chips x %.0f MB, host shards %.2f s, write %.2f s (%.0f MB/s over the mesh), free %.2f s"
+              % (name, K, mb, t1 - t0, t2 - t1, K * mb / max(t2 - t1, 1e-9), time.time() - t2), flush=True)
     if os.environ.get("CFD_IMG_VERIFY"):
         for d in range(K):
             ref = np.zeros(shape, np.uint32)
