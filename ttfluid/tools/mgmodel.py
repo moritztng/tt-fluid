@@ -218,6 +218,7 @@ def fpcg(A, b, x0, M, ctl, W):
         it += 1
         res = np.abs(r).sum() / nf
     true = np.abs(b - A @ x).sum() / nf
+    W.x = x
     return it, r0, res, true
 
 
@@ -259,6 +260,9 @@ def main():
     ap.add_argument("--q", type=float, default=4.0, help="matching priority: coupling steps per factor of 2")
     ap.add_argument("--cfg", action="append", default=[])
     ap.add_argument("--json", help="append one row per solve")
+    ap.add_argument("--ref", type=float, default=0.0,
+                    help="also solve each system to this relTol (last cfg as the preconditioner, fp64) and report the share "
+                         "of the correction x_ref - x0 that every solve leaves, in l2 and linf")
     a = ap.parse_args()
     d = Path(a.dir)
     cfgs = [parse_cfg(s) for s in a.cfg]
@@ -273,7 +277,8 @@ def main():
         A.sort_indices()
         log(f"sys {label}: n {A.shape[0]} nnz {A.nnz} tol {ctl[0]} relTol {ctl[1]}")
         built = {}
-        for c in cfgs:
+        xref = None
+        for c in ([cfgs[-1]] if a.ref and not a.aggonly else []) + cfgs:
             F = np.float32 if c["fp32"] else np.float64
             key = (c["agg"] if c["mode"] != "jac" else "jac", c["fp32"], c["aggfrom"])
             if key not in built:
@@ -299,6 +304,11 @@ def main():
             M = (lambda r, L=lev[0], c=c, W=W: cheb(L, r, c["k"], c["a"], W, 0)) if c["mode"] == "jac" else \
                 (lambda r, cy=Cycle(lev, c, W): cy(0, r))
             t1 = time.time()
+            if a.ref and xref is None:     # the reference: the same system far past the run's stopping point
+                it, r0, res, true = fpcg(A, b, x0, M, [0.0, a.ref, 20000, 0], W)
+                xref = W.x.astype(np.float64)
+                log(f"  {label} reference [{c['name']}] relTol {a.ref:g}: its {it}, true {true / r0:.3e} of r0, {time.time() - t1:.1f} s")
+                continue
             it, r0, res, true = fpcg(lev[0].A, b.astype(F), x0.astype(F), M, ctl, W)
             row = dict(sys=label, cfg=c["name"], its=it, r0=float(r0), final=float(res), true=float(true),
                        rows=[L.n for L in lev], nnz=[int(L.A.nnz) for L in lev], spmv=W.spmv, R=W.R, P=W.P, red=W.red,
@@ -306,6 +316,10 @@ def main():
                        coarse_nnz_eq=sum(s * L.A.nnz for s, L in zip(W.spmv[1:], lev[1:])) / lev[0].A.nnz,
                        lmax=[L.lmax for L in lev], levels=st[:len(lev)] if st else None, cores=a.cores, chips=a.chips, agg_ver=AGG,
                        wall=time.time() - t1)
+            if xref is not None:
+                e, e0 = W.x.astype(np.float64) - xref, x0 - xref
+                row.update(ref=a.ref, left_l2=float(np.linalg.norm(e) / np.linalg.norm(e0)), left_linf=float(np.abs(e).max() / np.abs(e0).max()))
+                log(f"  {label} [{c['name']}] leaves {row['left_l2']:.1%} of the correction in l2, {row['left_linf']:.2%} in linf")
             log(f"  {label} [{c['name']}] its {it} fine SpMV {W.spmv[0]} ({row['fine_per_it']:.2f}/it) coarse SpMV "
                 f"{W.spmv[1:]} = {row['coarse_nnz_eq']:.2f} fine-eq by nnz, R {W.R[:-1]}, red {W.red}, "
                 f"final {res / r0:.3e} of r0 (true {true / r0:.3e}), {row['wall']:.1f} s")
