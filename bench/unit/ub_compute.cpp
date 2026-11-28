@@ -2,7 +2,8 @@
 // against lean forms. Each cell runs NS acquire/commit/release sections of NB units; the three TRISCs meet at a
 // barrier before a cell (each after tensix_sync, so its Tensix queue is empty) and stamp the wall clock when their
 // own part of the cell has drained. Header words: 32 + 4 id + {0 unpack, 1 math, 2 pack} = cycles, + 3 = units.
-// Tiles of cb_v: 0-7 input, 8-11 stock-load check, 12-15 lean-load check, 16-19 op results, 20-23 pack scratch.
+// Tiles of cb_v: 0-7 input, 8-11 stock-load check, 12-15 lean-load check, 16-21 op results, 20-23 pack scratch
+// (the pack cell runs before the checks).
 #include <cstdint>
 
 #include "api/compute/common.h"
@@ -34,6 +35,17 @@ constexpr uint32_t NB = 4;   // fp32 tiles of one DEST half
     TTI_SFPSTORE(FUSED_OUT, InstrModLoadStore::FP32, ADDR_MOD_7, 192);           \
     TTI_INCRWC(0, 2, 0, 0)
 constexpr uint32_t FUSED_LEN = 10;
+// the same block as a lowering would schedule it: each operand loaded once, the pointer step folded into the store
+// (ADDR_MOD_6 advances DEST by one step). GAP is what sits between a multiply-add and the instruction that reads it
+#define SCHED_STEP(GAP)                                                          \
+    TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::FP32, ADDR_MOD_7, 0);          \
+    TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::FP32, ADDR_MOD_7, 64);         \
+    TTI_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::FP32, ADDR_MOD_7, 128);        \
+    TTI_SFPMAD(p_sfpu::LREG0, p_sfpu::LREG1, p_sfpu::LREG2, p_sfpu::LREG4, 0);   \
+    GAP;                                                                         \
+    TTI_SFPMAD(p_sfpu::LREG4, p_sfpu::LREG1, p_sfpu::LREG0, p_sfpu::LREG6, 0);   \
+    GAP;                                                                         \
+    TTI_SFPSTORE(FUSED_OUT, InstrModLoadStore::FP32, ADDR_MOD_6, 192)
 // r = s0 + s1 into slot 2: the smallest body, for the cost per SFPU instruction
 #define ADD_STEP()                                                                   \
     TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::FP32, ADDR_MOD_7, 0);              \
@@ -98,6 +110,7 @@ void kernel_main() {
     constexpr uint32_t cb_hdr = get_compile_time_arg_val(1);
     constexpr uint32_t cb_done = get_compile_time_arg_val(2);
     constexpr uint32_t nv = get_compile_time_arg_val(3);
+    constexpr uint32_t cb_h = get_compile_time_arg_val(4);   // bfloat16 view of cb_v's memory (CFD_NARROW)
     const uint32_t mask = get_common_arg_val<uint32_t>(0), NS = get_common_arg_val<uint32_t>(1);
 
     init_sfpu(cb_v, cb_v);
@@ -165,6 +178,17 @@ void kernel_main() {
     CELL(7, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); for (uint32_t j = 0; j < NB; ++j) where_tile<DataFormat::Float32>(0, 1, 2, 3); SEC_END(); });
     addcmul_tile_init();
     CELL(6, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); for (uint32_t j = 0; j < NB; ++j) addcmul_tile<DataFormat::Float32>(0, 1, 2, 3, 0x3f800000u); SEC_END(); });
+    // 8: bf16 page widened to fp32 in DEST, reconfigured both ways around every load as C_LDRH does
+    CELL(8, NS * NB, for (uint32_t s = 0; s < NS; ++s) {
+        SEC_BEGIN();
+        for (uint32_t j = 0; j < NB; ++j) {
+            copy_tile_to_dst_init_short_with_dt(cb_v, cb_h);
+            UNPACK((get_local_cb_interface(cb_h).fifo_rd_ptr = get_local_cb_interface(cb_v).fifo_rd_ptr + ((s + j) & 7) * 256));
+            copy_tile(cb_h, 0, j);
+            copy_tile_to_dst_init_short_with_dt(cb_h, cb_v);
+        }
+        SEC_END();
+    });
     // 9, 10, 11: lean load of 1, 2, 4 consecutive tiles per handshake
     copy_tile_to_dst_init_short(cb_v);
     LOAD_MOP(1);
@@ -182,6 +206,12 @@ void kernel_main() {
     CELL(14, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); MATH(({ for (uint32_t j = 0; j < NB; ++j) mop_tile(); })); SEC_END(); });
     MATH((mop_body(ADD_LEN, [] { ADD_STEP(); })));
     CELL(15, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); MATH(({ for (uint32_t j = 0; j < NB; ++j) mop_tile(); })); SEC_END(); });
+    // 16: scheduled block, a NOP in each gap (8 instructions); 17: the gaps left empty (6), to see what the SFPU does
+    MATH((addr_mod_t{.srca = {.incr = 0}, .srcb = {.incr = 0}, .dest = {.incr = 2}}.set(ADDR_MOD_6)));
+    MATH((mop_body(8, [] { SCHED_STEP(TTI_SFPNOP); })));
+    CELL(16, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); MATH(({ for (uint32_t j = 0; j < NB; ++j) mop_tile(); })); SEC_END(); });
+    MATH((mop_body(6, [] { SCHED_STEP((void)0); })));
+    CELL(17, NS * NB, for (uint32_t s = 0; s < NS; ++s) { SEC_BEGIN(); MATH(({ for (uint32_t j = 0; j < NB; ++j) mop_tile(); })); SEC_END(); });
 
     // checks (mask bit 31). Stock load of tiles 0-3 packed to 8-11; lean load of tiles 4-7 packed to 12-15
     if (mask & 0x80000000u) {
@@ -203,8 +233,13 @@ void kernel_main() {
         // r = (t0 t1 + t2) t1 + t0 four ways: two stock addcmul calls -> 16, issued block -> 17, sfpi -> 18, MOP -> 19
         copy_tile_to_dst_init_short(cb_v);
         addcmul_tile_init();
-        MATH((mop_body(FUSED_LEN, [] { FUSED_STEP(); })));
-        for (uint32_t v = 0; v < 4; ++v) {
+        MATH((addr_mod_t{.srca = {.incr = 0}, .srcb = {.incr = 0}, .dest = {.incr = 2}}.set(ADDR_MOD_6)));
+        for (uint32_t v = 0; v < 6; ++v) {   // 4 -> tile 20: scheduled with NOPs, 5 -> tile 21: gaps empty
+            MATH(({
+                if (v == 3) mop_body(FUSED_LEN, [] { FUSED_STEP(); });
+                if (v == 4) mop_body(8, [] { SCHED_STEP(TTI_SFPNOP); });
+                if (v == 5) mop_body(6, [] { SCHED_STEP((void)0); });
+            }));
             tile_regs_acquire();
             for (uint32_t j = 0; j < 3; ++j) copy_tile(cb_v, j, j);
             if (v == 0) {
@@ -214,7 +249,7 @@ void kernel_main() {
             MATH(({
                 if (v == 1) fused_issued();
                 if (v == 2) fused_sfpi();
-                if (v == 3) mop_tile();
+                if (v >= 3) mop_tile();
             }));
             tile_regs_commit();
             tile_regs_wait();

@@ -1,16 +1,19 @@
 #!/bin/bash
 # Unit-cost bench on one chip of a shared box, with the clock record taken outside the process (the Python sampler
-# cannot run while ttnn blocks). Usage: run_unit.sh <chip = sysfs node> <tag> [unit_costs.py args]
+# cannot run while ttnn blocks). Usage: run_unit.sh <chip> <tag> [unit_costs.py args]
+# <chip> is the TT_VISIBLE_DEVICES number (the one booking files use). The /dev/tenstorrent node differs on a Galaxy:
+# NODE=<n> overrides the anx-glx rule below, and unit_costs.py refuses to run if the node it opened is not NODE.
 # Writes logs/<tag>.json and logs/<tag>.aiclk next to this script's parent. PY defaults to the fleet venv.
 CHIP=$1; TAG=$2; shift 2
 B=$(cd "$(dirname "$0")/.." && pwd); PY=${PY:-$HOME/fleet/env/bin/python}; L=$B/logs; mkdir -p $L
 [ -e $HOME/fleet/HANDBACK ] && { echo HANDBACK; exit 3; }
-[ -n "$(fuser /dev/tenstorrent/$CHIP 2>/dev/null)" ] && { echo "chip $CHIP busy"; exit 4; }
+NODE=${NODE:-$(( CHIP < 16 ? CHIP : (CHIP < 24 ? CHIP + 8 : CHIP - 8) ))}
+[ -n "$(fuser /dev/tenstorrent/$NODE 2>/dev/null)" ] && { echo "chip $CHIP (node $NODE) busy"; exit 4; }
 export TT_VISIBLE_DEVICES=$CHIP TT_BIO_LEASE_CARDS=$CHIP TT_BIO_LEASE_HOLDER=worker:flx-kernel
 export TT_MESH_GRAPH_DESC_PATH=$($PY -c "import ttnn, pathlib; print(pathlib.Path(ttnn.__file__).parent / 'tt_metal/fabric/mesh_graph_descriptors/p150_mesh_graph_descriptor.textproto')")
-echo "$(date -u +%FT%TZ) start chip $CHIP load $(cut -d' ' -f1-3 /proc/loadavg)"
-( while :; do echo "$(date +%s.%N) $(cat /sys/class/tenstorrent/tenstorrent\!$CHIP/tt_aiclk)"; sleep 0.02; done ) > $L/$TAG.aiclk 2>&1 & CLK=$!
-timeout 420 $PY -u $B/unit/unit_costs.py --sysfs-node $CHIP --json $L/$TAG.json "$@" 2>&1 | grep -v "| info \|| warning \|^Total nodes\|^Degree hist\|topology_solver\|^=== "
+echo "$(date -u +%FT%TZ) start chip $CHIP node $NODE load $(cut -d' ' -f1-3 /proc/loadavg)"
+( while :; do echo "$(date +%s.%N) $(cat /sys/class/tenstorrent/tenstorrent\!$NODE/tt_aiclk)"; sleep 0.02; done ) > $L/$TAG.aiclk 2>&1 & CLK=$!
+timeout 420 $PY -u $B/unit/unit_costs.py --sysfs-node $NODE --json $L/$TAG.json "$@" 2>&1 | grep -v "| info \|| warning \|^Total nodes\|^Degree hist\|topology_solver\|^=== "
 RC=${PIPESTATUS[0]}; kill $CLK 2>/dev/null
 $PY - $L/$TAG.json $L/$TAG.aiclk <<'PYEOF'
 import json, sys
