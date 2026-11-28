@@ -15,16 +15,17 @@ residue/halo tables (padded to the global width L0), table blob pages, the halo 
 space the global ids of the elements it owns with their (core, lane), so results are collected chip by chip.
 """
 import hashlib
+import io
 import json
 import os
 import shutil
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
 LANES = 1024
+PAGE = 4096
 SCALARS = ("K", "P", "T", "ndram", "hpages", "cpages", "ntiles", "nhalo", "hmax", "red2", "redm", "L0", "TBP", "tab_stream", "nmaxop",
            "loop_pages")
 
@@ -81,15 +82,17 @@ class Image:
                     const_state=const_state)
 
     @staticmethod
-    def chip_of(E, tab, rows, L0, shared, members):
+    def chip_of(E, tab, rows, L0, shared, members, arrays=None):
         """One chip's arrays: E's rows `rows` (a slice over E's cores), tab its rewritten table rows (lists, indexed
-        like E's), members(space) -> (global ids, core on the chip, lane) of the elements the chip owns."""
+        like E's), members(space) -> (global ids, core on the chip, lane) of the elements the chip owns.
+        `arrays`, when given, supplies (arena, home, consts) directly instead of slicing E."""
         TBP = shared["scalars"]["TBP"]
         t = np.zeros((rows.stop - rows.start, L0), np.uint32)
         for i, row in enumerate(tab[rows]):
             t[i, :len(row)] = row
-        ch = dict(arena=np.ascontiguousarray(E.arena[rows]), home=np.ascontiguousarray(E.home[rows]),
-                  consts=np.ascontiguousarray(E.consts[rows]), tab=t,
+        A, Hm, C = (E.arena[rows], E.home[rows], E.consts[rows]) if arrays is None else arrays
+        ch = dict(arena=np.ascontiguousarray(A), home=np.ascontiguousarray(Hm),
+                  consts=np.ascontiguousarray(C), tab=t,
                   tab_halo=np.asarray(E.tab_halo[rows], np.uint32))
         if E.tab_stream:
             blob = np.zeros((rows.stop - rows.start, TBP * LANES), np.uint32)
@@ -102,6 +105,38 @@ class Image:
             ch["lane/" + name] = np.asarray(lane, np.int32)
         return ch
 
+    @staticmethod
+    def used_chip(ch):
+        """Non-zero 4-KB blocks of each array in one chip's dict, scanned in parallel across arrays."""
+        items = list(ch.items())
+        return dict(zip((n for n, _ in items), _READERS.map(lambda kv: _used_pages(kv[1]), items)))
+
+    @staticmethod
+    def write_chip_arrays(d, k, ch, used_k=None):
+        """Write one chip's arrays as sparse .npy files in parallel across arrays."""
+        cd = Path(d) / f"chip{k}"
+        cd.mkdir(parents=True, exist_ok=True)
+
+        def _one(kv):
+            name, arr = kv
+            f = cd / (name.replace("/", "@") + ".npy")
+            f.unlink(missing_ok=True)   # never truncate in place: identical arrays are hardlinked across images
+            _save_sparse(f, arr, used_k and used_k[name])
+
+        list(_READERS.map(_one, list(ch.items())))
+
+    @staticmethod
+    def digest_chip(shared, ch):
+        h = hashlib.sha256()
+        for name in ("c", "b", "n"):
+            h.update(name.encode() + np.ascontiguousarray(shared[name]).tobytes())
+        h.update(json.dumps([shared["scalars"], shared["gtab"], shared["out_names"]], sort_keys=True).encode())
+        for name in sorted(ch):
+            a = np.ascontiguousarray(ch[name])
+            h.update(name.encode() + str(a.dtype).encode() + str(a.shape).encode())
+            h.update(a.reshape(-1).view(np.uint8))   # the array's bytes without the copy tobytes() makes (home is 8 GB a chip on Small)
+        return h.hexdigest()
+
     def write_shared(self, d):
         d = Path(d)
         d.mkdir(parents=True, exist_ok=True)
@@ -110,21 +145,31 @@ class Image:
         meta = {k: v for k, v in self.shared.items() if not isinstance(v, np.ndarray) and k != "const_state"}
         np.savez(d / "shared.npz", meta=np.frombuffer(json.dumps(meta).encode(), np.uint8), **arrays)
 
-    def write_chip(self, d, k):
+    def write_chip(self, d, k, used=None):
         (Path(d) / f"chip{k}").mkdir(parents=True, exist_ok=True)
         for name, arr in self.chip(k).items():
             f = Path(d) / f"chip{k}" / (name.replace("/", "@") + ".npy")
             f.unlink(missing_ok=True)   # never truncate in place: identical arrays are hardlinked across images
-            np.save(f, arr)
-            subprocess.run(["fallocate", "--dig-holes", str(f)], check=False)   # zero pages as holes: home 97 %, consts 58 % on Small k4
+            _save_sparse(f, arr, used and used[k, name])
 
     # ---- files ---------------------------------------------------------------------------------------------------
-    def write(self, d, floor_gb=0):
-        need = sum(_disk_bytes(v) for k in range(self.s["K"]) for v in self.chip(k).values())
-        check_free(d, need, floor_gb)
+    def used(self):
+        """Every chip array's non-zero 4-KB blocks, found once: the disk check counts them and the write stores only those."""
+        K = self.s["K"]
+        with ThreadPoolExecutor(min(K, 8)) as ex:
+            return dict(kv for kvs in ex.map(lambda k: [((k, n), _used_pages(v)) for n, v in self.chip(k).items()], range(K)) for kv in kvs)
+
+    @staticmethod
+    def disk_bytes(used):
+        return sum(1 + int(u.sum()) for u in used.values()) * PAGE
+
+    def write(self, d, floor_gb=0, used=None):
+        """The files are np.save's byte for byte, with the zero pages as holes (home 97 %, consts 58 % on Small k4)."""
+        used = self.used() if used is None else used
+        check_free(d, self.disk_bytes(used), floor_gb)
         self.write_shared(d)
-        for k in range(self.s["K"]):
-            self.write_chip(d, k)
+        with ThreadPoolExecutor(min(self.s["K"], 8)) as ex:
+            list(ex.map(lambda k: self.write_chip(d, k, used), range(self.s["K"])))
 
     @classmethod
     def load(cls, d):
@@ -145,15 +190,7 @@ class Image:
 
     # ---- the gate ------------------------------------------------------------------------------------------------
     def digest(self, k):
-        h = hashlib.sha256()
-        for name in ("c", "b", "n"):
-            h.update(name.encode() + np.ascontiguousarray(self.shared[name]).tobytes())
-        h.update(json.dumps([self.s, self.shared["gtab"], self.shared["out_names"]], sort_keys=True).encode())
-        ch = self.chip(k)
-        for name in sorted(ch):
-            a = np.ascontiguousarray(ch[name])
-            h.update(name.encode() + str(a.dtype).encode() + str(a.shape).encode() + a.tobytes())
-        return h.hexdigest()
+        return Image.digest_chip(self.shared, self.chip(k))
 
     # ---- results, chip by chip ------------------------------------------------------------------------------------
     def state(self, out_rows, home_rows):
@@ -284,11 +321,34 @@ class _ChipFiles(dict):
         return [(n, self[n]) for n in self]
 
 
-def _disk_bytes(arr, page=4096):
-    """Bytes an array takes on disk once its zero pages are holes (write_chip writes sparse)."""
-    b = np.ascontiguousarray(arr).reshape(-1).view(np.uint8)
-    n = len(b) // page
-    return page * (int(b[:n * page].reshape(n, page).any(1).sum()) + bool(b[n * page:].any()))
+def _npy_head(arr):
+    f = io.BytesIO()
+    np.lib.format.write_array_header_1_0(f, np.lib.format.header_data_from_array_1_0(arr))
+    assert f.tell() <= PAGE
+    return f.getvalue()
+
+
+def _used_pages(arr):
+    """Which 4-KB blocks of np.save's file of arr hold a non-zero byte, the first (it has the header) left out."""
+    b = np.ascontiguousarray(arr).reshape(-1).view(np.uint8)[PAGE - len(_npy_head(arr)):]
+    n = len(b) // PAGE
+    return np.r_[b[:n * PAGE].reshape(n, PAGE).any(1), b[n * PAGE:].any() if len(b) > n * PAGE else np.zeros(0, bool)]
+
+
+def _save_sparse(f, arr, used=None):
+    """np.save(f, arr) with the file's zero blocks left as holes."""
+    arr = np.ascontiguousarray(arr)
+    b = arr.reshape(-1).view(np.uint8)
+    used = _used_pages(arr) if used is None else used
+    edge = np.flatnonzero(np.diff(np.r_[False, used, False]))   # runs of used blocks: [start, end) pairs
+    head = _npy_head(arr)
+    with open(f, "wb") as fp:
+        fp.write(head)
+        fp.write(b[:PAGE - len(head)])
+        for lo, hi in zip(edge[::2].tolist(), edge[1::2].tolist()):
+            fp.seek((1 + lo) * PAGE)
+            fp.write(b[lo * PAGE + PAGE - len(head):hi * PAGE + PAGE - len(head)])
+        fp.truncate(len(head) + len(b))
 
 
 def check_free(d, need, floor_gb):

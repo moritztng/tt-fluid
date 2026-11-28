@@ -25,6 +25,7 @@ import bisect
 import hashlib
 import os
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -433,32 +434,53 @@ class Maps:
     def __init__(self, prog, lay):
         self.prog, self.lay = prog, lay
         self.key2id, self.maps, self.lanes = {}, [], []
+        self._aid2id, self._aid_refs = {}, []
         self.group = None   # cores per chip on a mesh of chips (Machine(chip_cores=))
         self.cores = None   # (lo, hi): finish builds the tables of these cores only
 
     def map_of(self, dst_space, parts, lanes=None):
         """lanes: a register narrower than its space (--sliced) takes only its first `lanes` lanes on each core."""
+        akey = (dst_space.name, lanes) + tuple((self.prog.space[s].name, _aid(d), _aid(p)) for s, d, p in parts)
+        mid = self._aid2id.get(akey)
+        if mid is not None:
+            return mid
+        raw_parts = parts
         if lanes is not None:
             ln = self.lay.lane[dst_space.name]
-            parts = [(s, np.asarray(d)[ln[d] < lanes], np.asarray(p)[ln[np.asarray(d)] < lanes]) for s, d, p in parts]
-        key = (dst_space.name, lanes) + tuple((self.prog.space[s].name, d.tobytes(), np.asarray(p).tobytes())
-                                              for s, d, p in parts)
-        if key not in self.key2id:
-            self.key2id[key] = len(self.maps)
+            sliced = []
+            for s, d, p in parts:
+                da = np.asarray(d)
+                sel = ln[da] < lanes
+                sliced.append((s, da[sel], np.asarray(p)[sel]))
+            parts = sliced
+
+        def _dig(a):
+            a = np.ascontiguousarray(a)
+            return (a.shape, a.dtype.str, hashlib.blake2b(a.reshape(-1).view(np.uint8), digest_size=16).digest())
+
+        key = (dst_space.name, lanes) + tuple((self.prog.space[s].name, _dig(d), _dig(p)) for s, d, p in parts)
+        mid = self.key2id.get(key)
+        if mid is None:
+            mid = len(self.maps)
+            self.key2id[key] = mid
             self.maps.append((dst_space, [(self.prog.space[s], np.asarray(d), np.asarray(p)) for s, d, p in parts]))
             self.lanes.append(lanes)
-        return self.key2id[key]
+        self._aid2id[akey] = mid
+        self._aid_refs.append(raw_parts)
+        return mid
 
     def finish(self, hrun=False):
+        self.key2id.clear()
+        self._aid2id.clear()
+        self._aid_refs.clear()
         lay, P = self.lay, self.lay.P
         cells = self.prog.cells.name
-        remote = [set() for _ in range(P)]
-        remote_x = {}      # other spaces read across cores (multigrid levels): one more halo plan each
+        rem_pairs = defaultdict(list)
         self.flat = []
         for dsp, parts in self.maps:
             n = dsp.n
-            which = np.full(n, -1)
-            src = np.zeros(n, np.int64)
+            which = np.full(n, -1, np.int16 if len(parts) < 32767 else np.int32)
+            src = np.zeros(n, np.int32)
             for k, (ssp, d, p) in enumerate(parts):
                 assert ssp is not SCALAR, "scalar gather source"
                 which[d] = k
@@ -470,18 +492,27 @@ class Maps:
                 so = lay.owner[ssp.name][src[e]]
                 loc = so == own_d[e]
                 if not loc.all():
-                    if ssp.name != cells and ssp.name not in remote_x:
-                        remote_x[ssp.name] = [set() for _ in range(P)]
-                    rs = remote if ssp.name == cells else remote_x[ssp.name]
-                    for i, c in zip(own_d[e[~loc]], src[e[~loc]]):
-                        rs[i].add(int(c))
+                    rem = e[~loc]
+                    rem_pairs[ssp.name].append((own_d[rem].astype(np.int64) << 32) | src[rem].astype(np.int64))
                 rows.append((k, e.astype(np.int32), loc, src[e].astype(np.int32)))
             del which, src      # each row keeps its own sources: the unwritten lanes are the elements no row names
             self.flat.append((dsp, rows))
+
+        def _remote_for(name):
+            plist = rem_pairs.get(name)
+            if not plist:
+                return [np.zeros(0, np.int64) for _ in range(P)]
+            u = np.unique(np.concatenate(plist))
+            owners = (u >> 32).astype(np.int32)
+            srcs = (u & 0xFFFFFFFF).astype(np.int64)
+            sp = np.searchsorted(owners, np.arange(P + 1))
+            return [srcs[sp[i]:sp[i + 1]] for i in range(P)]
+
         # halo layout: plan 0 is the cell space (the only plan of a one-space program, encoded as before), plan q > 0
         # one per other space read across cores. A plan has its own receive lists, senders and halo slots.
         assert not (hrun and self.group), "hrun is single-chip only (its gap lanes break the 16-B sender-chip groups)"
-        self.plans = [self._plan(cells, remote, hrun)] + [self._plan(nm, remote_x[nm], False) for nm in sorted(remote_x)]
+        other = sorted(nm for nm in rem_pairs if nm != cells)
+        self.plans = [self._plan(cells, _remote_for(cells), hrun)] + [self._plan(nm, _remote_for(nm), False) for nm in other]
         self.plan_of = {pl["space"]: q for q, pl in enumerate(self.plans)}
         pl = self.plans[0]
         self.halo_cells, self.pos, self.halo_pos = pl["cells"], pl["posa"], pl["pos"]
@@ -509,9 +540,11 @@ class Maps:
                 C.append(own_d[e]); L.append(lane_d[e]); Pt.append(np.full(len(e), k))
                 K.append(np.where(loc, 0, 1))
                 idx = lay.lane[ssp.name][se].copy()
-                hp = self.plans[self.plan_of[ssp.name]]["pos"] if not loc.all() else None
-                for j in np.nonzero(~loc)[0]:
-                    idx[j] = hp[own_d[e[j]]][int(se[j])]
+                if not loc.all():
+                    pl_s = self.plans[self.plan_of[ssp.name]]
+                    rem = np.nonzero(~loc)[0]
+                    q = (own_d[e[rem]].astype(np.int64) << 32) | se[rem].astype(np.int64)
+                    idx[rem] = pl_s["lookup_v"][np.searchsorted(pl_s["lookup_k"], q)]
                 I.append(idx)
             z = np.nonzero(unw)[0]
             if self.lanes[m] is not None:
@@ -539,7 +572,10 @@ class Maps:
         where a fabric write of the run lands."""
         lay, P = self.lay, self.lay.P
         own, lc = lay.owner[name], lay.lane[name]
-        hc = [np.array(sorted(r, key=lambda c: (own[c], lc[c])), np.int64) for r in remote]
+        hc = []
+        for r in remote:
+            a = np.asarray(r, np.int64) if isinstance(r, np.ndarray) else np.fromiter(r, np.int64, len(r))
+            hc.append(a[np.lexsort((lc[a], own[a]))] if len(a) else a)
         posa = []
         for h in hc:
             q = np.arange(len(h))
@@ -601,8 +637,19 @@ class Maps:
         for (j, i) in send:
             senders[i].append(j)
             receivers[j].append(i)
+        lk, lv = [], []
+        for i, h in enumerate(hc):
+            if len(h):
+                lk.append((np.int64(i) << 32) | h)
+                lv.append(np.array([pos[i][int(c)] for c in h], np.int32) if hrun else posa[i].astype(np.int32))
+        if lk:
+            lookup_k, lookup_v = np.concatenate(lk), np.concatenate(lv)
+            o = np.argsort(lookup_k)
+            lookup_k, lookup_v = lookup_k[o], lookup_v[o]
+        else:
+            lookup_k, lookup_v = np.zeros(0, np.int64), np.zeros(0, np.int32)
         return dict(space=name, cells=hc, pos=pos, posa=posa, hlanes=hlanes, hstart=hstart, hmax=hmax, send=send,
-                    recv_off=recv_off, senders=senders, receivers=receivers)
+                    recv_off=recv_off, senders=senders, receivers=receivers, lookup_k=lookup_k, lookup_v=lookup_v)
 
     @staticmethod
     def drop(t, cover=None):
@@ -1550,22 +1597,41 @@ class Machine:
     def _split_gathers(self, min_per_core=24):
         cells = self.prog.cells.name
         self.base = {}
-        for mid, t in enumerate(self.maps.tab):
+        thresh = min_per_core * self.P
+
+        def _one(mid):
+            t = self.maps.tab[mid]
             dsp, parts = self.maps.maps[mid]
-            best, cover, ncov = None, None, len(t["zc"])
-            for k, (ssp, _, _) in enumerate(parts):
-                if ssp.name != cells or dsp.name != cells:
-                    continue
-                sel = (t["part"] == k) & (t["kind"] == 0)
-                d = t["idx"] - t["lane"]
-                vals, cnt = np.unique(d[sel & (d % 4 == 0)], return_counts=True)
-                if len(cnt) and cnt.max() > ncov:
-                    best, cover = (k, int(vals[np.argmax(cnt)])), sel & (d == vals[np.argmax(cnt)])
-                    ncov = int(cover.sum())
-            if ncov < min_per_core * self.P:
-                continue
-            self.base[mid] = best             # None: zero fill
-            self.maps.tab[mid] = Maps.drop(t, cover)
+            best, ncov = None, len(t["zc"])
+            if dsp.name == cells:
+                loc = t["kind"] == 0
+                for k, (ssp, _, _) in enumerate(parts):
+                    if ssp.name != cells:
+                        continue
+                    sel = loc & (t["part"] == k) if len(parts) > 1 else loc
+                    if not sel.any():
+                        continue
+                    d = t["idx"][sel] - t["lane"][sel]
+                    vals, cnt = np.unique(d[(d & 3) == 0], return_counts=True)
+                    if len(cnt):
+                        j = int(np.argmax(cnt))
+                        if int(cnt[j]) > ncov:
+                            best, ncov = (k, int(vals[j])), int(cnt[j])
+            if ncov < thresh:
+                return mid, None, None
+            cover = None if best is None else ((t["kind"] == 0) & (t["part"] == best[0]) & ((t["idx"] - t["lane"]) == best[1]))
+            return mid, best, Maps.drop(t, cover)
+
+        nm = len(self.maps.tab)
+        if nm > 1:
+            with ThreadPoolExecutor(min(8, nm)) as ex:
+                res = list(ex.map(_one, range(nm)))
+        else:
+            res = [_one(mid) for mid in range(nm)]
+        for mid, best, new_t in res:
+            if new_t is not None:
+                self.base[mid] = best             # None: zero fill
+                self.maps.tab[mid] = new_t
         out = []
         for ins in self.mir:
             if ins[0] == "gather" and ins[2] in self.base:

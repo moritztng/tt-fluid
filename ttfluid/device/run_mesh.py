@@ -169,12 +169,20 @@ ap.add_argument("--images", help="CPU only: lower, write per-chip device images 
                 "their sha256 per chip goes to digests.json there")
 ap.add_argument("--min-free-gb", type=int, default=200, help="refuse an --images/--save/--mcache write that would leave its disk "
                 "under this many GB free (checked before lowering, and again with the image's exact size before writing it)")
+ap.add_argument("--cache", help="CPU lowering: directory of the staged cache (ttfluid/lower/cache.py). A stage whose flags, input files and "
+                "source did not change is read from it instead of rebuilt; the images are byte-equal to an uncached lowering's")
+ap.add_argument("--cache-omit", default="", help=argparse.SUPPRESS)   # tests only: key inputs left out, to show the digest gate fails
+ap.add_argument("--preflight", action="store_true", help="CPU lowering: lower, check every refusal a lowering can end on (CB bytes against "
+                "--l1-bytes, the image against --min-free-gb, peak resident memory) and exit before anything is written: 0 when the line "
+                "would lower. With --cache the sizes are kept and the same line is then refused in its first seconds")
+ap.add_argument("--stages", help="CPU lowering: seconds and peak resident GB of every lowering stage as JSON lines in this file "
+                "(ttfluid/lower/stages.py)")
 a = ap.parse_args()
 if a.tsort is None and not a.from_images:
     a.tsort = int(a.tabstream)
+from ttfluid.lower.image import check_free  # noqa: E402
 for out in (a.images, a.save, a.mcache and not Path(a.mcache).exists() and a.mcache):
     if out:   # fail before a lowering that can take an hour, not after it
-        from ttfluid.lower.image import check_free
         check_free(out, 0, a.min_free_gb)
 R, C = map(int, a.mesh.split(","))
 assert min(R, C) == 1 or a.block2d or a.plan or a.emuonly, "2D mesh %dx%d needs --block2d (chips must be a physical block)" % (R, C)
@@ -184,7 +192,7 @@ K, P = R * C, GRID[0] * GRID[1]
 if a.cores:
     # the widest sub-rectangle of the arch grid that holds exactly --cores: the device launches its kernels on that corner
     w = max((w for w in range(1, GRID[0] + 1) if a.cores % w == 0 and a.cores // w <= GRID[1]), default=0)
-    assert (w and K == 1) or a.plan or a.emuonly or a.solve_census or a.images, \
+    assert (w and K == 1) or a.plan or a.emuonly or a.solve_census or a.images or a.preflight, \
         "--cores %d on a device: one chip, and a sub-rectangle of its %dx%d grid" % (a.cores, GRID[0], GRID[1])
     GRID = (w, a.cores // w) if w else GRID
 P = a.cores or P
@@ -192,6 +200,10 @@ PP = -(-P // 4) * 4   # one chip's partials padded to 16 B (vm_brisc.cpp PP): P 
 import ttfluid.resident.encode  # noqa: E402
 ttfluid.resident.encode.DA = DA
 
+from ttfluid.lower.stages import Stages  # noqa: E402
+ST = Stages(a.stages)
+with ST("imports"):
+    import ttfluid.solver.simple, ttfluid.resident.machine, ttfluid.resident.memu, ttfluid.resident.program  # noqa: E401,E402
 from ttfluid.solver.simple import SimpleFoam  # noqa: E402
 from ttfluid.resident.machine import Machine  # noqa: E402
 if a.owner:
@@ -289,6 +301,7 @@ if a.from_images:   # the device run from per-chip images (lower/image_dev.py): 
         a.nwin = -(-(NMAX + 255) // 256) * 256
         print("--nwin raised to %d words (longest N op %d)" % (a.nwin, NMAX), flush=True)
 else:
+    CACHE = None
     if a.load:
         with open(a.load, "rb") as f:
             saved, prog, m, E = pickle.load(f)
@@ -302,37 +315,99 @@ else:
         assert saved == low, ("--mcache: lowering flags differ", {k: (saved.get(k), low[k]) for k in low if saved.get(k) != low[k]})
         print("machine from %s in %.1f s" % (a.mcache, time.time() - t0), flush=True)
     else:
-        s = SimpleFoam(a.case, backend="ell", dtype=np.float32, log=lambda *x: None,
-                       ell_order="dir" if a.layout == "lattice" else "face")
-        core = None
-        if a.layout == "rcb" and K > 1:   # chip placement first (seconds): an unplaceable partition used to surface at plan(), an hour in
-            import ttfluid.resident.machine
-            from ttfluid.resident import chipplan
-            core = ttfluid.resident.machine.rcb(s.mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None, faces=ttfluid.resident.machine.mesh_faces(s.mesh))
-            nI = s.mesh.nInternalFaces
-            chipplan.place_blocks(chipplan.chip_adjacency(core // P, s.mesh.owner[:nI], s.mesh.neighbour, K), K, R, C)
-            print("placement ok: %d chip blocks one-hop on %dx%d" % (K, R, C), flush=True)
-        if a.forces:
-            from ttfluid.solver.forces import coeff_hook
-            s.force_hook = coeff_hook(s, a.forces)
-        if a.what == "synth":
-            from ttfluid.resident.synth import synth
-            prog = synth(s, a.n)
-        elif a.amg:
-            import ttfluid.resident.machine
-            assert a.layout == "rcb", "--amg: rcb (the owner below is Machine's rcb)"
-            owner = core if core is not None else ttfluid.resident.machine.rcb(s.mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None, faces=ttfluid.resident.machine.mesh_faces(s.mesh))
-            prog = build(s, a.n, phase=a.phase, amg_owner=owner, amg_kind=a.amg_kind, amg_smoothed=a.amg_smoothed, amg_stack=a.amg_stack,
-                         amg_lag=a.amg_lag, amg_lag_warm=a.amg_lag_warm, amg_chip_cores=None if a.amg_global else P,
-                         amg_depth=a.amg_depth, amg_min_core=a.amg_min_core,
-                         amg_vshape=VSHAPE)
+        def placed(mesh, core=[]):   # the cores' partition, once; on a mesh of chips it must place (chip blocks one hop apart)
+            if not core:
+                with ST("partition"):
+                    core.append(ttfluid.resident.machine.rcb(mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None, faces=ttfluid.resident.machine.mesh_faces(mesh)))
+                if K > 1:
+                    from ttfluid.resident import chipplan
+                    nI = mesh.nInternalFaces
+                    chipplan.place_blocks(chipplan.chip_adjacency(core[0] // P, mesh.owner[:nI], mesh.neighbour, K), K, R, C)
+                    print("placement ok: %d chip blocks one-hop on %dx%d" % (K, R, C), flush=True)
+            return core[0]
+
+        def trace():   # case read, one SIMPLE iteration traced: all the solver's work, none of the machine's
+            with ST("case"):
+                s = SimpleFoam(a.case, backend="ell", dtype=np.float32, log=lambda *x: None,
+                               ell_order="dir" if a.layout == "lattice" else "face")
+            if a.layout == "rcb" and K > 1:
+                placed(s.mesh)   # before the trace: an unplaceable partition used to surface at plan(), an hour in
+            if a.forces:
+                from ttfluid.solver.forces import coeff_hook
+                s.force_hook = coeff_hook(s, a.forces)
+            with ST("trace"):
+                if a.what == "synth":
+                    from ttfluid.resident.synth import synth
+                    prog = synth(s, a.n)
+                elif a.amg:
+                    assert a.layout == "rcb", "--amg: rcb (the owner below is Machine's rcb)"
+                    prog = build(s, a.n, phase=a.phase, amg_owner=placed(s.mesh), amg_kind=a.amg_kind, amg_smoothed=a.amg_smoothed,
+                                 amg_stack=a.amg_stack, amg_lag=a.amg_lag, amg_lag_warm=a.amg_lag_warm, amg_chip_cores=None if a.amg_global else P,
+                                 amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, amg_vshape=VSHAPE)
+                else:
+                    prog = build(s, a.n, phase=a.phase)
+            return s.mesh, prog
+
+        import ttfluid.resident.machine
+        if a.cache:   # the stage's key: every flag, file, environment variable and source file the trace reads (lower/cache.py)
+            from ttfluid.lower import cache as lcache
+            TRACE_FLAGS = ("what", "n", "layout", "mesh", "strips", "arch", "cores", "phase", "amg", "amg_kind", "amg_smoothed", "amg_stack", "amg_lag", "amg_lag_warm",
+                           "amg_global", "amg_depth", "amg_min_core", "vpre", "vpost", "vcoarse", "vgamma", "jointred", "cg1", "bjoint", "hlate")
+            with ST("cache key"):
+                key = dict({k: getattr(a, k) for k in TRACE_FLAGS}, case=lcache.tree_digest(a.case),
+                           forces=a.forces and [a.forces.rsplit(":", 1)[-1], ":" in a.forces and lcache.tree_digest(a.forces.rsplit(":", 1)[0])],
+                           owner=a.owner and lcache.tree_digest(a.owner), env={k: v for k, v in os.environ.items() if k.startswith(("CFD_AMG", "WM_PROJECT"))},
+                           source=lcache.source_digest(["ttfluid.solver", "ttfluid.resident.trace", "ttfluid.resident.program", "ttfluid.resident.krylov",
+                                                        "ttfluid.resident.sa", "ttfluid.resident.amg", "ttfluid.resident.synth"]),
+                           rcb=a.amg and lcache.source_digest(["ttfluid.resident.machine"]))   # --amg aggregates on the cores' partition
+            CACHE = lcache.Cache(a.cache, a.min_free_gb, omit=a.cache_omit.split(","))
+            # the sizes this exact line came to before: a refusal that took the whole lowering to reach is raised here instead
+            NOT_SIZES = ("images", "save", "mcache", "stages", "cache", "cache_omit", "min_free_gb", "preflight") + (() if a.l1 == "auto" else ("l1_bytes",))
+            SIZES = lcache.Sizes(CACHE, dict(trace=key, flags={k: v for k, v in vars(a).items() if k not in NOT_SIZES},
+                                             source=lcache.source_digest(["ttfluid", "ttfluid.resident", "ttfluid.lower", "ttfluid.device"])),
+                                 dict(case=key["case"], cores=K * P))
+            known = SIZES.known()
+            if known:
+                print("sizes of this line from an earlier lowering:", json.dumps(known), flush=True)
+            if known.get("cb_bytes", 0) > a.l1_bytes and (a.images or a.preflight):
+                raise SystemExit("error: CB bytes %d over --l1-bytes %d (halo %d B): more chips or a smaller case (this line lowered to that before)" % (known["cb_bytes"], a.l1_bytes, known["halo_bytes"]))
+            if known.get("image_bytes") and a.images:
+                check_free(a.images, known["image_bytes"], a.min_free_gb)
+            if known.get("peak_gb", 0) > lcache.mem_available_gb():
+                raise SystemExit("error: this lowering peaks at %.1f GB resident and the host has %.1f GB available" % (known["peak_gb"], lcache.mem_available_gb()))
+            if a.preflight and known.get("image_bytes"):   # every size of this line is known and none refuses
+                check_free(a.images or ".", known["image_bytes"], a.min_free_gb)
+                sys.exit(print("preflight ok: CB bytes %d of %d, image %.2f GB on disk, peak resident %.1f GB (this line lowered to that before, in %d s)" % (
+                    known["cb_bytes"], a.l1_bytes, known["image_bytes"] / 1e9, known["peak_gb"], known["s"]), flush=True))
+            if not a.owner:   # the cores' partition is a stage of its own, keyed by the points and faces it cuts: a changed trace keeps it
+                import inspect
+                _rcb, _busy = ttfluid.resident.machine.rcb, []
+
+                def rcb(xyz, P, chips=None, faces=None):
+                    if _busy:   # rcb's own recursion into the strips
+                        return _rcb(xyz, P, chips, faces)
+                    _busy.append(1)
+                    try:
+                        k = dict(P=P, chips=chips, xyz=lcache.array_digest(xyz), faces=faces and [lcache.array_digest(f) for f in faces], source=inspect.getsource(_rcb))
+                        return CACHE.get("partition", k, lambda: _rcb(xyz, P, chips, faces))
+                    finally:
+                        _busy.pop()
+                ttfluid.resident.machine.rcb = rcb
+            with ST("trace stage"):
+                mesh, prog = CACHE.get("trace", key, trace)
         else:
-            prog = build(s, a.n, phase=a.phase)
-        m = Machine(prog, s.mesh, K * P, layout=a.layout, tiles=a.tiles, chip_cores=P, red2=None if a.red2 < 0 else bool(a.red2), chip_line=a.strips or min(R, C) == 1,
-                    l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
-                    joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
-                    bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=a.cse, hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span, lsplit=a.lsplit)
+            mesh, prog = trace()
+        if a.layout == "rcb" and K > 1:
+            placed(mesh)   # a cached trace does not vouch for today's partition
+        ST.methods(Machine, ["_sliced", "_lower", "_fetches", "_split_gathers", "_halos", "_segments", "_scratch", "_allocate", "place"])
+        ST.methods(ttfluid.resident.machine.Maps, ["finish"])
+        ST.methods(ttfluid.resident.machine.Layout, ["__init__"])
+        with ST("machine"):
+            m = Machine(prog, mesh, K * P, layout=a.layout, tiles=a.tiles, chip_cores=P, red2=None if a.red2 < 0 else bool(a.red2), chip_line=a.strips or min(R, C) == 1,
+                        l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
+                        joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
+                        bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
+                        amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=a.cse, hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span, lsplit=a.lsplit)
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))
@@ -383,8 +458,13 @@ else:
     ttfluid.resident.encode.WIDE = a.wide or m.T > 64   # over 65,536 lanes a core: 22-bit gather entries (ttfluid/resident/encode.py)
     assert a.tabstream or not ttfluid.resident.encode.WIDE, "T=%d > 64 needs --tabstream" % m.T
     assert not (ttfluid.resident.encode.WIDE and (a.tgts or a.gtile)), "--tgts / --gtile hand over 16-bit gather entries (vm_compute tsvc): not with wide ones"
+    stream_chips = bool((a.images or a.preflight) and not (a.save or a.load))
     if not a.load:
-        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break)
+        ST.methods(Encoded, ["_tables", "_arena"])
+        import ttfluid.resident.tabstream
+        ST.methods(ttfluid.resident.tabstream, ["stream"])
+        with ST("encode"):
+            E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break, arena=not stream_chips)
         if a.tabdense:
             S_ = E.tab_stream
             print("tabdense %d: %d twin maps, %d of %d (core, twin) tables dense, L1 table %d words, blob %d words a core (staging %d)" % (
@@ -403,7 +483,7 @@ else:
             k = max(0, int((a.l1_bytes - (cb_bytes(E) - m.ntiles * 4096)) // 4096 - m.nsmall) // m.T)
             while True:
                 m.place(k, print)
-                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break)
+                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break, arena=not stream_chips)
                 print("l1 auto: %d vector slots in L1, CB bytes %d" % (k, cb_bytes(E)), flush=True)
                 if cb_bytes(E) <= a.l1_bytes or k == 0:
                     break
@@ -429,8 +509,9 @@ else:
     if a.nwin and a.nwin < NMAX + 255:
         a.nwin = -(-(NMAX + 255) // 256) * 256
         print("--nwin raised to %d words (longest N op %d)" % (a.nwin, NMAX), flush=True)
-    tab = [list(row) for row in E.tab]
-    chipplan.rewrite(tab, E.tab_halo, range(K * P), pl, 1 if a.amg_global else NPL)   # halo sections: local ids, remote via gateways
+    with ST("rewrite"):
+        tab = [list(row) for row in E.tab]
+        chipplan.rewrite(tab, E.tab_halo, range(K * P), pl, 1 if a.amg_global else NPL)   # halo sections: local ids, remote via gateways
     gtab = pl["gtab"]
     info = dict(K=K, mesh=[R, C], place={k: cells[place[k]] for k in range(K)}, T=m.T, hmax=mp.hmax, nhalo=m.nhalo, shs=SHS, nsh=NSH,
                 cross_pairs={f"{x}->{y}": len(v) for (x, y), v in pairs.items()},
@@ -440,19 +521,99 @@ else:
     if E.tab_stream:
         info["loc"] = list(E.tab_stream["loc"])   # for --bpatch auto on a run from the images
     print("plan", json.dumps(info), flush=True)
+    def sizes(image_bytes=None):   # kept beside the cache's stages: the next lowering of this line knows them at its start
+        rec = dict(cb_bytes=int(cb_bytes(E)), halo_bytes=int(E.m.hwords * 4), image_bytes=image_bytes, peak_gb=round(ST.peak_gb(), 1), s=round(time.time() - T_START))
+        if a.cache and not (a.load or a.mcache):
+            SIZES.note(**rec)
+        return rec
+
     if cb_bytes(E) > a.l1_bytes:   # images that cannot fit L1 fail only at launch, after the whole lowering: refuse them here
         msg = "CB bytes %d over --l1-bytes %d (halo %d B): more chips or a smaller case" % (cb_bytes(E), a.l1_bytes, E.m.hwords * 4)
-        if a.images:
+        if a.images or a.preflight:
+            sizes()
             raise SystemExit("error: " + msg)
         print("warning: " + msg, flush=True)
-    if a.images:
-        from ttfluid.lower.image import Image
+    if a.images or a.preflight:
+        from concurrent.futures import ThreadPoolExecutor
+        import shutil
+        from ttfluid.lower.image import Image, check_free
         t1 = time.time()
-        img = Image.from_lowering(m, E, tab, gtab, info, K, P, LOWER)
-        img.write(a.images, a.min_free_gb)
-        dig = {k: img.digest(k) for k in range(K)}
+        if stream_chips:
+            m.maps.tab = None
+            m.mir = None
+            if hasattr(E, "tab_cursor"):
+                E.tab_cursor = None
+            if CACHE is not None:
+                CACHE.evict()
+            L0 = max(len(t) for t in tab)
+            shared = Image.shared_of(m, E, gtab, info, K, P, LOWER, L0)
+            own = {name: np.asarray(m.lay.owner[name]) for name in shared["spaces"]}
+
+            def members(name, k):
+                ids = np.nonzero(own[name] // P == k)[0]
+                return ids, own[name][ids] - k * P, np.asarray(m.lay.lane[name][ids])
+
+            total_bytes, dig = 0, {}
+            existed = bool(a.images) and Path(a.images).exists()
+            written = []
+            try:
+                for k in range(K):
+                    rows = slice(k * P, (k + 1) * P)
+                    with ST("chip_arena"):
+                        arrs = E.chip_arena(rows, evict=CACHE.evict if CACHE is not None else None)
+                    with ST("image"):
+                        ch = Image.chip_of(E, tab, rows, L0, shared, lambda name: members(name, k), arrays=arrs)
+                        del arrs
+                        used_k = Image.used_chip(ch)
+                        chip_bytes = Image.disk_bytes(used_k)
+                        total_bytes += chip_bytes
+                    if a.preflight:
+                        del ch, used_k
+                        continue
+                    check_free(a.images, chip_bytes, a.min_free_gb)
+                    with ST("write+digest"):
+                        if k == 0:
+                            Image(shared, {}).write_shared(a.images)
+                            written.append(Path(a.images) / "shared.npz")
+                        with ThreadPoolExecutor(2) as ex:
+                            fw = ex.submit(Image.write_chip_arrays, a.images, k, ch, used_k)
+                            fd = ex.submit(Image.digest_chip, shared, ch)
+                            fw.result()
+                            dig[k] = fd.result()
+                        written.append(Path(a.images) / f"chip{k}")
+                    del ch, used_k
+            except SystemExit:
+                if a.images and not a.preflight:
+                    if not existed:
+                        shutil.rmtree(a.images, ignore_errors=True)
+                    else:
+                        for p in written:
+                            shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True)
+                raise
+            if a.preflight:
+                rec = sizes(total_bytes)
+                check_free(a.images or ".", rec["image_bytes"], a.min_free_gb)
+                sys.exit(print("preflight ok: CB bytes %d of %d, image %.2f GB on disk, peak resident %.1f GB, %d s" % (
+                    rec["cb_bytes"], a.l1_bytes, rec["image_bytes"] / 1e9, rec["peak_gb"], rec["s"]), flush=True))
+            Path(a.images, "digests.json").write_text(json.dumps(dig, indent=1))
+            print("images %s written in %.1f s, digests %s" % (a.images, time.time() - t1, json.dumps(dig)), flush=True)
+            sizes(total_bytes)
+            sys.exit(0)
+        with ST("image"):
+            img = Image.from_lowering(m, E, tab, gtab, info, K, P, LOWER)
+            used = img.used()
+        if a.preflight:
+            rec = sizes(Image.disk_bytes(used))
+            check_free(a.images or ".", rec["image_bytes"], a.min_free_gb)
+            sys.exit(print("preflight ok: CB bytes %d of %d, image %.2f GB on disk, peak resident %.1f GB, %d s" % (
+                rec["cb_bytes"], a.l1_bytes, rec["image_bytes"] / 1e9, rec["peak_gb"], rec["s"]), flush=True))
+        with ST("write"):
+            img.write(a.images, a.min_free_gb, used)
+        with ST("digest"):
+            dig = {k: img.digest(k) for k in range(K)}
         Path(a.images, "digests.json").write_text(json.dumps(dig, indent=1))
         print("images %s written in %.1f s, digests %s" % (a.images, time.time() - t1, json.dumps(dig)), flush=True)
+        sizes(Image.disk_bytes(used))
         sys.exit(0)
 
 

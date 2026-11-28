@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `run_mesh --cache DIR`: a lowering reads the case, the traced program and the partition back from DIR when their
+  flags, input files and source did not change. Images are byte-equal to an uncached lowering's.
+- `run_mesh --stages FILE`: seconds and peak memory of every lowering stage.
+- `run_mesh --preflight`: lowers without writing and checks what a lowering can be refused for at its end: CB bytes
+  against `--l1-bytes`, the image against `--min-free-gb`, peak memory. With `--cache` the sizes of a line are kept and
+  the same line is refused, or accepted, in its first seconds from then on.
 - `--lsplit 1` at lowering: a vector that holds an L1 slot across a solver loop that does not use it is parked in DRAM
   for the loop. `--lsplit 2` also parks the solution of a solve, which its loop touches once a pass.
 - `--cse 2` at lowering: gathers whose index arrays have the same content are computed once. `--cse 1` compares the
@@ -22,6 +28,7 @@ All notable changes to this project are documented here. The format follows
   `bench/per_dollar.py` prices them.
 
 ### Changed
+- Image files are written sparse in one pass and digested without a copy; the bytes are unchanged.
 - HPC_motorbike Small on two Blackhole chips: the first 100 iterations take 108 s of device time with the tutorial's
   new line (`--l1 1 --lsplit 2 --cse 2 --tabdense 530 --span 2` and the settings the run chooses itself), 1.49 times
   faster than v0.1.0's `--l1 1 --gcache 14` (161 s), with a bit-identical state. The line in between

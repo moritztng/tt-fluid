@@ -26,6 +26,8 @@ Encoded(m, tab_stream=True) uses it: E.tab becomes the L1 part, E.tab_blob the D
 section's offset in the new L1 table. stream(E) builds the layout from an Encoded program's cursor tables; check(E, S) replays NCRISC's cursor walk on the L1 table and the
 streamed walk on the blob for every core, map and tile and asserts they patch the same lanes from the same sources.
 """
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 
 from .machine import NH
@@ -125,20 +127,22 @@ def stream(E, sort=False, dense=None, brk=0):
     ndense = 0
     P, T, nm = len(E.tab), m.T, len(m.maps.tab)      # E's rows: every core, or the cores of Encoded(cores=)
     nparts = [t["nparts"] for t in m.maps.tab]
+    wide = _enc.WIDE
     nparts += [nparts[o] for o, _, _ in dense]
     assert all(nparts[nm + j] == 1 for j in range(len(dense))), "a dense twin has one part"
-    l1, blob, halo_off, staging, loc = [], [], [], 0, []
-    for i in range(P):
+
+    def _core(i):
         tab = E.tab[i]
         L = [len(nparts)] + [0] * len(nparts)
-        B = []
+        B_chunks, b_len = [], 0
+        stg, loc_i, nd_i = 0, [], 0
         for mid in range(len(nparts)):
             orig, dsh, dmin = (mid, 0, 0) if mid < nm else dense[mid - nm]
             secs, counts = _sections(tab, orig, nparts[mid])
             tm = max([int(_lane(k, e.astype(np.int64)).max()) // 1024 + 1 for k, e in secs if len(e)] or [1])
             assert tm <= T and len(L) < 1 << 20
             L[1 + mid] = len(L) | tm << 20
-            base, H = len(B), []
+            base, H = b_len, []
             per_tile = np.zeros(tm, np.int64)
             loc_tile = np.zeros(tm, np.int64)
             dn = mid >= nm and len(secs[0][1]) >= dmin * tm
@@ -149,14 +153,16 @@ def stream(E, sort=False, dense=None, brk=0):
                 if dn and si == 0:
                     assert nparts[mid] == 1 and kind == "l" and len(np.unique(lanes)) == len(lanes)
                     loc_tile += np.diff(bounds)
-                    H += (len(B) - base + np.arange(tm) * 512).tolist()
+                    H += (b_len - base + np.arange(tm) * 512).tolist()
                     idx = dense_index(ent, tm, dsh)
                     if brk and i == 0:
                         ln = lanes[:2 * (min(brk, len(lanes) // 2))]
                         idx[ln[0::2]], idx[ln[1::2]] = idx[ln[1::2]].copy(), idx[ln[0::2]].copy()
-                    B += _half(idx)
+                    h_arr = np.asarray(_half(idx), np.uint32)
+                    B_chunks.append(h_arr)
+                    b_len += len(h_arr)
                     per_tile += 512
-                    ndense += 1
+                    nd_i += 1
                     continue
                 if sort and kind == "l":
                     ent = _by_src_tile(ent, bounds)
@@ -169,23 +175,37 @@ def stream(E, sort=False, dense=None, brk=0):
                     start = np.r_[True, ~step] | cut
                     ln = np.diff(np.r_[np.flatnonzero(start), len(ent)])
                     RUNSTATS.append(np.bincount(np.minimum(ln, 64), minlength=65))
-                H += (len(B) - base + bounds[:tm]).tolist()
-                B += _cut(kind, ent.astype(np.int64)).tolist()
+                H += (b_len - base + bounds[:tm]).tolist()
+                if len(ent):
+                    B_chunks.append(_cut(kind, ent.astype(np.int64)).astype(np.uint32))
+                    b_len += len(ent)
                 per_tile += np.diff(bounds)
                 if kind == "l":
                     loc_tile += np.diff(bounds)
-            H.append(len(B) - base)
-            assert (H[-1] < 1 << 32 if _enc.WIDE else H[-1] < 1 << 16) and len(counts) <= 32
+            H.append(b_len - base)
+            assert (H[-1] < 1 << 32 if wide else H[-1] < 1 << 16) and len(counts) <= 32
             # section offsets: two uint16 a word, or (WIDE: a map may hold more than 65,536 entries on a core) one a word
-            L += [base, sum(1 << k for k, (_, nh) in enumerate(counts) if nh) | (DENSE if dn else 0)] + (H if _enc.WIDE else _half(H))
+            L += [base, sum(1 << k for k, (_, nh) in enumerate(counts) if nh) | (DENSE if dn else 0)] + (H if wide else _half(H))
             if mid < nm:
-                loc.append(loc_tile[loc_tile > 0])
-            staging = max(staging, int(per_tile.max()) if T else 0)
+                loc_i.append(loc_tile[loc_tile > 0])
+            stg = max(stg, int(per_tile.max()) if T else 0)
         d = _hdir(E, i)    # the halo directory below tab_halo (more than one plan) moves with the plans
-        halo_off.append(len(L) + d)
+        h_off = len(L) + d
         L += tab[int(E.tab_halo[i]) - d:E.tab_len[i]].tolist()   # not the padding up to the longest core's table
-        l1.append(np.array(L, np.uint32))
-        blob.append(np.array(B, np.uint32))
+        B_arr = np.concatenate(B_chunks) if B_chunks else np.zeros(0, np.uint32)
+        return np.array(L, np.uint32), B_arr, h_off, stg, loc_i, nd_i
+
+    if RUNSTATS is None and P > 1:
+        with ThreadPoolExecutor(min(8, P)) as ex:
+            res = list(ex.map(_core, range(P)))
+    else:
+        res = [_core(i) for i in range(P)]
+    l1 = [r[0] for r in res]
+    blob = [r[1] for r in res]
+    halo_off = [r[2] for r in res]
+    staging = max((r[3] for r in res), default=0)
+    loc = [x for r in res for x in r[4]]
+    ndense = sum(r[5] for r in res)
     loc = np.concatenate(loc) if loc else np.zeros(0)
     # loc: local residue entries and the patched (map, tile)s they sit in, over these cores; run_mesh --bpatch auto
     # tests their ratio. Two integers, so the chips of a per-chip lowering add up to the global lowering's pair.
