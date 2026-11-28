@@ -148,7 +148,7 @@ class FaceMatrix:
     def flux(self):
         return Surf(*self.M.flux())
 
-    def setValues(self, cells, values):
+    def setValues(self, cells, values=None):
         self.M.setValues(cells, values)
 
     def solve(self, controls, symmetric=False):
@@ -234,7 +234,7 @@ class EllOps:
         return {p.name: x[p.faceCells] for p in self.mesh.patches if p.type != "empty"}
 
     # ---- face values ------------------------------------------------------------------------------------------------
-    def interp(self, x, xb=None):
+    def interp(self, x, xb=None, internal_only=False):
         """Linear interpolate per slot as OpenFOAM orders it: w_own (x_own - x_nei) + x_nei, the same operands from
         both sides of a face; boundary slots carry the patch value (default: the cell value)."""
         e = self.e
@@ -245,6 +245,8 @@ class EllOps:
         own = _b(e.side > 0, xo)
         xP, xN = np.where(own, xs, xo), np.where(own, xo, xs)
         f = _b(e.wown, xo) * (xP - xN) + xN
+        if internal_only:
+            return f
         xbd = self.cells_on(x) if xb is None else xb
         bv = self.bslots(xbd, x)
         f = np.where(_b(e.boundary, f), bv, f)
@@ -404,7 +406,7 @@ class EllOps:
     def nonorth_corr(self, g):
         e = self.e
         if hasattr(g, "space"):
-            gf = self.interp(g)
+            gf = self.interp(g, internal_only=True)
             c = _dot(e.corr, gf) if g.ndim == 2 else _vdot(e.corr, gf)
             return np.where(_b(e.internal, c), c, 0)
         g = np.asarray(g, self.dtype)
@@ -743,10 +745,13 @@ class EllMatrix:
             f = f + self.fluxCorr
         return f
 
-    def setValues(self, cells, values):
+    def setValues(self, cells, values=None):
         e = self.e
         x = self.psi.internal
-        x[cells] = values
+        if values is None:
+            values = x[cells]
+        else:
+            x[cells] = values
         fixed = np.zeros(e.nCells, bool)
         fixed[cells] = True
         nb_fixed = e.internal & fixed[self.ops.cnbr]
