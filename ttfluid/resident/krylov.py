@@ -57,6 +57,8 @@ def _norm_factor(A, x, b, Ax):
 JOINT = False   # pcg, amg_pcg: the residual norm and the next iteration's rho leave in one cross-core reduction
 CG1 = False     # pcg, amg_pcg as _pcg_cg1 (one reduction per iteration; needs Machine(joint_red=True) to pay)
 BJOINT = False  # pbicgstab as _pbicgstab_joint (three cross-core reductions per iteration, not five)
+UROUND = 0   # pbicgstab with its sums in marked reduction rounds (_pbicgstab_rounds, --uround): 1 = four cross-core messages an
+             # iteration and no work pbicgstab does not do; 2 = three, t = A(rD s) is computed before the test on s
 UFUSE = False   # a vector solve's components in one lockstep loop (pbicgstab_fused), not one loop after another
 UFUSE_NOFREEZE = False   # self-test only (--ufuse 2): a component that has left keeps updating x, so the comparison with the one-by-one solve must fail
 UFUSE_REMAKE = False   # pbicgstab_fused makes y and z a second time for the x update (--uremake 1), so no SpMV source outlives its SpMV
@@ -338,6 +340,8 @@ def _amg_joint(A, x, b, c, M, maxit):
 
 
 def pbicgstab(A, x, b, c):
+    if UROUND:
+        return _pbicgstab_rounds(A, x, b, c, UROUND == 2)
     if BJOINT:
         return _pbicgstab_joint(A, x, b, c)
     tr = x.tr
@@ -478,6 +482,99 @@ def _round(tr, sums):
     """Mark the sums of all components at one point of a lockstep loop as one reduction round: each partial is made
     where its sum stands and the round leaves in one cross-core message with its last member (Machine._lower)."""
     tr.rounds.append(tuple(t.c[()] for v in sums for t in (v if isinstance(v, (tuple, list)) else (v,))))
+
+
+def _pbicgstab_rounds(A, x, b, c, spec):
+    """pbicgstab with its sums in marked reduction rounds, each round one cross-core message (Machine._lower), where
+    pbicgstab sends five an iteration (r0.v, |s|, t.t with t.s, |r|, rho). Every sum is the same sum of the same
+    products in the same order, so the iterates and the exit iteration are pbicgstab's, bit for bit.
+
+    spec False, four messages: r0.v; |s|; t.t, t.s; |r| with the next iteration's rho = r0.r. Nothing is computed that
+    pbicgstab does not compute, except the dot partial of rho in the iteration that then exits on r.
+    spec True, three messages: |s| rides with t.t, t.s, so t = A(rD s) is computed before the test on s (as
+    _pbicgstab_joint): one SpMV more in every solve that exits on s.
+    The setup sums are grouped as in pbicgstab_fused (the two halves of normFactor with |r|). The maxIter and rho == 0
+    tests of pbicgstab's loop head ride on the end-of-iteration branch (both leave X and R as they are)."""
+    tr = x.tr
+    Ax = A(x)
+    xm = x.mean()
+    tv = A.sumA() * xm
+    r = b - Ax
+    e = (np.abs(Ax - tv).sum(), np.abs(b - tv).sum(), np.abs(r).sum())
+    _round(tr, [e])
+    nf = e[0] + e[1] + SMALL
+    r0n = e[2] / nf
+    END, LOOP, EXIT_S = tr.new_label(), tr.new_label(), tr.new_label()
+    X, R = Var(x), Var(r)
+    zero = np.zeros_like(x)
+    P, V = Var(zero), Var(zero)
+    one = _scalar(tr, 1.0)
+    RHO_OLD, ALPHA, OMEGA = Var(one), Var(one), Var(one)
+    IT, RES = Var(_scalar(tr, 0.0)), Var(r0n)
+    if c.minIter <= 0:
+        tr.jumpif(_converged(r0n, r0n, c).c[()], END)
+    if c.maxIter <= 0:
+        tr.jump(END)
+    rD = 1.0 / A.d
+    r0 = r.copy()
+    RHO = Var(r0 @ r)
+    tr.jumpif((np.abs(RHO.t) < 1e-300).c[()], END)
+    tr.trips[LOOP] = 5
+    tr.label(LOOP)
+    rho = RHO.t
+    beta = (rho / RHO_OLD.t) * (ALPHA.t / OMEGA.t)
+    RHO_OLD.set(rho)
+    p = R.t + beta * (P.t - OMEGA.t * V.t)
+    P.set(p)
+    y = rD * p
+    v = A(y)
+    V.set(v)
+    alpha = rho / (r0 @ v)
+    ALPHA.set(alpha)
+    s = R.t - alpha * v
+    it = IT.t + 1.0
+    IT.set(it)
+    if spec:
+        z = rD * s
+        t = A(z)
+        a, q, w = np.abs(s), t * t, t * s
+        sa, tt, ts = a.sum(), q.sum(), w.sum()
+        _round(tr, [(sa, tt, ts)])
+    else:
+        sa = np.abs(s).sum()
+    res = sa / nf
+    RES.set(res)
+    gate = (it >= float(c.minIter)) if c.minIter > 0 else None
+    done = _converged(res, r0n, c)
+    done = done if gate is None else done * gate
+    tr.jumpif(done.c[()], EXIT_S)        # converged on s: x += alpha y, r = s, stop
+    if not spec:
+        z = rD * s
+        t = A(z)
+        q, w = t * t, t * s
+        tt, ts = q.sum(), w.sum()
+        _round(tr, [(tt, ts)])
+    omega = np.where(tt > 0, ts / tt, 0.0)
+    OMEGA.set(omega)
+    X.set(X.t + (alpha * y + omega * z))
+    R.set(s - omega * t)
+    rn = R.t
+    a, g = np.abs(rn), r0 * rn
+    sa, rho_n = a.sum(), g.sum()
+    _round(tr, [(sa, rho_n)])
+    res = sa / nf
+    RES.set(res)
+    RHO.set(rho_n)
+    done = _converged(res, r0n, c)
+    done = done if gate is None else done * gate
+    tr.jumpif((done + (it >= float(c.maxIter)) + (np.abs(rho_n) < 1e-300)).c[()], END)
+    tr.jump(LOOP)
+    tr.label(EXIT_S)
+    X.set(X.t + alpha * y)
+    R.set(s)
+    tr.label(END)
+    x[...] = X.t
+    return Perf(r0n, RES.t, IT.t)
 
 
 def pbicgstab_fused(As, xs, bs, c):

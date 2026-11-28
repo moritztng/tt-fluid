@@ -122,6 +122,7 @@ for k, h in [("jointred", "krylov.JOINT + Machine(joint_red=True)"), ("cg1", "kr
              ("bcast", "Machine(bcast_run=True)"), ("bgather", "Machine(bgather=True)"), ("bscal", "Machine(bscal=True)"),
              ("bjoint", "krylov.BJOINT (pair with --jointred 1)"), ("ufuse", "krylov.UFUSE: the components of a vector solve (U) in one lockstep BiCGStab loop, bitwise the sequential solves"), ("cse", "Machine(cse_ir=True): value numbering over the traced IR, bit-exact"), ("narrow", "bf16 in-place DRAM constants (Machine(narrow=True), C_LDRH)")]:
     ap.add_argument("--" + k, type=int, default=0, help="as run_vm.py: " + h)
+ap.add_argument("--uround", type=int, default=0, help="krylov.UROUND: every BiCGStab solve (U one component after another, k, omega) with its sums in marked reduction rounds, bitwise the plain loop: 1 = four cross-core messages an iteration for five, no extra work; 2 = three, one SpMV more in a solve that exits on s")
 ap.add_argument("--uremake", type=int, default=0, help="with --ufuse: 1 = the x update makes y = rD p and z = rD s again (krylov.UFUSE_REMAKE), so each SpMV source dies with its SpMV; same bits, two more products per component")
 ap.add_argument("--utrips", type=int, default=5, help="with --ufuse: the fused U loop's placement weight (krylov.UFUSE_TRIPS; the p loop's is 300), a placement hint only")
 ap.add_argument("--gtile", type=int, default=0, help="1 (with --tabstream): a gather whose next sync hands it to a tile loop that reads it "
@@ -202,6 +203,7 @@ ttfluid.resident.krylov.BJOINT = bool(a.bjoint)
 ttfluid.resident.krylov.UFUSE = bool(a.ufuse)
 ttfluid.resident.krylov.UFUSE_TRIPS = a.utrips
 ttfluid.resident.krylov.UFUSE_REMAKE = bool(a.uremake)
+ttfluid.resident.krylov.UROUND = a.uround
 ttfluid.resident.krylov.UFUSE_NOFREEZE = a.ufuse == 2   # the broken arm of the bitwise check
 stamp("python imports done")
 
@@ -216,7 +218,7 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit", "ufuse", "utrips", "uremake") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit", "ufuse", "utrips", "uremake", "uround") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
@@ -959,7 +961,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         h[:, w] += h[:, w + 400] << 32
     root = [k * P for k in range(K)]
     gws = sorted(gtab)
-    res = dict(ufuse=a.ufuse, jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
+    res = dict(ufuse=a.ufuse, uround=a.uround, jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
                plan=info, sizes=E.sizes(), l1=l1, rows=nrow, walls=walls, ticks=ticks,
                ms_device=[max(t) / amax / 1e3 for t in ticks], aiclk=clks,
                same_history_all_chips=bool(all(np.array_equal(hist_all[0, :nrow], hist_all[k, :nrow]) for k in range(K))),
