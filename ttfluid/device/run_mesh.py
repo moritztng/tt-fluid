@@ -628,8 +628,9 @@ elif IMG is not None:   # chip by chip: chip k's arrays are built from its image
     ahead["blob"] = blob.submit(host, "blob")
     blob.shutdown(wait=False)
     t_arena = image_dev.upload(md, K, DEVBLK, *filled("arena"), "arena", lambda: host("arena", ahead.pop("arena")))
-    t_const, t_home = (image_dev.upload_placed(md, cells, grid, cores, DEVBLK, staged[name], name, ahead.pop(name))
-                       for name in ("consts", "home"))
+    # a later run of --runs uploads the homes again and builds them then
+    up = lambda name: image_dev.upload_placed(md, cells, grid, cores, DEVBLK, staged[name], name, ahead.pop(name, None))
+    t_const, t_home = up("consts"), up("home")
     t_blob = image_dev.upload(md, K, DEVBLK, *filled("blob"), "blob", ahead.pop("blob").result)
     t_tab = image_dev.upload(md, K, DEVBLK, (P, L), lambda k, out: np.copyto(out, chip_tab(k)), "tab")
     stamp("images uploaded (arena, consts, home, blob, tab)")
