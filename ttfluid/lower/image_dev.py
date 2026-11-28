@@ -228,14 +228,17 @@ class Ahead:
     once written and synchronized. `alive` buffers at most are built and not yet done, and multi-part uploads reuse
     those pooled buffers with parallel zeroing instead of reallocating and unmapping every part."""
 
-    def __init__(self, sg, alive=2):
+    def __init__(self, sg, alive=2, after=None):
         self.built, self._free = queue.Queue(), queue.Queue()
         self._in_flight, self._pool, self._done, self._total = None, [], 0, None
+        self.all_built = threading.Event()
         for _ in range(alive):
             self._free.put(None)
 
         def build():
             try:
+                if after is not None:
+                    after.wait()
                 pieces = sg.pieces()
                 self._total = len(pieces)
                 reuse = sg.sparse and len(pieces) > 1
@@ -256,6 +259,8 @@ class Ahead:
                     self.built.put((slot, view))
             except BaseException as e:     # next() raises it where the buffer was expected
                 self.built.put(e)
+            finally:
+                self.all_built.set()
         threading.Thread(target=build, daemon=True).start()
 
     def next(self):

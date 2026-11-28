@@ -874,12 +874,13 @@ elif IMG is not None:   # chip by chip: chip k's arrays are built from its image
     ahead.update(ahead.pop("state").result())
     host = lambda name, buf=None: image_dev.host_shards(md, K, DEVBLK, *filled(name), buf)
     t_arena = image_dev.upload(md, K, DEVBLK, *filled("arena"), "arena", lambda: host("arena", ahead.pop("arena")))
-    # start home after torch/ttnn import so it overlaps consts upload without stalling startup
-    ahead["home"] = image_dev.Ahead(staged["home"])
+    # start home as soon as consts finishes building its last part: zero _READERS contention during consts, overlapped with its final writes
+    ah_consts = ahead.pop("consts", None)
+    ahead["home"] = image_dev.Ahead(staged["home"], after=ah_consts.all_built if ah_consts is not None else None)
     # a later run of --runs / --cases updates t_home in place
     up = lambda name, out=None, ah=None: image_dev.upload_placed(
         md, cells, grid, cores, DEVBLK, staged[name], name, ah, out=out)
-    t_const = up("consts", ah=ahead.pop("consts", None))
+    t_const = up("consts", ah=ah_consts)
     blob = ThreadPoolExecutor(1)
     ahead["blob"] = blob.submit(host, "blob")
     blob.shutdown(wait=False)
