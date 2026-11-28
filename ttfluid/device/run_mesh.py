@@ -682,15 +682,14 @@ if IMG is not None and not a.l1_check:
                                      int(os.environ.get("CFD_IMG_STAGE_MB", 1024)) << 20)
               for name in ("consts", "home")}
 
-    def with_state():   # the arena and the homes carry the start state
+    def with_state():   # read start state and build arena; defer Ahead(home) until after torch/ttnn import to avoid GIL/page-fault contention
         global STATE
         if a.state_in:
             STATE = image_dev.load_state(a.state_in)
             print("state from %s" % a.state_in, flush=True)
             stamp("state read")
-        # arena is small (~60 MB/chip) and uploaded first: build it before home Ahead grabs _READERS
         ar = image_dev.host_buffer(K, DEVBLK, *filled("arena"))
-        return dict(arena=ar, home=image_dev.Ahead(staged["home"]))
+        return dict(arena=ar)
     early = ThreadPoolExecutor(1)
     ahead = dict(consts=image_dev.Ahead(staged["consts"]), state=early.submit(with_state))
     early.shutdown(wait=False)
@@ -874,14 +873,16 @@ elif IMG is not None:   # chip by chip: chip k's arrays are built from its image
     # the host tensors borrow the buffers built since the start; the blob's is built while the constants are written
     ahead.update(ahead.pop("state").result())
     host = lambda name, buf=None: image_dev.host_shards(md, K, DEVBLK, *filled(name), buf)
-    blob = ThreadPoolExecutor(1)
-    ahead["blob"] = blob.submit(host, "blob")
-    blob.shutdown(wait=False)
     t_arena = image_dev.upload(md, K, DEVBLK, *filled("arena"), "arena", lambda: host("arena", ahead.pop("arena")))
+    # start home after torch/ttnn import so it overlaps consts upload without stalling startup
+    ahead["home"] = image_dev.Ahead(staged["home"])
     # a later run of --runs / --cases updates t_home in place
     up = lambda name, out=None, ah=None: image_dev.upload_placed(
         md, cells, grid, cores, DEVBLK, staged[name], name, ah, out=out)
     t_const = up("consts", ah=ahead.pop("consts", None))
+    blob = ThreadPoolExecutor(1)
+    ahead["blob"] = blob.submit(host, "blob")
+    blob.shutdown(wait=False)
     t_home = up("home", ah=ahead.pop("home", None))
     t_blob = image_dev.upload(md, K, DEVBLK, *filled("blob"), "blob", ahead.pop("blob").result)
     t_tab = image_dev.upload(md, K, DEVBLK, (P, L), lambda k, out: np.copyto(out, chip_tab(k)), "tab")
