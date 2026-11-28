@@ -23,8 +23,9 @@ for ln in open(st, errors="replace"):
 for n, r in rows.items():
     print("%-8s rc=%d blocks=%d host=%s chip=%s sha=%s aiclk=%s (%d sysfs samples in the run%s) ms_device=%s digest=%s"
           % (n, r["rc"], r["blocks"], r["host"], r["chip"], r["sha"], r["aiclk"], r["ns"], ", VOID" if r["void"] else "", "%.2f" % r["ms"] if r["ms"] else "-", r["dig"][:16]))
-A = [r["ms"] for n, r in rows.items() if r["blocks"] == 0 and r["rc"] == 0 and r["ms"] and not n.endswith("0") and not r["void"]]
-B = [r["ms"] for n, r in rows.items() if r["blocks"] == 1 and r["rc"] == 0 and r["ms"] and not n.endswith("0") and not r["void"]]
+kept = lambda n: re.search(r"_[AB][1-9]$", n)   # not the first runs (A0, B0, A0c, B0c), not the --prof legs (Ap, Bp)
+A = [r["ms"] for n, r in rows.items() if r["blocks"] == 0 and r["rc"] == 0 and r["ms"] and kept(n) and not r["void"]]
+B = [r["ms"] for n, r in rows.items() if r["blocks"] == 1 and r["rc"] == 0 and r["ms"] and kept(n) and not r["void"]]
 dA = {r["dig"] for n, r in rows.items() if r["blocks"] == 0 and r["rc"] == 0}
 dB = {r["dig"] for n, r in rows.items() if r["blocks"] == 1 and r["rc"] == 0}
 dX = {r["dig"] for n, r in rows.items() if r["blocks"] == 2}
