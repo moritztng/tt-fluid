@@ -2189,6 +2189,7 @@ class Machine:
         D = self.dram
         if span:
             mir = self._span_fill(mir, D, self.nsmall + newc[span])
+        spanh = self.span_held if span and self.span >= 2 else ()   # --span 2: a gather from the span is a page for any destination
 
         def blk(ins, nxt):
             """A block with its DRAM-homed loads made ldr pages: (new block, instructions consumed)."""
@@ -2197,7 +2198,7 @@ class Machine:
             split = (dst is not None and u[0] in ("lds", "fill") and
                      (len(ins[1]) == 1 or (len(ins[1]) == 2 and ins[1][0][2] == "__anchor__")))
             src = u[2] if u[0] == "lds" else None
-            if split and (dst in D or src in D):
+            if split and (dst in D or src in D or src in spanh):
                 if nxt is not None and nxt[0] == "gather" and nxt[1] == dst and nxt[2] in self.base:
                     # the split gather's two halves become one page the reader builds
                     return ("blk", [("ldr", 0, src, u[3] if src is not None else 0, nxt[2], nxt[3])], ins[2]), 2
@@ -2236,9 +2237,11 @@ class Machine:
     # (--tabdense), with no window read and no gather-cache miss. The span is dropped at every label and jump and by
     # a store to its vector. A part's halo entries still read the halo page; gathers that mix vectors, in-place
     # constants (narrow would start to round them) and gathers with no window keep today's path. Values are
-    # unchanged: the same lanes are read, from a copy.
+    # unchanged: the same lanes are read, from a copy. With --span 1 a served gather whose destination is in L1 stays
+    # a block and a gather op (two syncs); --span 2 makes it one reader page as well, like the DRAM destinations.
     def _span_fill(self, mir, D, base):
         out, cur, held, nfill, npage, skipped = [], None, None, 0, 0, Counter()
+        self.span_held = set()
         i = 0
         while i < len(mir):
             ins = mir[i]
@@ -2262,6 +2265,7 @@ class Machine:
                     if src in self.ext:
                         self.ext[held] = self.ext[src]
                     self.phys[held] = base
+                    self.span_held.add(held)
                     out.append(("blk", [("ld", 0, src)], [(0, held)]))
                     cur, nfill = src, nfill + 1
                 out.append(("blk", list(ins[1][:-1]) + [("lds", u[1], held, u[3])], ins[2]))
