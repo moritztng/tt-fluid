@@ -17,9 +17,13 @@ space the global ids of the elements it owns with their (core, lane), so results
 import functools
 import hashlib
 import json
+import mmap
 import os
 import shutil
+import struct
 import subprocess
+import threading
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -30,16 +34,56 @@ SCALARS = ("K", "P", "T", "ndram", "hpages", "cpages", "ntiles", "nhalo", "hmax"
            "loop_pages")
 
 
+def par_zero(arr):
+    """Zero a C-contiguous array across _READERS when large enough to pay for the fan-out."""
+    if arr.nbytes < (1 << 22):
+        arr.fill(0)
+        return
+    flat = arr.reshape(-1)
+    nw = max(1, _READERS._max_workers)
+    step = -(-len(flat) // nw)
+    list(_READERS.map(lambda i: flat[i:i + step].fill(0), range(0, len(flat), step)))
+
+
+def load_state(path):
+    """Read a state .npz as name -> array (dropping hist). Uncompressed .npz files (as np.savez writes) are
+    memory-mapped directly without copying into anonymous RAM; compressed archives fall back to np.load."""
+    with open(path, "rb") as f:
+        with zipfile.ZipFile(f, "r") as zf:
+            infos = [info for info in zf.infolist() if info.filename != "hist.npy"]
+            if all(info.compress_type == zipfile.ZIP_STORED and info.filename.endswith(".npy") for info in infos):
+                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                out = {}
+                ok = True
+                for info in infos:
+                    name = info.filename[:-4]
+                    fname_len, extra_len = struct.unpack_from("<HH", mm, info.header_offset + 26)
+                    f.seek(info.header_offset + 30 + fname_len + extra_len)
+                    major, _ = np.lib.format.read_magic(f)
+                    if major not in (1, 2):
+                        ok = False
+                        break
+                    hdr = np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0
+                    shape, fortran_order, dtype = hdr(f)
+                    out[name] = np.ndarray(shape, dtype=dtype, buffer=mm, offset=f.tell(),
+                                           order="F" if fortran_order else "C")
+                if ok:
+                    return out
+                mm.close()
+    with np.load(path) as z:
+        return {k: z[k] for k in z.files if k != "hist"}
+
+
 class Pages:
     """A (cores, pages, LANES) array held as the pages that are not zero: rows[row[core, page]] is a page, and the
     pages left out share one row on the way back from a chip (zero) and have row -1 on the way in, where a write to
     them is dropped (they are zero, or another part of the upload holds them). Indexed as Image.state and put_state index the homes: [core, page, lane] with index arrays."""
 
-    def __init__(self, rows, row):
-        self.rows, self.row = rows, row
+    def __init__(self, rows, row, zero_row=None):
+        self.rows, self.row, self.zero_row = rows, row, zero_row
 
     def view(self, dtype):
-        return Pages(self.rows.view(dtype), self.row)
+        return Pages(self.rows.view(dtype), self.row, self.zero_row)
 
     def __getitem__(self, i):
         return self.rows[self.row[i[0], i[1]], i[2]]
@@ -53,11 +97,46 @@ class Pages:
             self.rows[r[m], i[2][m]] = v[m]
 
 
+def _write_core(X, c, tt, ntc, nc, col):
+    if isinstance(X, Pages):
+        rr = X.row[c, tt:tt + ntc]
+        if (rr >= 0).all() and (ntc <= 1 or (rr[1:] == rr[:-1] + 1).all()):
+            X.rows[int(rr[0]):int(rr[0]) + ntc].ravel()[:nc] = col
+        else:
+            for j in range(ntc):
+                rj = int(rr[j])
+                if rj >= 0:
+                    lo = j * LANES
+                    hi = min(lo + LANES, nc)
+                    X.rows[rj, :hi - lo] = col[lo:hi]
+    else:
+        X[c, tt:tt + ntc].ravel()[:nc] = col
+
+
+def _read_core(X, c, tt, ntc, nc, dst):
+    if isinstance(X, Pages):
+        rr = X.row[c, tt:tt + ntc]
+        zr = X.zero_row
+        if (zr is None or (rr != zr).all()) and (ntc <= 1 or (rr[1:] == rr[:-1] + 1).all()):
+            dst[:] = X.rows[int(rr[0]):int(rr[0]) + ntc].ravel()[:nc]
+        else:
+            for j in range(ntc):
+                rj = int(rr[j])
+                if zr is None or rj != zr:
+                    lo = j * LANES
+                    hi = min(lo + LANES, nc)
+                    dst[lo:hi] = X.rows[rj, :hi - lo]
+    else:
+        dst[:] = X[c, tt:tt + ntc].ravel()[:nc]
+
+
 class Image:
     def __init__(self, shared, chips):
         self.shared = shared          # name -> array or JSON-able object
         self._chips = chips           # k -> dict, or k -> path (lazy)
         self._members = {}            # (k, space) -> members(k, space)
+        self._layouts = {}            # (k, space) -> compact per-core layout
+        self._mlock = threading.Lock()
         self.s = shared["scalars"]
 
     # ---- from a global lowering --------------------------------------------------------------------------------
@@ -180,31 +259,131 @@ class Image:
         return h.hexdigest()
 
     # ---- results, chip by chip ------------------------------------------------------------------------------------
+    def _layout(self, k, spn):
+        """Compact per-core layout for chip k's elements of space spn. When every core's lanes are 0..n_c-1
+        (the normal lowering output), returns (True, ptr[P+1], ids_sorted) in O(N) without sorting or storing
+        core/tile/lane arrays; otherwise falls back to (False, core, tile, lane, ids) in (core, lane) order."""
+        key = (k, spn)
+        with self._mlock:
+            lay = self._layouts.get(key)
+        if lay is not None:
+            return lay
+        ch = self.chip(k)
+        core = np.asarray(ch[f"core/{spn}"])
+        lane = np.asarray(ch[f"lane/{spn}"])
+        ids = np.asarray(ch[f"ids/{spn}"])
+        P = int(self.s["P"])
+        n = len(ids)
+        lay = None
+        if n == 0:
+            lay = (True, np.zeros(P + 1, np.int64), np.empty(0, np.uint32))
+        elif int(core.min()) >= 0 and int(core.max()) < P:
+            cnt = np.bincount(core, minlength=P)
+            ptr = np.empty(P + 1, np.int64)
+            ptr[0] = 0
+            np.cumsum(cnt, out=ptr[1:])
+            if int(lane.min()) >= 0 and (lane < cnt[core]).all():
+                dest = ptr[core] + lane
+                seen = np.zeros(n, np.uint8)
+                seen[dest] = 1
+                if seen.all():
+                    id_dt = np.uint32 if int(self.shared["spaces"][spn]) < (1 << 32) else np.int64
+                    ids_s = np.empty(n, id_dt)
+                    ids_s[dest] = ids
+                    lay = (True, ptr, ids_s)
+        if lay is None:
+            o = np.argsort(core.astype(np.int64) << 32 | lane, kind="stable")
+            lay = (False, core[o].astype(np.int32), (lane[o] // LANES).astype(np.int32),
+                   (lane[o] % LANES).astype(np.int32), ids[o])
+        with self._mlock:
+            return self._layouts.setdefault(key, lay)
+
+    def _warm_layouts(self, keys):
+        with self._mlock:
+            todo = [key for key in keys if key not in self._layouts]
+        if len(todo) > 1:
+            list(_READERS.map(lambda kv: self._layout(*kv), todo))
+        elif todo:
+            self._layout(*todo[0])
+
     def state(self, out_rows, home_rows):
         """out_rows(k) -> chip k's arena (P, ntiles, LANES) fp32; home_rows(k) -> its DRAM homes (P, hpages, LANES) or Pages.
-        Returns name -> global array, as Encoded.state_from_arena. Each register is read front to back on its own
-        thread, as put_state writes it."""
+        Returns name -> global array, as Encoded.state_from_arena. Contiguous per-core layouts scatter in core chunks
+        across _READERS and skip pages marked zero."""
         from ttfluid.resident.machine import DBASE
+        K, P = int(self.s["K"]), int(self.s["P"])
         out = {}
+        spaces = set()
         for name, shape, regs in self.shared["state"]:
             out[name] = np.zeros((self.shared["spaces"][regs[0][0]], len(regs)), np.float32)
             for i, (spn, t, n) in enumerate(regs):
                 if t is None:
                     out[name][:, i] = self.shared["const_state"][f"{name}/{i}"]
+                else:
+                    spaces.add(spn)
+        self._warm_layouts([(k, spn) for k in range(K) for spn in spaces])
 
-        def get(col, ids, X, idx):
+        def get_general(col, ids, X, idx):
             col[ids] = X[idx]
-        for k in range(self.s["K"]):
-            A, H = out_rows(k), home_rows(k)
-            jobs = []
+
+        def get_chunk(out_arr, ncols, all_dev, reg_ops, ptr, ids_s, c0, c1):
+            for c in range(c0, c1):
+                a0, a1 = int(ptr[c]), int(ptr[c + 1])
+                if a0 == a1:
+                    continue
+                nc = a1 - a0
+                ntc = -(-nc // LANES)
+                active = []
+                for i, X, tt in reg_ops:
+                    if isinstance(X, Pages) and X.zero_row is not None:
+                        if (X.row[c, tt:tt + ntc] == X.zero_row).all():
+                            continue
+                    active.append((i, X, tt))
+                if not active:
+                    continue
+                idx_ids = ids_s[a0:a1]
+                if ncols == 1:
+                    _, X, tt = active[0]
+                    col = np.zeros(nc, np.float32)
+                    _read_core(X, c, tt, ntc, nc, col)
+                    out_arr[idx_ids, 0] = col
+                elif all_dev:
+                    buf = np.zeros((nc, ncols), np.float32)
+                    for i, X, tt in active:
+                        _read_core(X, c, tt, ntc, nc, buf[:, i])
+                    out_arr[idx_ids] = buf
+                else:
+                    col = np.zeros(nc, np.float32)
+                    for i, X, tt in active:
+                        col.fill(0)
+                        _read_core(X, c, tt, ntc, nc, col)
+                        out_arr[idx_ids, i] = col
+
+        ah = [(out_rows(k), home_rows(k)) for k in range(K)]
+        step = max(1, -(-P // max(1, _READERS._max_workers)))
+        jobs = []
+        for k in range(K):
+            A, H = ah[k]
             for name, shape, regs in self.shared["state"]:
-                for i, (spn, t, n) in enumerate(regs):
-                    if t is not None:
-                        X, tt = (H, t - DBASE) if t >= DBASE else (A, t)
-                        core, tile, lane, ids = self.members(k, spn)
-                        jobs.append(_READERS.submit(get, out[name][:, i], ids, X, (core, tt + tile, lane)))
-            for j in jobs:
-                j.result()
+                reg_ops = [(i, H if t >= DBASE else A, t - DBASE if t >= DBASE else t)
+                           for i, (spn, t, n) in enumerate(regs) if t is not None]
+                if not reg_ops:
+                    continue
+                spn0 = regs[reg_ops[0][0]][0]
+                same_sp = all(regs[i][0] == spn0 for i, _, _ in reg_ops)
+                lay = self._layout(k, spn0) if same_sp else None
+                if lay is not None and lay[0]:
+                    _, ptr, ids_s = lay
+                    all_dev = len(reg_ops) == len(regs)
+                    for c0 in range(0, P, step):
+                        jobs.append(_READERS.submit(get_chunk, out[name], len(regs), all_dev, reg_ops,
+                                                    ptr, ids_s, c0, min(c0 + step, P)))
+                else:
+                    for i, X, tt in reg_ops:
+                        core, tile, lane, ids = self.members(k, regs[i][0])
+                        jobs.append(_READERS.submit(get_general, out[name][:, i], ids, X, (core, tt + tile, lane)))
+        for j in jobs:
+            j.result()
         return {name: out[name].reshape((-1,) + tuple(shape)) if shape else out[name][:, 0]
                 for name, shape, regs in self.shared["state"]}
 
@@ -212,10 +391,15 @@ class Image:
         """Chip k's elements of space spn in the order they lie on the chip: (core, tile, lane in the tile, global id),
         so a register's values are written front to back (in global-id order every write lands on another page)."""
         if (k, spn) not in self._members:
-            ch = self.chip(k)
-            core, lane, ids = (np.asarray(ch[f"{a}/{spn}"]) for a in ("core", "lane", "ids"))
-            o = np.argsort(core.astype(np.int64) << 32 | lane, kind="stable")
-            self._members[k, spn] = core[o], lane[o] // LANES, lane[o] % LANES, ids[o]
+            lay = self._layout(k, spn)
+            if lay[0]:
+                _, ptr, ids_s = lay
+                counts = np.diff(ptr)
+                core = np.repeat(np.arange(len(counts), dtype=np.int32), counts)
+                lane = np.arange(len(ids_s), dtype=np.int32) - np.repeat(ptr[:-1], counts).astype(np.int32)
+                self._members[k, spn] = core, lane // LANES, lane % LANES, ids_s.astype(np.int64)
+            else:
+                self._members[k, spn] = lay[1:]
         return self._members[k, spn]
 
     def put_state(self, k, arena, home, state):
@@ -223,19 +407,20 @@ class Image:
         (P, ntiles, LANES) and DRAM homes (P, hpages, LANES), fp32 views, in place, so the next launch starts from it
         (a restart). Either array may be None to write only the other, and the homes may be Pages that hold every
         page of a state register. A register the lowering kept as a constant
-        must already hold the value: a state that changes one cannot be loaded into these images. The components of
-        a name are gathered together, one row per element, and each register is written on its own thread (numpy
-        indexing releases the GIL): Small k2 lays 122 M values over a chip's homes."""
+        must already hold the value: a state that changes one cannot be loaded into these images. Contiguous per-core
+        layouts gather and copy in core chunks across _READERS, touching only cores held by this part."""
         from ttfluid.resident.machine import DBASE
+        P = int(self.s["P"])
+        all_cores = np.arange(P, dtype=np.int32)
+        home_cores = np.flatnonzero((home.row >= 0).any(axis=1)).astype(np.int32) if isinstance(home, Pages) else all_cores
 
-        def put(X, idx, col):
-            X[idx] = col
-        jobs = []
+        fields = []
+        spaces = set()
         for name, shape, regs in self.shared["state"]:
             v = np.asarray(state[name], np.float32)
             v = v.reshape(v.shape[0], -1) if shape else v[:, None]
             assert v.shape[1] == len(regs), (name, v.shape, len(regs))
-            g = None
+            reg_ops = []
             for i, (spn, t, n) in enumerate(regs):
                 if t is None:
                     c = np.asarray(self.shared["const_state"][f"{name}/{i}"], np.float32)
@@ -243,12 +428,63 @@ class Image:
                         (f"{name}/{i} is a constant in these images and the state changes it", float(np.max(np.abs(c - v[:, i]))))
                     continue
                 X, tt = (home, t - DBASE) if t >= DBASE else (arena, t)
-                if X is None:
+                if X is not None:
+                    reg_ops.append((i, spn, X, tt))
+                    spaces.add(spn)
+            if reg_ops:
+                fields.append((v, reg_ops))
+        if not fields:
+            return
+        self._warm_layouts([(k, spn) for spn in spaces])
+
+        def put_general(X, idx, col):
+            X[idx] = col
+
+        def put_chunk(v, reg_ops, ptr, ids_s, chunk):
+            for c in chunk:
+                c = int(c)
+                a0, a1 = int(ptr[c]), int(ptr[c + 1])
+                if a0 == a1:
                     continue
-                core, tile, lane, ids = self.members(k, spn)
-                if g is None:
-                    g = v[ids]
-                jobs.append(_READERS.submit(put, X, (core, tt + tile, lane), g[:, i]))
+                nc = a1 - a0
+                ntc = -(-nc // LANES)
+                active = []
+                for i, _, X, tt in reg_ops:
+                    if isinstance(X, Pages) and not (X.row[c, tt:tt + ntc] >= 0).any():
+                        continue
+                    active.append((i, X, tt))
+                if not active:
+                    continue
+                idx_ids = ids_s[a0:a1]
+                if len(active) == 1:
+                    i, X, tt = active[0]
+                    _write_core(X, c, tt, ntc, nc, v[idx_ids, i])
+                else:
+                    vc = v[idx_ids]
+                    for i, X, tt in active:
+                        _write_core(X, c, tt, ntc, nc, vc[:, i])
+
+        nw = max(1, _READERS._max_workers)
+        jobs = []
+        for v, reg_ops in fields:
+            spn0 = reg_ops[0][1]
+            same_sp = all(spn == spn0 for _, spn, _, _ in reg_ops)
+            lay = self._layout(k, spn0) if same_sp else None
+            if lay is not None and lay[0]:
+                _, ptr, ids_s = lay
+                cores = all_cores if any(X is arena for _, _, X, _ in reg_ops) else home_cores
+                if len(cores) == 0:
+                    continue
+                step = max(1, -(-len(cores) // nw))
+                for p0 in range(0, len(cores), step):
+                    jobs.append(_READERS.submit(put_chunk, v, reg_ops, ptr, ids_s, cores[p0:p0 + step]))
+            else:
+                g = {}
+                for i, spn, X, tt in reg_ops:
+                    core, tile, lane, ids = self.members(k, spn)
+                    if spn not in g:
+                        g[spn] = v[ids]
+                    jobs.append(_READERS.submit(put_general, X, (core, tt + tile, lane), g[spn][:, i]))
         for j in jobs:
             j.result()
 
