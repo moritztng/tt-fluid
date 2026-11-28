@@ -679,7 +679,7 @@ if IMG is not None and not a.l1_check:
     # constants and homes are mostly zero pages: the host writes the pages that hold a value, the chips lay the array.
     # CFD_IMG_STAGE_MB: the most the host stages of an array at a time, over all chips (two such parts are alive)
     staged = {name: image_dev.Staged(DEVBLK, *filled(name), lambda k, name=name: image_dev.chip_pages(IMG, k, P, name, STATE),
-                                     int(os.environ.get("CFD_IMG_STAGE_MB", 1024)) << 20)
+                                     int(os.environ.get("CFD_IMG_STAGE_MB", 1536)) << 20)
               for name in ("consts", "home")}
 
     def with_state():   # read start state and build arena; defer Ahead(home) until after torch/ttnn import to avoid GIL/page-fault contention
@@ -889,7 +889,9 @@ elif IMG is not None:   # chip by chip: chip k's arrays are built from its image
     stamp("images uploaded (arena, consts, home, blob, tab)")
     t_c, t_b, t_n = (to_dev(np.tile(code[k], (K, 1))) for k in "cbn")
     t_hist = to_dev(np.zeros((K * H, 16), np.uint32))
-    t_out = to_dev(np.zeros((K * P, 1024 + nv * 1024), np.uint32))
+    # vm_brisc.cpp unconditionally writes every core's full CFD_HDRB + abytes row of t_out at END
+    t_out = ttnn.allocate_tensor_on_device(
+        ttnn.Shape([P, 1024 + nv * 1024]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
 else:
     arena = pad16(E.arena.reshape(K * P, -1))
     tabp = pad16(tabarr)
