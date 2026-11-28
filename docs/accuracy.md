@@ -166,7 +166,8 @@ SPUMA SPDP runs by 0.01. The limit is 1 count. Double precision against mixed pr
 a 0.1 % error in the force is 17 counts at iteration 1. The check stops at iteration 10 because the device pair
 separates soon after: at iteration 12 one velocity solve takes 14 iterations on one partition and 13 on the other, and
 three iterations later the two drag values are 44 counts apart. A run that tracks its base is a reorder of it; anything
-else is graded on the window.
+else is graded on the window. Eleven iterations are enough for this check: given a run that short, the tool prints
+the tracking line alone.
 
 What the runs in `results/` grade as:
 

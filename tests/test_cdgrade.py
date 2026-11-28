@@ -1,4 +1,5 @@
 """The drag gate (bench/cdgrade.py) passes a correct run, fails a wrong one, and knows its own resolution."""
+import json
 import sys
 from pathlib import Path
 
@@ -57,3 +58,15 @@ def test_reordered_runs_track_and_other_changes_do_not():
     wrong = {i: (cd * 1.001, cl) for i, (cd, cl) in b.items()}   # a 0.1 % force error is seen in the first iterations
     assert not cdgrade.grade(wrong, REF, base=b)["reordered"]
     assert "early" not in cdgrade.grade(a, REF, base={i: v for i, v in b.items() if i > cdgrade.TRACK_ITS})
+
+
+@pytest.mark.parametrize("error, status", [(1.0, 0), (1.001, 1)])
+def test_a_short_run_gets_the_reorder_check_alone(tmp_path, monkeypatch, error, status):
+    """Eleven iterations decide whether a change is a reorder: no window, the exit status is the tracking check."""
+    hist = json.loads((QB2 / "qb2k2_D1A.hist.json").read_text())[:12]
+    short = tmp_path / "short.hist.json"
+    short.write_text(json.dumps([{**r, "Cd_in": r["Cd_in"] * error} for r in hist]))
+    monkeypatch.setattr(sys, "argv", ["cdgrade.py", "--run", f"{short}:0", "--base", f"{QB2}/qb2k2_D1A.hist.json:0"])
+    with pytest.raises(SystemExit) as e:
+        cdgrade.main()
+    assert e.value.code == status

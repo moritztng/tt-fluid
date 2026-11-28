@@ -23,7 +23,8 @@ of their floating-point sums sit sqrt(2) S100 / sqrt(n) apart (the floor); 1 suc
 
 A change that only reorders the same arithmetic has a much sharper check, also printed with --base when both runs
 start from the same state: such runs still track each other through iteration 10 (TRACK), long before the window.
-After that one linear solve taking one iteration more or fewer separates them for good.
+After that one linear solve taking one iteration more or fewer separates them for good. A run too short for a window
+(11 iterations are enough) gets this check alone, and the exit status is its result.
 """
 import argparse
 import json
@@ -81,7 +82,8 @@ def grade(run, ref, base=None, lo=START, hi=None):
     hi = max(run) if hi is None else hi
     gaps = [i for i in range(lo, hi + 1) if i not in run or (base is not None and i not in base)]
     if gaps or hi - lo + 1 < BLOCK:
-        raise SystemExit(f"window {lo}-{hi}: {len(gaps)} iterations missing (first {gaps[:1]}), need >= {BLOCK}")
+        raise SystemExit(f"no window: the run ends at iteration {hi} and a window is {lo}-{lo + BLOCK - 1} or longer"
+                         if hi - lo + 1 < BLOCK else f"window {lo}-{hi}: {len(gaps)} iterations missing, first {gaps[0]}")
     n = (hi - lo + 1) / BLOCK
     out = dict(window=[lo, hi], ref_its=[REF_FROM, max(ref)])
     for q, name in enumerate(("Cd", "Cl")):
@@ -113,7 +115,16 @@ def main():
     ap.add_argument("--to", dest="hi", type=int)
     ap.add_argument("--json")
     a = ap.parse_args()
-    g = grade(series(a.run), series(a.ref), series(a.base) if a.base else None, a.lo, a.hi)
+    run, base = series(a.run), series(a.base) if a.base else None
+
+    def track(t):
+        print(f"its 1-{TRACK_ITS} vs base: Cd within {t:.2f} counts | the same arithmetic in another order stays within "
+              f"{TRACK:g}: " + ("it tracks the base" if t <= TRACK else "this is NOT a reorder of the base"))
+
+    if base is not None and a.hi is None and max(run) < a.lo + BLOCK - 1 and (t := tracks(run, base)) is not None:
+        track(t)
+        sys.exit(not t <= TRACK)
+    g = grade(run, series(a.ref), base, a.lo, a.hi)
     lo, hi = g["window"]
     print(f"window {lo}-{hi} ({hi - lo + 1} its), reference OpenFOAM its {g['ref_its'][0]}-{g['ref_its'][1]}")
     for name in ("Cd", "Cl"):
@@ -129,8 +140,7 @@ def main():
             print(f"   vs base {c['shift']:+.1f} counts, floor {c['floor']:.1f} (1 sigma): "
                   f"{'inside' if abs(c['shift']) <= 2 * c['floor'] else 'OUTSIDE'} 2 sigma")
     if "early" in g:
-        print(f"its 1-{TRACK_ITS} vs base: Cd within {g['early']:.2f} counts | the same arithmetic in another order stays "
-              f"within {TRACK:g}: " + ("it tracks the base" if g["reordered"] else "this is NOT a reorder of the base"))
+        track(g["early"])
     c = g["Cd"]
     print(f"GRADE: {g['grade']}  Cd {c['diff']:+.1f} counts against a band of {c['band']:.1f} on {lo}-{hi}; a bias of "
           f"{c['detects']:.0f} counts fails 9 times in 10")
