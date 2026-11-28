@@ -11,20 +11,14 @@ device closely but not bit for bit.
 
 On the OpenFOAM HPC benchmark's motorbike case (HPC_motorbike Small: 8.66 M cells, 800 SIMPLE iterations), a $9,999 Tenstorrent QuietBox 2
 costs **$0.115 per case**. An 8x H100 SXM server running the GPU port of OpenFOAM (SPUMA) at its cheapest documented
-price costs $0.270 per case with one case per GPU, $0.119 with four cases per GPU under NVIDIA MPS and **$0.096 with
-eight: a GPU packed with cases is cheaper per case than the QuietBox 2 today, by 1.2x.** The drag coefficient lands 10 drag counts (0.2 %) below OpenFOAM's
-fp64 CPU result, inside the reference's own uncertainty, while the eight H100 runs scatter from -4 to +30.
-
-> **Status, 2026-11-28.** The packed-GPU numbers are new. They were measured on one H100 SXM, priced as one eighth of
-> the server: two cases per GPU $0.158 per case, four $0.119, eight $0.096, every case passing the drag check. A whole
-> 8-GPU server with eight cases per GPU (64 busy host cores) is still to be measured. These numbers are not yet in the
-> table, the figure and the scripts below, which still compare against one case per GPU; their raw data and the
-> updated table follow. Every other number in this README is printed by a script in this repository from raw data in
-> this repository.
+price costs $0.270 per case with one case per GPU and **$0.093 with eight cases per GPU under NVIDIA MPS: a GPU packed
+with cases is cheaper per case than the QuietBox 2 today, by 1.24x.** Mean drag over eight runs on a Blackhole Galaxy is 6 drag counts (0.1 %) below OpenFOAM's
+fp64 CPU result, against a bar of 12.5; nine SPUMA runs average 8 counts above it.
 
 ![Cost per case and drag coefficient vs OpenFOAM](docs/figures/headline.svg)
 
-*The figure shows one case per GPU on the NVIDIA side (see the status note above).*
+*The packed GPU bar is derived: one H100 was measured with eight cases at once, and the server is taken as eight
+such GPUs.*
 
 ## Why it matters
 
@@ -32,7 +26,7 @@ Steady RANS is still most of the CFD that engineering teams run, and GPU ports o
 bandwidth. A Tenstorrent chip is a grid of more than a hundred small cores, each with its own SRAM, linked by a network on chip,
 and chips link to each other over Ethernet. tt-fluid keeps the whole iteration resident on that grid: each core owns a
 block of cells, exchanges halos with its neighbours directly, and never returns to the host inside a run. The result is
-a $9,999 box doing the same job within 1.2x of the cost per case of a fully packed GPU server, with its accuracy
+a $9,999 box doing the same job at 1.24x the cost per case of a fully packed GPU server, with its accuracy
 checked against OpenFOAM.
 
 ## Results
@@ -40,37 +34,45 @@ checked against OpenFOAM.
 HPC_motorbike Small (OpenFOAM HPC Technical Committee benchmark, the motorBike tutorial geometry on a finer
 mesh), 8,662,309 cells, k-omega SST, 800 SIMPLE iterations from the same
 potentialFoam start on both sides. Cost per case uses one formula for every system: `capex / 3 years + wall kW x PUE
-1.3 x $0.15/kWh`, then `$/case = batch wall time x $/h / cases in the batch` ([method](docs/performance.md)).
+1.3 x $0.15/kWh`, then `$/case = batch wall time x $/h / cases in the batch` ([method](docs/performance.md)). Every
+number in this README is printed by a script in this repository from raw data in this repository.
 
 | system | price | cases at once | batch wall | $/case | per $ vs this system | how | raw data |
 |---|---|---|---|---|---|---|---|
 | Tenstorrent QuietBox 2 (2x p300c, 4 Blackhole chips) | $9,999 | 2 (one per board) | 1310.3 s | **$0.1154** | 1.00x | measured, both boards at once, AICLK 1350 MHz on all 4 chips | [logs](results/tenstorrent/quietbox2-p300x4) |
 | 8x H100 SXM (HGX), SPUMA, mixed precision | $249,200 | 8 (one per GPU) | 771.5 s | $0.2704 | **2.34x** | measured, 8 cases at once | [runs](results/nvidia/dgx-h100) |
+| same server, 2 cases per GPU under NVIDIA MPS | $249,200 | 16 | 891.3 s | $0.1579 | 1.37x | one H100 measured with 2 cases, 8x derived | [cells](results/nvidia/h100-packed) |
+| same server, 4 cases per GPU | $249,200 | 32 | 1331.6 s | $0.1192 | 1.03x | one H100 measured with 4 cases, 8x derived | [cells](results/nvidia/h100-packed) |
+| same server, 8 cases per GPU | $249,200 | 64 | 2122.3 s | $0.0958 | 0.83x | one H100 measured with 8 cases, 8x derived | [cells](results/nvidia/h100-packed) |
+| same server, 8 cases per GPU, Richardson smoother | $249,200 | 64 | 2062.2 s | **$0.0930** | **0.81x** | one H100 measured with 8 cases, 8x derived | [cells](results/nvidia/h100-packed) |
 | 8x B200 (HGX), SPUMA, mixed precision | $384,228 | 8 (one per GPU) | 690.5 s | $0.3678 | **3.19x** | one B200 measured, 8x derived | [run](results/nvidia/b200) |
 
-Reproduce the table: `python3 bench/per_dollar.py`.
+Reproduce the table: `python3 bench/per_dollar.py`. The column "per $ vs this system" is that system's cost per case
+over the QuietBox 2's: below 1.00x the GPU server is the cheaper one.
 
 A single H100 finishes a case faster than a p300c board (771.5 s vs 1310 s). With one case per GPU the QuietBox 2 wins
-per dollar because it costs 4 % of the H100 server. Packing the GPUs reverses that: with four cases per GPU the
-QuietBox 2 is 1.03x cheaper per case, with eight it is 1.2x more expensive (status note above). GPU power is the measured board power while busy, plus a host share. The QuietBox 2 is
-charged its full 1.3 kW system rating (not a measurement). NVIDIA gets its cheapest documented price and its
-fastest measured precision mode (SPDP: fp32 fields with fp64 solver sums).
+per dollar because it costs 4 % of the H100 server. Packing the GPUs reverses that. One case uses 6 GiB of an H100's
+80, and with eight cases on each GPU under NVIDIA MPS the server is 1.20x cheaper per case than the QuietBox 2, 1.24x
+with the pressure smoother the SPUMA paper reports fastest on a GPU (Richardson). The packed rows are derived: one
+H100 was measured with 2, 4 and 8 cases at once, every case passing the drag check, and the server is taken as eight
+such GPUs. A whole 8-GPU server with eight cases per GPU (64 busy host cores) has not been measured.
 
-**Accuracy.** On this case Cd keeps moving under SIMPLE (standard deviation 42 drag counts over iterations 101-800 in
-OpenFOAM's own run; 1 count = 0.0001), so single iterations say little. We compare window means over iterations 101-800 against OpenFOAM v2412 in fp64 on a CPU,
-from the same start ([method](docs/accuracy.md)):
+GPU power is the measured board power while busy, plus a host share. The QuietBox 2 is charged its full 1.3 kW system
+rating (not a measurement). NVIDIA gets its cheapest documented price and its fastest measured precision mode (SPDP:
+fp32 fields with fp64 solver sums). The QuietBox 2 row is the v0.1.0 run. The run line in the
+[tutorial](docs/tutorial.md#part-2-hpc_motorbike-small-on-a-quietbox-2) is faster on the device, and its run on a
+whole QuietBox 2 is not in this table yet.
 
-| run | Cd mean, its 101-800 | vs OpenFOAM fp64 | script |
-|---|---|---|---|
-| OpenFOAM v2412 fp64 (CPU) | 0.42116 (+-22 counts, 2 sigma) | reference | |
-| tt-fluid, QuietBox 2 board A (fp32) | 0.42013 | -10.3 counts | `bench/nvidia/cdwindow.py` |
-| SPUMA SPDP, 8x H100, 8 runs | 0.42079 - 0.42419 | -3.7 to +30.3 counts | `bench/nvidia/grade.py` |
-| SPUMA SPDP, B200 | 0.42268 | +15.2 counts | `bench/nvidia/grade.py` |
+**Accuracy.** On this case Cd keeps moving under SIMPLE (standard deviation 42 drag counts from iteration to
+iteration in OpenFOAM's own run; 1 count = 0.0001), so runs are compared on window means. `bench/cdgrade.py` grades the
+mean from iteration 201 on against the long-run mean of OpenFOAM v2412 in fp64 on a CPU (Cd 0.42226), from the same
+start. One run is a screen with a band of 17.8 counts. The bar is 12.5 counts on four or more runs pooled
+([method](docs/accuracy.md#3-drag-and-lift-against-openfoam-fp64-hpc_motorbike-small)):
 
-Over a longer window (iterations 101-1900) the Tenstorrent run's Cd is 0.42060, 12.8 counts below OpenFOAM over the same
-iterations. Lift agrees to within 3 counts. Against OpenFOAM's long-run mean (iterations 501-3372) instead, every
-window above is still partly transient and the Tenstorrent run is the furthest off, at -21 counts;
-[docs/accuracy.md](docs/accuracy.md) has all of it.
+| runs | Cd vs OpenFOAM fp64, counts | grade |
+|---|---|---|
+| tt-fluid fp32, 8 runs on one Blackhole Galaxy (4 chips each) | -21.6 to +10.2; pooled -5.7 +- 4.9 | pass, band 12.5 |
+| SPUMA SPDP, 9 runs (8 on H100, 1 on B200) | -12.6 to +27.0; pooled +8.4 +- 5.0 | pass, band 12.5 |
 
 **occDrivAer.** The coarse occDrivAer car (1.6 M cells, [cases/occDrivAer](cases/occDrivAer)) ran iterations 1-3999 on
 one Blackhole chip. Its mean Cd over iterations 1001-3999 is 0.2738, 15.0 counts above a serial OpenFOAM v2412 fp64
@@ -137,7 +139,7 @@ in [docs/architecture.md](docs/architecture.md).
 
 ```bash
 pip install -e '.[dev]'
-pytest -q          # 34 tests, about a minute, CPU only
+pytest -q          # 55 tests, CPU only
 ```
 
 The tests compare the solver against stored OpenFOAM v2412 results on pitzDaily (mesh geometry to 1e-12, laminar
@@ -155,7 +157,7 @@ with `ruff` and a full-history `gitleaks` scan.
   the order of fp32 sums. Each partition is deterministic.
 - On pitzDaily the first SST iteration agrees with OpenFOAM v2412 to about 1e-2 in k and omega (the next steps,
   started from OpenFOAM's own state, agree to better than 1e-9 and are tested); see [docs/accuracy.md](docs/accuracy.md).
-- Lowering a case of several million cells takes host RAM: about 220 GB for HPC_motorbike Small.
+- Lowering a case of several million cells takes host RAM: about 90 GB for HPC_motorbike Small.
 - Tested with the ttnn 0.68.0 wheel. This release was verified on a Blackhole p300 board; the same device program ran
   on Blackhole p150 cards and a Wormhole Galaxy during development.
 

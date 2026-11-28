@@ -9,7 +9,9 @@ Method (the same formula for every system):
     $/case = s/case x $/h / 3600 / cases the box runs at once
 
 s/case is the wall time of a batch that fills the box (8 cases, one per GPU, on 8 GPUs; one case per p300c board on a
-QuietBox 2), taken from the slowest member. GPU wall power is the measured mean board power while the GPUs were busy,
+QuietBox 2), taken from the slowest member. The packed GPU rows run k cases at once on each GPU under NVIDIA MPS: one
+H100 was measured with k cases (results/nvidia/h100-packed, bench/nvidia/pack_plan.sh) and the box is taken as 8 such
+GPUs, so their batch is 8 x k cases in the measured batch wall. GPU wall power is the measured mean board power while the GPUs were busy,
 divided by a 0.94 power supply efficiency, plus 0.15 kW of host per GPU. The QuietBox 2 is charged its full 1.3 kW
 rating, not a measurement. NVIDIA gets the cheapest documented price for each system; see docs/performance.md.
 """
@@ -32,14 +34,19 @@ def makespan(plan, tag):
     return float(m[-1])
 
 
+def cell(tsv, tag):
+    """Batch wall of one pack_plan.sh cell: first launch to last exit of its cases."""
+    return float(re.search(rf"^CELL {tag} ([\d.]+) ", Path(tsv).read_text(), re.M).group(1))
+
+
 def busy_board_kw(pattern):
     """Mean nvidia-smi board power over the samples with nonzero utilisation, all files matched."""
     w = []
     for f in glob.glob(pattern):
         for line in open(f):
             p = [x.strip() for x in line.split(",")]
-            if int(p[5].rstrip(" %")) > 0:
-                w.append(float(p[2].rstrip(" W")))
+            if int(next(x for x in p if x.endswith("%")).rstrip(" %")) > 0:
+                w.append(float(next(x for x in p if x.endswith(" W"))[:-2]))
     return sum(w) / len(w) / 1e3
 
 
@@ -52,6 +59,15 @@ def systems(r):
     h100_kw = busy_board_kw(str(r / "nvidia/dgx-h100/A_SPDP_g*/gpu.csv"))
     b200_kw = busy_board_kw(str(r / "nvidia/b200/A_SPDP_g0/gpu.csv"))
     qb = r / "tenstorrent/quietbox2-p300x4"
+    pk = r / "nvidia/h100-packed"
+
+    def packed(k, tag, what=""):
+        kw = busy_board_kw(str(pk / f"gpu_{tag}.csv"))
+        return dict(name=f"8x H100 SXM (HGX), {k} cases per GPU{what}", capex=249_200,
+                    kw=8 * (kw / PSU + GPU_HOST_KW), cases=8 * k, s_batch=cell(pk / "cells.tsv", tag), board_kw=kw,
+                    how=f"derived: {k} cases at once on one H100 under MPS measured, 8 GPUs assumed to do the same",
+                    price="cheapest documented HGX H100 listing")
+
     return [
         dict(name="Tenstorrent QuietBox 2 (2x p300c, 4 Blackhole chips)", capex=9_999, kw=1.30, cases=2,
              s_batch=max(process_wall(qb / "vq3_A.log"), process_wall(qb / "vq3_B.log")),
@@ -60,6 +76,8 @@ def systems(r):
         dict(name="8x H100 SXM (HGX)", capex=249_200, kw=8 * (h100_kw / PSU + GPU_HOST_KW), cases=8,
              s_batch=makespan(r / "nvidia/dgx-h100/plan.out", "A SPDP"), board_kw=h100_kw,
              how="measured: 8 cases, one per GPU, SPUMA SPDP, makespan", price="cheapest documented HGX H100 listing"),
+        packed(2, "P_mps_k2"), packed(4, "P_mps_k4"), packed(8, "P_mps_k8"),
+        packed(8, "P_mps_k8_richardson", ", Richardson smoother"),
         dict(name="8x B200 (HGX)", capex=384_228, kw=8 * (b200_kw / PSU + GPU_HOST_KW), cases=8,
              s_batch=makespan(r / "nvidia/b200/plan.out", "A SPDP"), board_kw=b200_kw,
              how="derived: one case on one B200 measured, 8 GPUs assumed to run 8 such cases in the same time",

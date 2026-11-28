@@ -1,0 +1,42 @@
+index, name, memory.total [MiB], clocks.max.sm [MHz], clocks.max.memory [MHz], power.limit [W], driver_version, compute_mode
+0, NVIDIA H100 80GB HBM3, 81559 MiB, 1980 MHz, 2619 MHz, 700.00 W, 615.71.09, Default
+pid, process_name, used_gpu_memory [MiB]
+CPU(s):                                  192
+Model name:                              INTEL(R) XEON(R) PLATINUM 8568Y+
+Socket(s):                               2
+CPU(s) scaling MHz:                      21%
+192
+               total        used        free      shared  buff/cache   available
+Mem:             850         299         387           0         169         550
+[2026-11-27T23:45:23Z] P_off_k1: 1 cases x 800 it, pool 60 GiB each, 7874s left
+CELL P_off_k1 681.1 per_case=681.1 ok=1/1 its=800 clock=668 power_mean=225.8W power_busy=244.8W util_mean=52.6% sm_median=1980MHz sm_at_max=99% gpu_mem_max=6177MiB host_rss_max=5231MiB
+/root/s/P_off_k1_c0 iters=800 wall=680.5s first_it=58.1s s/iter median=0.7600 mean=0.7646 min=0.7300 max=1.0100
+[2026-11-27T23:56:44Z] P_mps_k2 MPS daemon rc=0
+[2026-11-27T23:56:44Z] P_mps_k2: 2 cases x 800 it, pool 36 GiB each, 7193s left
+[2026-11-28T00:11:35Z] P_mps_k2 MPS stopped
+CELL P_mps_k2 891.3 per_case=445.7 ok=2/2 its=800,800 clock=876,887 power_mean=285.0W power_busy=298.4W util_mean=76.2% sm_median=1980MHz sm_at_max=100% gpu_mem_max=12276MiB host_rss_max=9690MiB
+/root/s/P_mps_k2_c0 iters=800 wall=880.8s first_it=69.4s s/iter median=0.9900 mean=1.0047 min=0.9000 max=1.2400
+/root/s/P_mps_k2_c1 iters=800 wall=890.8s first_it=58.1s s/iter median=1.0300 mean=1.0326 min=0.7800 max=1.3000
+[2026-11-28T00:11:35Z] P_mps_k4 MPS daemon rc=0
+[2026-11-28T00:11:35Z] P_mps_k4: 4 cases x 800 it, pool 18 GiB each, 6302s left
+[2026-11-28T00:33:47Z] P_mps_k4 MPS stopped
+CELL P_mps_k4 1331.6 per_case=332.9 ok=4/4 its=800,800,800,800 clock=1302,1292,1285,1323 power_mean=345.4W power_busy=358.5W util_mean=89.3% sm_median=1980MHz sm_at_max=100% gpu_mem_max=24484MiB host_rss_max=20089MiB
+/root/s/P_mps_k4_c0 iters=800 wall=1311.1s first_it=65.3s s/iter median=1.5200 mean=1.5206 min=1.0400 max=1.8800
+/root/s/P_mps_k4_c1 iters=800 wall=1301.1s first_it=69.3s s/iter median=1.5000 mean=1.4943 min=1.1100 max=1.7800
+/root/s/P_mps_k4_c2 iters=800 wall=1291.1s first_it=69.5s s/iter median=1.4900 mean=1.4868 min=1.1500 max=1.7700
+/root/s/P_mps_k4_c3 iters=800 wall=1331.1s first_it=64.5s s/iter median=1.5500 mean=1.5313 min=0.7700 max=1.8300
+[2026-11-28T00:33:47Z] auto -> k=8 (mps k2 891.3 s, k4 1331.6 s)
+[2026-11-28T00:33:47Z] P_mps_k8 MPS daemon rc=0
+[2026-11-28T00:33:47Z] P_mps_k8: 8 cases x 800 it, pool 9 GiB each, 4970s left
+[2026-11-28T01:09:10Z] P_mps_k8 MPS stopped
+CELL P_mps_k8 2122.3 per_case=265.3 ok=8/8 its=800,800,800,800,800,800,800,800 clock=2048,2104,2105,2049,2082,2116,2078,2106 power_mean=403.0W power_busy=411.6W util_mean=96.3% sm_median=1980MHz sm_at_max=100% gpu_mem_max=48770MiB host_rss_max=39902MiB
+/root/s/P_mps_k8_c0 iters=800 wall=2051.8s first_it=66.8s s/iter median=2.4500 mean=2.4282 min=1.2500 max=2.7300
+/root/s/P_mps_k8_c1 iters=800 wall=2111.8s first_it=66.0s s/iter median=2.5400 mean=2.4980 min=1.4600 max=2.8500
+/root/s/P_mps_k8_c2 iters=800 wall=2111.8s first_it=60.2s s/iter median=2.5500 mean=2.5077 min=1.2800 max=2.9000
+/root/s/P_mps_k8_c3 iters=800 wall=2061.8s first_it=66.5s s/iter median=2.4500 mean=2.4325 min=1.4800 max=2.7300
+/root/s/P_mps_k8_c4 iters=800 wall=2091.8s first_it=64.4s s/iter median=2.5000 mean=2.4780 min=1.5700 max=2.7900
+/root/s/P_mps_k8_c5 iters=800 wall=2121.8s first_it=64.4s s/iter median=2.5600 mean=2.5148 min=0.8100 max=2.9700
+/root/s/P_mps_k8_c6 iters=800 wall=2081.8s first_it=66.2s s/iter median=2.4900 mean=2.4651 min=1.7800 max=2.7600
+/root/s/P_mps_k8_c7 iters=800 wall=2111.8s first_it=67.3s s/iter median=2.5400 mean=2.4984 min=1.0600 max=2.9300
+[2026-11-28T01:09:10Z] P_off_k2: 2 cases x 800 it, pool 36 GiB each, 2847s left
+[cut by the driver]

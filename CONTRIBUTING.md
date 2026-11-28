@@ -19,7 +19,8 @@ ruff check . && pytest -q          # what CI runs, ~20 s
    `tests/test_emulator.py` green, and a device run of the changed program (`ttfluid run cases/pitzDaily -n 3`) reports
    a `vs_emu.worst_rel` no larger than before the change.
 3. **A performance change says what it does to the answer.** Either the final state is bitwise unchanged (say so and
-   how you checked), or the change is graded like any other: windowed Cd/Cl against OpenFOAM, `bench/nvidia/cdwindow.py`.
+   how you checked), or the change is graded like any other: windowed Cd/Cl against OpenFOAM, `bench/cdgrade.py`
+   (docs/accuracy.md, section 3).
 4. **Every number has its data.** A claim in the docs points at a script and the raw files it reads, with the chip clock
    recorded during the run.
 

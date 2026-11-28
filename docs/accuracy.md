@@ -66,56 +66,155 @@ are what the convergence criterion leaves open, not what the arithmetic adds.
 
 ## 3. Drag and lift against OpenFOAM fp64 (HPC_motorbike Small)
 
-HPC_motorbike Small (8.66 M cells, k-omega SST) does not settle to a steady state under SIMPLE: over iterations 101-800
-OpenFOAM's own drag coefficient has a standard deviation of 42 drag counts (1 count = 0.0001 in Cd). A comparison of
-single iterations would mean nothing. Both sides are therefore averaged over a window of iterations, and the error of each mean
-comes from batch means (blocks of 100 iterations). The OpenFOAM reference is v2412 in fp64 on a CPU from the same
-potentialFoam start (`results/openfoam/of1k.dat`, `of4k.dat`).
+HPC_motorbike Small (8.66 M cells, k-omega SST) does not settle to a steady state under SIMPLE: OpenFOAM's own drag
+coefficient has a standard deviation of 42 drag counts from iteration to iteration (1 count = 0.0001 in Cd), and two
+runs from the same start are unrelated after about 300 iterations. Single iterations cannot be compared. A run is
+graded on its mean Cd over a window of iterations against OpenFOAM v2412 in fp64 on a CPU, from the same potentialFoam
+start (`results/openfoam/of1k.dat`, `of4k.dat`).
 
-Iterations 101-800, all runs from the same start:
-
-| run | Cd | vs OpenFOAM, counts | 2 sigma of the difference |
-|---|---|---|---|
-| OpenFOAM v2412 fp64 | 0.42116 | | 22.0 (OpenFOAM's own mean) |
-| tt-fluid, QuietBox 2 board A, fp32 | 0.42013 | -10.3 | 23.8 |
-| SPUMA SPDP on H100, 8 runs of the same case | 0.42079 to 0.42419 | -3.7 to +30.3 | 24.2 to 29.6 |
-| SPUMA SPDP on B200 | 0.42268 | +15.2 | 26.7 |
-
-Over iterations 101-1900 the Tenstorrent run gives Cd 0.42060, 12.8 counts below OpenFOAM over the same iterations.
-Lift (Cl) agrees within 3 counts in both windows.
-
-Against OpenFOAM's long-run mean instead (its iterations 501-3372, Cd 0.42226), iterations 101-800 are still partly
-transient for every run: tt-fluid is -21.4 counts (2 sigma 11.9), the eight H100 runs -14.7 to +19.3, the B200 +4.2.
-On that comparison the Tenstorrent run is the furthest from OpenFOAM. The last line `cdwindow.py` prints applies a
-3-count target to it, which this run does not meet.
-
-The eight H100 runs are the same case on identical GPUs, and their window means still spread over 34 counts: that is
-how much a window mean moves with nothing but the order of floating-point sums. The Tenstorrent result (-10.3) lies
-just outside that spread on the low side and inside OpenFOAM's own +-22.
-
-Reproduce:
+`bench/cdgrade.py` does this for any run of the case, on a device or on a GPU, and exits 0 on a pass:
 
 ```bash
-Q=results/tenstorrent/quietbox2-p300x4; O=results/openfoam
-python3 bench/nvidia/cdwindow.py --dev $Q/qb2k2_D1A.hist.json:0 --of $O/of1k.dat $O/of4k.dat --from 101 --to 799
-python3 bench/nvidia/cdwindow.py --dev $Q/qb2k2_D1A.hist.json:0 $Q/qb2k2_D2A.hist.json:800 --of $O/of1k.dat $O/of4k.dat --from 101 --to 1899
-for g in 0 1 2 3 4 5 6 7; do python3 bench/nvidia/grade.py --of $O/of1k.dat $O/of4k.dat --to 800 \
-    --run results/nvidia/dgx-h100/A_SPDP_g$g/coefficient.dat; done
+python3 bench/cdgrade.py --run results/tenstorrent/quietbox2-p300x4/qb2k2_D1A.hist.json:0 \
+    results/tenstorrent/quietbox2-p300x4/qb2k2_D2A.hist.json:800
+python3 bench/cdgrade.py --run results/nvidia/dgx-h100/A_SPDP_g1/coefficient.dat
+python3 bench/cdgrade.py --run new_case_1x2_state.npz:0 --base old.hist.json:0     # did a change move the answer?
 ```
 
-`cdwindow.py` prints one-sigma errors; `grade.py` prints two-sigma errors. The Tenstorrent history files hold Cd and Cl
-of the state each iteration starts from (`Cd_in`), which is OpenFOAM's row for the same iteration number.
+A device run is given as the state file `run_mesh --forces` writes (it holds the history) or as a history exported from
+it, followed by the iteration the leg started from. The history holds Cd and Cl of the state each iteration starts
+from (`Cd_in`), which is OpenFOAM's row for the same iteration number.
 
-The QuietBox 2 runs behind the cost table (`vq3_A`, `vq3_B`) ran a later build with three performance changes (gather order, a
-gather tile cache and fused SpMV row products). Each change was accepted only if the final state after 800 iterations
-stayed bitwise equal, so the cost runs inherit this grade; `vq3.status` records the bitwise comparison of both boards'
-final states against two earlier builds.
+It compares the mean Cd of a window with OpenFOAM's long-run mean (iterations 501-3372, Cd 0.42226 +- 3.5 counts) and
+passes the run if the difference is inside a band. The band is 12.5 counts, or two standard deviations of the
+difference where that is wider, and it is known before the run because the noise of a window mean is known:
+
+| measured on | standard deviation of a 100-iteration mean of Cd, counts |
+|---|---|
+| OpenFOAM v2412 fp64, iterations 201-3372 | 20.7 |
+| 18 SPUMA runs, across runs, iterations 301-800 | 16.5 |
+| tt-fluid on QuietBox 2, iterations 201-1899 | 15.2 |
+
+The tool uses 20. Blocks of 100 iterations are close to independent, so a window of n blocks has 20 / sqrt(n). The 18
+SPUMA runs check this directly: their means over iterations 201-800 have a standard deviation of 8.9 counts, and the
+rule gives 8.2.
+
+The rule stops holding on longer windows of one run. The long tt-fluid histories on record (a 5,000-iteration run on a
+Wormhole Galaxy, 3,000 on four p150a cards, 1,900 on QuietBox 2) give seven windows of 1,100 to 1,900 iterations, and
+their means spread 10.5 counts where independent blocks would give 5. The Wormhole Galaxy run reads +6.5 counts on
+201-1800 and -16.0 on 1801-3400. So the tool counts one run as 600 iterations at most, however long its window, and the 12.5 bar is
+reached by pooling runs (below), not by running one of them longer.
+
+| graded | band, counts | a bias this large fails 9 times in 10 |
+|---|---|---|
+| one run, window 201-800 or longer | 17.8 | 29 |
+| four or more runs pooled | 12.5 | 19 |
+
+Three choices behind it:
+
+- The reference is OpenFOAM's long-run mean, not OpenFOAM over the same iterations. Two runs from the same start are
+  unrelated after about 300 iterations, so pairing them only adds the reference's own noise. OpenFOAM's mean over
+  101-800 happens to lie 11.8 counts below the average of the 18 SPUMA runs, while that average is 0.7 counts from
+  OpenFOAM's long-run mean.
+- The window starts at 201. Iterations 101-200 still carry a start-up transient whose size depends on the linear
+  solvers (the block mean ranges from -12 to -40 counts across the runs in `results/`).
+- One run is a screen for gross errors. It cannot tell a 15-count bias from chance. A change that alters the
+  trajectory is held to 12.5 counts on four or more runs pooled.
+
+With `--base` the tool also reports the shift against a baseline run over the same window. Two correct runs that differ
+only in the order of their floating-point sums sit 11.5 counts apart (one standard deviation) on 201-800: the 28 pairs
+of identical SPUMA SPDP runs measure 16.1, the 28 double-precision pairs 8.8. A shift inside twice that is no change;
+about 1 pair in 20 of correct runs lies outside.
+
+A change that only reorders the same arithmetic (another partition, another gather or reduction order) has a sharper
+check, printed with `--base` when both runs start from the same state or from states one rounding step apart. Such runs
+still track each other through iteration 5: nine device runs (three partitions, and six starts with the velocity scaled
+by 1 +- k x 1e-7) differ by at most 0.3 counts of Cd there, the 28 pairs of SPUMA SPDP runs by 0.01. The limit is 1
+count. Double precision against mixed precision is 52 counts apart by then, and a 0.1 % error in the force is 17 counts
+at iteration 1. The check stops at iteration 5 because the runs separate soon after: one linear solve takes one
+iteration more in one run than in the other, and by iteration 10 a run from a scaled start is up to 18 counts from the
+unscaled one. A run that tracks its base is a reorder of it; anything else is graded on the window. Six iterations
+are enough for this check: given a run that short, the tool prints the tracking line alone.
+
+Runs that track each other are draws of one arithmetic, so their windows can be pooled into one grade, which is how
+a set of 800-iteration runs reaches the 12.5 bar. Each `--pool` adds a run; the tool refuses one that does not track
+the first, and it leaves out the first block of every added run because that block still follows the first run. The
+pooled error is the larger of the rule's and the one the run means themselves show, so runs that disagree widen their
+own band. Four runs or more make a grade of record. Such runs cost nothing extra where several cases run at once:
+start each from a state one rounding step away from the others. The eight SPUMA SPDP runs on H100 and the one on B200
+pool to +8.4 +- 5.0 counts over 5,400 iterations: a pass.
+
+```bash
+H=results/nvidia/dgx-h100
+python3 bench/cdgrade.py --run $H/A_SPDP_g0/coefficient.dat --pool results/nvidia/b200/A_SPDP_g0/coefficient.dat \
+    $(for g in 1 2 3 4 5 6 7; do echo --pool $H/A_SPDP_g$g/coefficient.dat; done)
+```
+
+What the runs in `results/` grade as:
+
+| runs | window | Cd against OpenFOAM, counts | band | grade |
+|---|---|---|---|---|
+| SPUMA SPDP, 8 runs on H100 and 1 on B200, pooled | 201-800 | +8.4 +- 5.0 | 12.5 | pass |
+| 16 SPUMA runs on H100 and 2 on B200 (SPDP and fp64), one by one | 201-800 | -12.6 to +27.0, mean +5.3 | 17.8 | 17 pass, 1 fails (+27.0) |
+| SPUMA SPDP with the inlet 1 % and 0.3 % too fast, wrong on purpose | 201-800 | +82.0 and +43.5 | 17.8 | both fail |
+| tt-fluid, Blackhole Galaxy, eight 4-chip runs pooled | 201-799 | -5.7 +- 4.9 | 12.5 | pass |
+| the eight one by one | 201-799 | -21.6 to +10.2 | 17.8 | 7 pass, 1 fails (-21.6, by 3.8) |
+| the build before the fp32 omega floor, seven 4-chip runs pooled | 201-799 | -3.3 +- 4.9 | 12.5 | pass |
+| the seven one by one | 201-799 | -17.8 to +7.0 | 17.8 | 6 pass, 1 fails (-17.8, by 0.03) |
+| that build, Blackhole Galaxy, 2 chips | 201-3499 | -3.1 | 17.8 | pass |
+| that build, QuietBox 2 board A, 2 chips | 201-1899 | -17.0 | 17.8 | pass, by 0.8 |
+| all nine runs of that build pooled | as above | -5.7 +- 4.6 | 12.5 | pass |
+
+One failure in 18 correct runs is what a two-sigma band gives, and so is one in seven that misses by 0.03 counts or
+one in eight that misses by 3.8. The
+two wrong-on-purpose runs show the gate can fail a real solve: with the inlet at 20.2 m/s instead of 20 and the forces
+still normalised with 20, SPUMA reads +82.0 counts (`results/nvidia/h100-wrong-inlet`).
+
+The eight Galaxy runs are tt-fluid's grade of record. They ran at once on eight 4-chip blocks of one Blackhole Galaxy,
+each from the potentialFoam start with the velocity scaled by 1 +- k x 1e-7 (k = 0 to 4), so they are eight draws of one
+fp32 program (`results/tenstorrent/galaxy-blackhole/runs.status` has chips, commit, clock and final state of every
+run). Their means spread as the rule predicts (3.4 counts on the pooled mean against 3.1), and the pool reads
+-5.7 +- 4.9 against the 12.5 bar.
+
+The build before it floored omega at 1e-15 in fp32 ([below](#a-known-behaviour-of-the-case)). Seven of the same eight
+starts ran on it, the eighth went NaN, and they read -3.3 +- 4.9: the two pools differ by 2.4 counts, well inside
+their noise, so the floor does not move the drag. The two 2-chip runs are that earlier build on other partitions.
+Taken alone, iterations 201-800 of the QuietBox 2 run read -22.8, outside the band for one run; pooled with the other
+eight of that build the nine read -5.7 +- 4.6.
+
+```bash
+G=results/tenstorrent/galaxy-blackhole; Q=results/tenstorrent/quietbox2-p300x4
+python3 bench/cdgrade.py --run $G/glx3_2_0-1-4-5.hist.json:0 $(for f in $G/glx3_2_[1-9]*.hist.json; do echo --pool $f:0; done)
+# the build before the fp32 omega floor: its seven Galaxy runs, then all nine
+python3 bench/cdgrade.py --run $G/d_l0_b0.hist.json:0 $(for f in $G/glx1_*.hist.json; do echo --pool $f:0; done)
+python3 bench/cdgrade.py --run $G/d_l0_b0.hist.json:0 $(for f in $G/glx1_*.hist.json; do echo --pool $f:0; done) \
+    --pool $(for i in 1 2 3 4 5 6 7; do echo $G/hC_$i.hist.json:$(((i - 1) * 500)); done) \
+    --pool $Q/qb2k2_D1A.hist.json:0 $Q/qb2k2_D2A.hist.json:800
+```
+
+The QuietBox 2 runs behind the cost table (`vq3_A`, `vq3_B`) ran a later build with three performance changes (gather
+order, a gather tile cache and fused SpMV row products). Each change was accepted only if the final state after 800
+iterations stayed bitwise equal, so the cost runs follow the board A history above; `vq3.status` records the bitwise
+comparison of both boards' final states against two earlier builds.
 
 ### A known behaviour of the case
 
-On long runs (about 2,200 iterations) HPC_motorbike Small can produce a NaN on the device. The same discretisation in fp64
-on the host floors omega in the same cell and fails the same way, so it belongs to the model and mesh, not to fp32 or
-the device. tt-fluid stops a run one iteration after any field becomes non-finite.
+HPC_motorbike Small has gone NaN on the device in two cases: after about 2,200 iterations on a 1x2 block, and in
+iteration 337 of one of nine start states on a 2x2 block. Device states around both events and a host replay of the
+first show the chain. The explicit non-orthogonal correction of omega's laplacian pulls a pocket of cells below zero.
+`bound()` gives a cell whose face neighbours are all negative exactly the floor `omegaMin`. The cross-diffusion source
+divides by omega, so one iteration later that cell is near 1e18 when the floor is 1e-15 (8.0e17 and 3.7e18 in the two
+events). In the next omega solve PBiCGStab's dot product `r0 . r` leaves the fp32 range and the fields are NaN from
+there on; the same solve carried out in double precision stays finite.
+
+The floor was OpenFOAM's double-precision `SMALL` in single-precision arithmetic. OpenFOAM's single-precision `SMALL`
+is 1e-6 (ESI `floatScalarSMALL`), and tt-fluid now floors omega there when it computes in fp32 (1e-15 in fp64;
+`omegaMin` and `kMin` in the RAS dictionary override the defaults). With that floor the start that went NaN in
+iteration 337 runs all 800 iterations, like the seven beside it (the eight runs above). A run whose residuals still
+become non-finite ends in that iteration: the device program leaves its outer loop, and `run_mesh` prints `DIVERGED`
+with the iteration, saves the state and exits with code 4. On a Blackhole 2x2 block a Small run started with one NaN
+cell stopped after its first iteration, 1.5 s of device time. `tests/test_diverge.py` reproduces the chain on
+pitzDaily, from the pocket to the NaN.
 
 ## 4. Drag and lift against OpenFOAM (occDrivAer, coarse mesh)
 
@@ -149,18 +248,20 @@ One-sigma errors are 4 to 11 counts per 1000-iteration window and about 5 counts
 OpenFOAM against itself moves as much as the device does, with the same onset after iteration 2000: restarting on 8
 ranks is enough to put the flow on a different trajectory. Against the 8-rank OpenFOAM run with the case's solvers the
 device is within 1 count in every window (-0.3, +0.9, +1.0; +0.5 over 1001-3999), and within 2.0 counts of the run with
-device-like solvers over 1001-3999. So on this case the 3-count target of section 3 is below what OpenFOAM reproduces
-between two of its own runs; the device's Cd sits inside that spread. Lift agrees within its noise (+5.5 +- 14.9
-counts against serial).
+device-like solvers over 1001-3999. Two OpenFOAM runs of this case differ by 15 counts, so nothing below that can be
+asked of the device; its Cd sits inside that spread. Lift agrees within its noise (+5.5 +- 15.8 counts against serial).
 
 Reproduce:
 
 ```bash
 T=results/tenstorrent/occdrivaer-coarse; O=results/openfoam/occdrivaer-coarse
 for ref in serial p8 p8dev; do
-  python3 bench/nvidia/cdwindow.py --dev $T/dev.hist.json:0 --of $O/$ref.dat --from 1001 --to 3999
+  python3 bench/cdgrade.py --means --run $T/dev.hist.json:0 --ref $O/$ref.dat --from 1001 --to 3999
 done
 ```
+
+`--means` prints the window means of both runs with their batch errors and no grade: the band of section 3 is measured
+on the motorbike and does not carry over to another case.
 
 The device run was split into checkpointed segments on two chips; a second chip run with different segment lengths
 is bitwise identical to it through iteration 3199, so restarts are exact.
