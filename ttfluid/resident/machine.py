@@ -1618,6 +1618,7 @@ class Machine:
     def _split_gathers(self, min_per_core=24):
         cells = self.prog.cells.name
         self.base = {}
+        nloc = nshift = 0                     # the cells' entries read from cells of the same core; those at a shift
         for mid, t in enumerate(self.maps.tab):
             dsp, parts = self.maps.maps[mid]
             best, cover, ncov = None, None, len(t["zc"])
@@ -1625,6 +1626,7 @@ class Machine:
                 if ssp.name != cells or dsp.name != cells:
                     continue
                 sel = (t["part"] == k) & (t["kind"] == 0)
+                nloc += int(sel.sum())
                 d = t["idx"] - t["lane"]
                 vals, cnt = np.unique(d[sel & (d % 4 == 0)], return_counts=True)
                 if len(cnt) and cnt.max() > ncov:
@@ -1634,6 +1636,9 @@ class Machine:
                 continue
             self.base[mid] = best             # None: zero fill
             self.maps.tab[mid] = Maps.drop(t, cover)
+            nshift += ncov if best is not None else 0
+        self._log("gather split: %d of %d local cell entries of %d maps are at their map's lane shift (%.1f %%), loaded and not gathered; shifts %s" % (
+            nshift, nloc, len(self.maps.tab), 100 * nshift / max(nloc, 1), sorted({b[1] for b in self.base.values() if b is not None})))
         out = []
         for ins in self.mir:
             if ins[0] == "gather" and ins[2] in self.base:
