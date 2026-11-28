@@ -160,3 +160,31 @@ class Cache:
         view = memoryview(mm) if mm is not None else memoryview(b"")
         with open(d / "value.pkl", "rb") as f:
             return pickle.load(f, buffers=[view[o:o + n] for o, n in index])
+
+
+class Sizes:
+    """What a lowering line came to, kept beside the stages: CB bytes a core, the image's bytes on disk, peak resident
+    GB. A line that was lowered (or run with --preflight) once is refused in its first seconds from then on when it
+    cannot end well: CB bytes over --l1-bytes, the image against the disk floor, the peak against the memory the host
+    has. `line` keys the exact line, `trace` the case and the cores: a new line of a known case still has a peak."""
+
+    def __init__(self, cache, line, trace):
+        self.f = cache.root / ("sizes-%s.json" % cache.key("sizes", line)[0])
+        self.g = cache.root / ("peak-%s.json" % cache.key("peak", trace)[0])
+
+    def known(self):
+        rec = json.loads(self.f.read_text()) if self.f.exists() else {}
+        if "peak_gb" not in rec and self.g.exists():
+            rec["peak_gb"] = json.loads(self.g.read_text())["peak_gb"]
+        return rec
+
+    def note(self, **rec):
+        for f, r in ((self.f, rec), (self.g, dict(peak_gb=rec["peak_gb"]))):   # the case's peak is its latest: a lowering that needs less lowers it
+            tmp = f.with_suffix(".%d" % os.getpid())
+            tmp.write_text(json.dumps(r))
+            os.replace(tmp, f)
+
+
+def mem_available_gb():
+    with open("/proc/meminfo") as f:
+        return next(int(x.split()[1]) for x in f if x.startswith("MemAvailable")) / (1 << 20)

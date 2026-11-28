@@ -155,21 +155,24 @@ ap.add_argument("--min-free-gb", type=int, default=200, help="refuse an --images
 ap.add_argument("--cache", help="CPU lowering: directory of the staged cache (ttfluid/lower/cache.py). A stage whose flags, input files and "
                 "source did not change is read from it instead of rebuilt; the images are byte-equal to an uncached lowering's")
 ap.add_argument("--cache-omit", default="", help=argparse.SUPPRESS)   # tests only: key inputs left out, to show the digest gate fails
+ap.add_argument("--preflight", action="store_true", help="CPU lowering: lower, check every refusal a lowering can end on (CB bytes against "
+                "--l1-bytes, the image against --min-free-gb, peak resident memory) and exit before anything is written: 0 when the line "
+                "would lower. With --cache the sizes are kept and the same line is then refused in its first seconds")
 ap.add_argument("--stages", help="CPU lowering: seconds and peak resident GB of every lowering stage as JSON lines in this file "
                 "(ttfluid/lower/stages.py)")
 a = ap.parse_args()
 if a.tsort is None and not a.from_images:
     a.tsort = int(a.tabstream)
+from ttfluid.lower.image import check_free  # noqa: E402
 for out in (a.images, a.save, a.mcache and not Path(a.mcache).exists() and a.mcache):
     if out:   # fail before a lowering that can take an hour, not after it
-        from ttfluid.lower.image import check_free
         check_free(out, 0, a.min_free_gb)
 R, C = map(int, a.mesh.split(","))
 assert min(R, C) == 1 or a.block2d or a.plan or a.emuonly, "2D mesh %dx%d needs --block2d (chips must be a physical block)" % (R, C)
 GRID, l1_default, NCB, DA = ARCH[a.arch]
 a.l1_bytes = a.l1_bytes or l1_default
 K, P = R * C, GRID[0] * GRID[1]
-assert not a.cores or a.plan or a.emuonly or a.solve_census or a.images, "--cores: a CPU lowering only (the device grid is --arch's)"
+assert not a.cores or a.plan or a.emuonly or a.solve_census or a.images or a.preflight, "--cores: a CPU lowering only (the device grid is --arch's)"
 P = a.cores or P
 PP = -(-P // 4) * 4   # one chip's partials padded to 16 B (vm_brisc.cpp PP): P = 110 on BH, 72 on WH (unchanged)
 import ttfluid.resident.encode  # noqa: E402
@@ -311,6 +314,24 @@ else:
                                                         "ttfluid.resident.sa", "ttfluid.resident.amg", "ttfluid.resident.synth"]),
                            rcb=a.amg and lcache.source_digest(["ttfluid.resident.machine"]))   # --amg aggregates on the cores' partition
             CACHE = lcache.Cache(a.cache, a.min_free_gb, omit=a.cache_omit.split(","))
+            # the sizes this exact line came to before: a refusal that took the whole lowering to reach is raised here instead
+            NOT_SIZES = ("images", "save", "mcache", "stages", "cache", "cache_omit", "min_free_gb", "preflight") + (() if a.l1 == "auto" else ("l1_bytes",))
+            SIZES = lcache.Sizes(CACHE, dict(trace=key, flags={k: v for k, v in vars(a).items() if k not in NOT_SIZES},
+                                             source=lcache.source_digest(["ttfluid", "ttfluid.resident", "ttfluid.lower", "ttfluid.device"])),
+                                 dict(case=key["case"], cores=K * P))
+            known = SIZES.known()
+            if known:
+                print("sizes of this line from an earlier lowering:", json.dumps(known), flush=True)
+            if known.get("cb_bytes", 0) > a.l1_bytes and (a.images or a.preflight):
+                raise SystemExit("error: CB bytes %d over --l1-bytes %d (halo %d B): more chips or a smaller case (this line lowered to that before)" % (known["cb_bytes"], a.l1_bytes, known["halo_bytes"]))
+            if known.get("image_bytes") and a.images:
+                check_free(a.images, known["image_bytes"], a.min_free_gb)
+            if known.get("peak_gb", 0) > lcache.mem_available_gb():
+                raise SystemExit("error: this lowering peaks at %.1f GB resident and the host has %.1f GB available" % (known["peak_gb"], lcache.mem_available_gb()))
+            if a.preflight and known.get("image_bytes"):   # every size of this line is known and none refuses
+                check_free(a.images or ".", known["image_bytes"], a.min_free_gb)
+                sys.exit(print("preflight ok: CB bytes %d of %d, image %.2f GB on disk, peak resident %.1f GB (this line lowered to that before, in %d s)" % (
+                    known["cb_bytes"], a.l1_bytes, known["image_bytes"] / 1e9, known["peak_gb"], known["s"]), flush=True))
             if not a.owner:   # the cores' partition is a stage of its own, keyed by the points and faces it cuts: a changed trace keeps it
                 import inspect
                 _rcb, _busy = ttfluid.resident.machine.rcb, []
@@ -440,22 +461,36 @@ else:
                 gw_load={g: (v["gP"], v["gR"], len(v["rec"])) for g, v in gtab.items()},
                 cells_per_chip=[int(np.sum(m.lay.owner[prog.cells.name] // P == k)) for k in range(K)])
     print("plan", json.dumps(info), flush=True)
+    def sizes(image_bytes=None):   # kept beside the cache's stages: the next lowering of this line knows them at its start
+        rec = dict(cb_bytes=int(cb_bytes(E)), halo_bytes=int(E.m.hwords * 4), image_bytes=image_bytes, peak_gb=round(ST.peak_gb(), 1), s=round(time.time() - T_START))
+        if a.cache and not (a.load or a.mcache):
+            SIZES.note(**rec)
+        return rec
+
     if cb_bytes(E) > a.l1_bytes:   # images that cannot fit L1 fail only at launch, after the whole lowering: refuse them here
         msg = "CB bytes %d over --l1-bytes %d (halo %d B): more chips or a smaller case" % (cb_bytes(E), a.l1_bytes, E.m.hwords * 4)
-        if a.images:
+        if a.images or a.preflight:
+            sizes()
             raise SystemExit("error: " + msg)
         print("warning: " + msg, flush=True)
-    if a.images:
-        from ttfluid.lower.image import Image
+    if a.images or a.preflight:
+        from ttfluid.lower.image import Image, check_free
         t1 = time.time()
         with ST("image"):
             img = Image.from_lowering(m, E, tab, gtab, info, K, P, LOWER)
+            used = img.used()
+        if a.preflight:
+            rec = sizes(Image.disk_bytes(used))
+            check_free(a.images or ".", rec["image_bytes"], a.min_free_gb)
+            sys.exit(print("preflight ok: CB bytes %d of %d, image %.2f GB on disk, peak resident %.1f GB, %d s" % (
+                rec["cb_bytes"], a.l1_bytes, rec["image_bytes"] / 1e9, rec["peak_gb"], rec["s"]), flush=True))
         with ST("write"):
-            img.write(a.images, a.min_free_gb)
+            img.write(a.images, a.min_free_gb, used)
         with ST("digest"):
             dig = {k: img.digest(k) for k in range(K)}
         Path(a.images, "digests.json").write_text(json.dumps(dig, indent=1))
         print("images %s written in %.1f s, digests %s" % (a.images, time.time() - t1, json.dumps(dig)), flush=True)
+        sizes(Image.disk_bytes(used))
         sys.exit(0)
 
 

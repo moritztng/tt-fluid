@@ -90,6 +90,11 @@ to a fixed value. The case read, the traced program and the partition are kept i
 depend on has changed. The images are byte for byte the ones an uncached lowering writes. `--stages FILE` records the
 seconds and peak memory of every stage of the lowering.
 
+A lowering can be refused at its very end: the per-core buffers do not fit `--l1-bytes`, or the image does not fit the
+disk. `--preflight` runs the lowering up to that point, writes nothing and exits 0 when the line would lower. With
+`--cache` the sizes a line came to are kept, so a second attempt at a refused line stops in its first seconds, and so
+does a lowering whose peak memory the host no longer has.
+
 The pressure solve is Jacobi-preconditioned CG (`--amg-depth 0` builds no coarse level). On Blackhole that is faster
 than an aggregation V-cycle: it needs about six times as many iterations, but each costs a twentieth.
 

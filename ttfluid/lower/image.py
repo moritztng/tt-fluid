@@ -117,15 +117,23 @@ class Image:
             _save_sparse(f, arr, used and used[k, name])
 
     # ---- files ---------------------------------------------------------------------------------------------------
-    def write(self, d, floor_gb=0):
-        """One pass finds every array's non-zero pages (the disk check needs their count), the write stores only those:
-        the files are np.save's byte for byte, with the zero pages as holes (home 97 %, consts 58 % on Small k4)."""
+    def used(self):
+        """Every chip array's non-zero 4-KB blocks, found once: the disk check counts them and the write stores only those."""
         K = self.s["K"]
         with ThreadPoolExecutor(min(K, 8)) as ex:
-            used = dict(kv for kvs in ex.map(lambda k: [((k, n), _used_pages(v)) for n, v in self.chip(k).items()], range(K)) for kv in kvs)
-            check_free(d, sum(1 + int(u.sum()) for u in used.values()) * PAGE, floor_gb)
-            self.write_shared(d)
-            list(ex.map(lambda k: self.write_chip(d, k, used), range(K)))
+            return dict(kv for kvs in ex.map(lambda k: [((k, n), _used_pages(v)) for n, v in self.chip(k).items()], range(K)) for kv in kvs)
+
+    @staticmethod
+    def disk_bytes(used):
+        return sum(1 + int(u.sum()) for u in used.values()) * PAGE
+
+    def write(self, d, floor_gb=0, used=None):
+        """The files are np.save's byte for byte, with the zero pages as holes (home 97 %, consts 58 % on Small k4)."""
+        used = self.used() if used is None else used
+        check_free(d, self.disk_bytes(used), floor_gb)
+        self.write_shared(d)
+        with ThreadPoolExecutor(min(self.s["K"], 8)) as ex:
+            list(ex.map(lambda k: self.write_chip(d, k, used), range(self.s["K"])))
 
     @classmethod
     def load(cls, d):

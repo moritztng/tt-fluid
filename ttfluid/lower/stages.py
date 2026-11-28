@@ -37,6 +37,7 @@ def _reset_peak():
 class Stages:
     def __init__(self, path=None, log=print):
         self.path, self.log, self.t0, self.open = path, log, time.time(), []   # open: [name, start, peak so far] per running stage
+        self.seen = 0   # the process's peak before the last reset
         if path:
             open(path, "w").close()
 
@@ -47,6 +48,7 @@ class Stages:
             return
         for s in self.open:   # the reset below forgets the peak the parents have seen so far
             s[2] = max(s[2], _status("VmHWM"))
+        self.seen = max(self.seen, _status("VmHWM"))
         _reset_peak()
         me = [name, time.time(), 0]
         self.open.append(me)
@@ -62,6 +64,10 @@ class Stages:
             self.log("[stage] %-34s %8.1f s  rss %6.2f GB  peak %6.2f GB" % (row["stage"], row["s"], row["rss_gb"], row["peak_gb"]), flush=True)
             for s in self.open:
                 s[2] = max(s[2], peak)
+
+    def peak_gb(self):
+        """Peak resident GB of the process so far (the per-stage resets do not lose it)."""
+        return max(self.seen, _status("VmHWM")) / GB
 
     def methods(self, cls, names):
         """Time the methods (or a module's functions) `names` as stages Class.name, nested under the stage that calls them."""

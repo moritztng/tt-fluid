@@ -9,6 +9,9 @@ All notable changes to this project are documented here. The format follows
 - `run_mesh --cache DIR`: a lowering reads the case, the traced program and the partition back from DIR when their
   flags, input files and source did not change. Images are byte-equal to an uncached lowering's.
 - `run_mesh --stages FILE`: seconds and peak memory of every lowering stage.
+- `run_mesh --preflight`: lowers without writing and checks what a lowering can be refused for at its end: CB bytes
+  against `--l1-bytes`, the image against `--min-free-gb`, peak memory. With `--cache` the sizes of a line are kept and
+  the same line is refused, or accepted, in its first seconds from then on.
 
 ### Changed
 - Image files are written sparse in one pass and digested without a copy; the bytes are unchanged.

@@ -63,3 +63,29 @@ def test_sparse_write_is_np_save(tmp_path):
         _save_sparse(tmp_path / "b.npy", a)
         assert (tmp_path / "a.npy").read_bytes() == (tmp_path / "b.npy").read_bytes()
     assert (tmp_path / "b.npy").stat().st_blocks * 512 < arrays[-1].nbytes / 2   # four rows in five are holes
+
+
+def preflight(*extra):
+    r = subprocess.run([sys.executable, "-m", "ttfluid.device.run_mesh", "case", "50", *FLAGS, "--case", str(ROOT / "cases" / "pitzDaily"),
+                        "--preflight", *map(str, extra)], cwd=ROOT, env=dict(os.environ, PYTHONHASHSEED="0"), capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+
+
+def test_preflight_refuses_before_the_image(tmp_path):
+    """--preflight ends on the refusals a lowering would end on and writes nothing; with --cache the second refusal of a
+    line comes from its kept sizes, before the lowering; an accepted line then lowers to the uncached image."""
+    c, d = tmp_path / "cache", tmp_path / "img"
+    rc, out = preflight("--images", d)
+    assert rc == 0 and "preflight ok: CB bytes" in out and not d.exists(), out[-2000:]
+    cb = int(out.split("preflight ok: CB bytes ")[1].split()[0])
+    rc, out = preflight("--cache", c, "--l1-bytes", cb - 1)
+    assert rc != 0 and "CB bytes %d over --l1-bytes %d" % (cb, cb - 1) in out and "lowered to that before" not in out, out[-2000:]
+    rc, out = preflight("--cache", c, "--l1-bytes", cb - 1)
+    assert rc != 0 and "lowered to that before" in out and "[t" not in out.split("sizes of this line")[1], out[-2000:]
+    rc, out = preflight("--cache", c, "--l1-bytes", cb)
+    assert rc == 0 and "preflight ok: CB bytes %d of %d" % (cb, cb) in out, out[-2000:]
+    rc, out = preflight("--cache", c, "--min-free-gb", 10 ** 6)   # no disk has a million GB free
+    assert rc != 0 and "refusing to write" in out, out[-2000:]
+    rc, out = preflight("--cache", c, "--l1-bytes", cb)
+    assert rc == 0 and "lowered to that before" in out, out[-2000:]
+    assert lower(tmp_path / "a", "--cache", c, "--l1-bytes", cb)[0] == lower(tmp_path / "b", "--l1-bytes", cb)[0]
