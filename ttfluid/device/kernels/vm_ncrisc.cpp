@@ -580,6 +580,7 @@ void kernel_main() {
     }
 #else
 #define PSUB(i, x) x
+#define NSTATE(s)
 #endif
 #ifdef CFD_TRACE
     volatile tt_l1_ptr uint32_t* tr_ = hdr + 1024 + 4 * (2 * CFD_TRACE + 2);
