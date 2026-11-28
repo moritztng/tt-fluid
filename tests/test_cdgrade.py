@@ -79,6 +79,9 @@ def test_runs_of_one_arithmetic_pool_into_one_grade(monkeypatch, capsys):
     q = cdgrade.pooled([cdgrade.grade(cdgrade.series([f]), REF) for f in spdp])
     assert q["its"] == 4800 and q["Cd"]["band"] == cdgrade.BAND and q["grade"] == "PASS" and q["record"]
     assert abs(q["Cd"]["model"] - 20 / (48 - 7) ** 0.5) < 0.01 and q["Cd"]["sigma"] >= (q["Cd"]["model"] ** 2 + 3.5 ** 2) ** 0.5 - 0.05
+    for error in (1.01, 0.99):   # the same eight runs with a 1 % force error must fail as a pool, in both directions
+        wrong = [{i: (cd * error, cl) for i, (cd, cl) in cdgrade.series([f]).items()} for f in spdp]
+        assert cdgrade.pooled([cdgrade.grade(w, REF) for w in wrong])["grade"] == "FAIL"
     two = [cdgrade.grade(cdgrade.series([f]), REF) for f in spdp[:2]]
     two[1]["Cd"]["diff"] = two[0]["Cd"]["diff"] + 40   # two runs that disagree: a wide band and a screen, not a record
     q = cdgrade.pooled(two)
