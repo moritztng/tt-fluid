@@ -35,6 +35,9 @@ constexpr uint32_t SS = 16, SM = 0xfff;
 #if defined(CFD_DENSE) && (!defined(CFD_TABSTREAM) || defined(CFD_WIDE) || defined(CFD_DEFER) || defined(CFD_TRID))
 #error "CFD_DENSE: streamed 16-bit tables, the plain ring (no CFD_DEFER, no CFD_TRID)"
 #endif
+#if defined(CFD_RUNCOPY) && !defined(CFD_DENSE)
+#error "CFD_RUNCOPY requires CFD_DENSE"
+#endif
 
 #if defined(CFD_OS) && CFD_OS >= 2   // run_mesh --os 2: the reader built for size too (see vm_brisc.cpp)
 #pragma GCC optimize("Os")
@@ -366,6 +369,35 @@ void kernel_main() {
         for (; e < n; ++e) out[e] = src[ix[e]];
         asm volatile("" ::: "memory");
     };
+#ifdef CFD_RUNCOPY
+    // run-copy tile (tabstream.py encode_runcopy): cmd words are COPY-RUN (bit 31: len=(w>>16)&0x7fff, s=w&0xffff ->
+    // 8x-unrolled word copy) or LITERAL-GATHER (bit 31 clear: len=w followed by (len+1)>>1 packed uint16 index words)
+    auto gather_run = [&](const uint32_t* src, const uint32_t* cmd, uint32_t nd, uint32_t* out) {
+        uint32_t* const end = out + nd;
+        while (out < end) {
+            const uint32_t w = *cmd++;
+            if (w >> 31) {
+                const uint32_t len = (w >> 16) & 0x7fffu;
+                const uint32_t* p = src + (w & 0xffffu);
+                uint32_t e = 0;
+                for (; e + 8 <= len; e += 8) {
+                    const uint32_t v0 = p[e], v1 = p[e + 1], v2 = p[e + 2], v3 = p[e + 3];
+                    const uint32_t v4 = p[e + 4], v5 = p[e + 5], v6 = p[e + 6], v7 = p[e + 7];
+                    out[e] = v0, out[e + 1] = v1, out[e + 2] = v2, out[e + 3] = v3;
+                    out[e + 4] = v4, out[e + 5] = v5, out[e + 6] = v6, out[e + 7] = v7;
+                }
+                for (; e < len; ++e) out[e] = p[e];
+                out += len;
+            } else {
+                const uint32_t len = w;
+                gather16(src, reinterpret_cast<const uint16_t*>(cmd), len, out);
+                out += len;
+                cmd += (len + 1) >> 1;
+            }
+        }
+        asm volatile("" ::: "memory");
+    };
+#endif
 #endif
 #ifdef CFD_HRUN
     // hrun: a halo entry with bit 15 set heads a run (its length in the next word) that agrees with its destination
@@ -694,43 +726,94 @@ void kernel_main() {
 #ifdef CFD_DENSE
                         if (dn) {
                             // dense twin (tabstream.py): section 0 is this tile's 1,024 source lanes as uint16 in lane
-                            // order, so every lane is gathered once with a sequential store. The lanes are split over
-                            // this core, UNPACK and BRISC as --bgts/--tgts split entries; halo values and zero lanes
-                            // go on top once both have answered (their lanes got a dense value first)
+                            // order (sn[0] == 512) or a run-copy command stream (CFD_RUNCOPY, sn[0] < 512). Halo and
+                            // zero lanes go on top once both helper threads have answered.
                             const uint32_t* const gs = A + parts[0] * 1024;
-                            const uint16_t* const ix = reinterpret_cast<const uint16_t*>(sp[0]);
                             uint32_t* const o = dst + 1024 * t;
-                            uint32_t lo = 1024;
-#ifdef CFD_BGTS
-                            lo = 1024 * CFD_BGTS / 8;
-                            S[M_JOB] = reinterpret_cast<uint32_t>(gs);
-                            S[M_JOB + 1] = reinterpret_cast<uint32_t>(ix + lo);
-                            S[M_JOB + 2] = (1024 - lo) | 1u << 31;
-                            S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + lo);
-                            S[M_N] = 1;
-                            asm volatile("" ::: "memory");
-                            S[M_SEQ] = ++bseq;
-#endif
-#ifdef CFD_TGTS
-                            const uint32_t dq = 1024 * CFD_TGTS / 8 < lo ? 1024 * CFD_TGTS / 8 : 0;
-                            if (dq) {
-                                lo -= dq;
+#ifdef CFD_RUNCOPY
+                            if (sn[0] < 512) {
+                                const uint32_t* const rc = sp[0];
+#if defined(CFD_BGTS) && defined(CFD_TGTS)
+                                const uint32_t c1 = rc[0] & 0xffffu, c1_off = rc[0] >> 16;
+                                const uint32_t c2 = rc[1] & 0xffffu, c2_off = rc[1] >> 16;
+                                S[M_JOB] = reinterpret_cast<uint32_t>(gs);
+                                S[M_JOB + 1] = reinterpret_cast<uint32_t>(rc + c2_off);
+                                S[M_JOB + 2] = (1024 - c2) | 1u << 30;
+                                S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + c2);
+                                S[M_N] = 1;
+                                asm volatile("" ::: "memory");
+                                S[M_SEQ] = ++bseq;
                                 S[T_JOB] = reinterpret_cast<uint32_t>(gs);
-                                S[T_JOB + 1] = reinterpret_cast<uint32_t>(ix + lo);
-                                S[T_JOB + 2] = dq | 1u << 31;
-                                S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + lo);
+                                S[T_JOB + 1] = reinterpret_cast<uint32_t>(rc + c1_off);
+                                S[T_JOB + 2] = (c2 - c1) | 1u << 30;
+                                S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + c1);
                                 S[T_N] = 1;
                                 asm volatile("" ::: "memory");
                                 S[T_SEQ] = ++tseq;
-                            }
+                                gather_run(gs, rc + 3, c1, o);
+                                if (!WAIT_UNTIL(S[M_DONE] == bseq, 21)) { run = false; break; }
+                                if (!WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
+#elif defined(CFD_BGTS)
+                                const uint32_t m2 = rc[2] & 0xffffu, m2_off = rc[2] >> 16;
+                                S[M_JOB] = reinterpret_cast<uint32_t>(gs);
+                                S[M_JOB + 1] = reinterpret_cast<uint32_t>(rc + m2_off);
+                                S[M_JOB + 2] = (1024 - m2) | 1u << 30;
+                                S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + m2);
+                                S[M_N] = 1;
+                                asm volatile("" ::: "memory");
+                                S[M_SEQ] = ++bseq;
+                                gather_run(gs, rc + 3, m2, o);
+                                if (!WAIT_UNTIL(S[M_DONE] == bseq, 21)) { run = false; break; }
+#elif defined(CFD_TGTS)
+                                const uint32_t m2 = rc[2] & 0xffffu, m2_off = rc[2] >> 16;
+                                S[T_JOB] = reinterpret_cast<uint32_t>(gs);
+                                S[T_JOB + 1] = reinterpret_cast<uint32_t>(rc + m2_off);
+                                S[T_JOB + 2] = (1024 - m2) | 1u << 30;
+                                S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + m2);
+                                S[T_N] = 1;
+                                asm volatile("" ::: "memory");
+                                S[T_SEQ] = ++tseq;
+                                gather_run(gs, rc + 3, m2, o);
+                                if (!WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
+#else
+                                gather_run(gs, rc + 3, 1024, o);
 #endif
-                            gather16(gs, ix, lo, o);
+                            } else
+#endif
+                            {
+                                const uint16_t* const ix = reinterpret_cast<const uint16_t*>(sp[0]);
+                                uint32_t lo = 1024;
 #ifdef CFD_BGTS
-                            if (!WAIT_UNTIL(S[M_DONE] == bseq, 21)) { run = false; break; }
+                                lo = 1024 * CFD_BGTS / 8;
+                                S[M_JOB] = reinterpret_cast<uint32_t>(gs);
+                                S[M_JOB + 1] = reinterpret_cast<uint32_t>(ix + lo);
+                                S[M_JOB + 2] = (1024 - lo) | 1u << 31;
+                                S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + lo);
+                                S[M_N] = 1;
+                                asm volatile("" ::: "memory");
+                                S[M_SEQ] = ++bseq;
 #endif
 #ifdef CFD_TGTS
-                            if (dq && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
+                                const uint32_t dq = 1024 * CFD_TGTS / 8 < lo ? 1024 * CFD_TGTS / 8 : 0;
+                                if (dq) {
+                                    lo -= dq;
+                                    S[T_JOB] = reinterpret_cast<uint32_t>(gs);
+                                    S[T_JOB + 1] = reinterpret_cast<uint32_t>(ix + lo);
+                                    S[T_JOB + 2] = dq | 1u << 31;
+                                    S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + lo);
+                                    S[T_N] = 1;
+                                    asm volatile("" ::: "memory");
+                                    S[T_SEQ] = ++tseq;
+                                }
 #endif
+                                gather16(gs, ix, lo, o);
+#ifdef CFD_BGTS
+                                if (!WAIT_UNTIL(S[M_DONE] == bseq, 21)) { run = false; break; }
+#endif
+#ifdef CFD_TGTS
+                                if (dq && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
+#endif
+                            }
                             scatter(hbuf(parts[1]), sp[1], sn[1], dt);
                             for (uint32_t e = 0; e < sn[2]; ++e) dt[sp[2][e]] = 0;
                         } else
@@ -1074,14 +1157,28 @@ void kernel_main() {
                             // bsvc); this core does the rest, then waits for its DONE before the page is pushed
                             uint32_t nj = 0, nkeep[8];
 #ifdef CFD_DENSE
-                            if (dn) {   // BRISC gathers the upper (8 - CFD_BPATCH) / 8 of the tile's lanes (bit 31: dense)
-                                dkeep = 1024 * CFD_BPATCH / 8;
+                            if (dn) {   // BRISC gathers the upper share of the tile's lanes (bit 31: dense, bit 30: run-copy)
                                 nkeep[0] = 0;   // (unused on a dense tile)
-                                S[M_JOB] = reinterpret_cast<uint32_t>(A + N[p + 2] * 1024);
-                                S[M_JOB + 1] = reinterpret_cast<uint32_t>(reinterpret_cast<const uint16_t*>(sp[0]) + dkeep);
-                                S[M_JOB + 2] = (1024 - dkeep) | 1u << 31;
-                                S[M_JOB + 3] = reinterpret_cast<uint32_t>(pd + dkeep);
-                                nj = 1;
+#ifdef CFD_RUNCOPY
+                                if (sn[0] < 512) {
+                                    const uint32_t* const rc = sp[0];
+                                    const uint32_t m2 = rc[2] & 0xffffu, m2_off = rc[2] >> 16;
+                                    dkeep = m2;
+                                    S[M_JOB] = reinterpret_cast<uint32_t>(A + N[p + 2] * 1024);
+                                    S[M_JOB + 1] = reinterpret_cast<uint32_t>(rc + m2_off);
+                                    S[M_JOB + 2] = (1024 - m2) | 1u << 30;
+                                    S[M_JOB + 3] = reinterpret_cast<uint32_t>(pd + m2);
+                                    nj = 1;
+                                } else
+#endif
+                                {
+                                    dkeep = 1024 * CFD_BPATCH / 8;
+                                    S[M_JOB] = reinterpret_cast<uint32_t>(A + N[p + 2] * 1024);
+                                    S[M_JOB + 1] = reinterpret_cast<uint32_t>(reinterpret_cast<const uint16_t*>(sp[0]) + dkeep);
+                                    S[M_JOB + 2] = (1024 - dkeep) | 1u << 31;
+                                    S[M_JOB + 3] = reinterpret_cast<uint32_t>(pd + dkeep);
+                                    nj = 1;
+                                }
                             }
 #endif
                             for (uint32_t k = 0; k < np_ && !dn; ++k) {
@@ -1112,7 +1209,12 @@ void kernel_main() {
 #endif
 #ifdef CFD_DENSE
                                 if (dn) {
-                                    gather16(A + sd * 1024, reinterpret_cast<const uint16_t*>(sp[0]), dkeep, pd);
+#ifdef CFD_RUNCOPY
+                                    if (sn[0] < 512)
+                                        gather_run(A + sd * 1024, sp[0] + 3, dkeep, pd);
+                                    else
+#endif
+                                        gather16(A + sd * 1024, reinterpret_cast<const uint16_t*>(sp[0]), dkeep, pd);
 #ifdef CFD_BPATCH
                                     // BRISC's lanes include halo and zero lanes: those are written after its DONE
                                     if (nj) {

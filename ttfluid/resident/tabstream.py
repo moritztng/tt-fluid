@@ -106,6 +106,115 @@ def dense_index(ent, tm, shift):
     return idx
 
 
+def _enc_seg(seg, rmin):
+    """Encode one contiguous lane segment into (COPY-RUN, LITERAL-GATHER) 32-bit words."""
+    n = len(seg)
+    if n == 0:
+        return [], 0, 0.0
+    cont = np.zeros(n, dtype=bool)
+    cont[1:] = seg[1:] == seg[:-1] + 1
+    starts = np.flatnonzero(~cont)
+    ends = np.r_[starts[1:], n]
+    words = []
+    lit = []
+    run_lanes = 0
+    cost = 0.0
+
+    def flush_lit():
+        nonlocal cost
+        if not lit:
+            return
+        L = len(lit)
+        words.append(L)
+        words.extend(_half(lit))
+        cost += L * 7.47 + 10.0
+        lit.clear()
+
+    for s0, e0 in zip(starts, ends):
+        L = int(e0 - s0)
+        if L >= rmin:
+            flush_lit()
+            words.append((1 << 31) | (L << 16) | int(seg[s0]))
+            run_lanes += L
+            cost += L * 3.82 + 10.0
+        else:
+            lit.extend(seg[s0:e0].tolist())
+    flush_lit()
+    return words, run_lanes, cost
+
+
+def encode_runcopy(tile_idx, tile_dc, max_src, rmin=4, weights=(1, 1, 1), brk=0):
+    """Encode one 1024-lane dense tile as a run-copy stream (< 512 words) with a 3-word thread-split header,
+    or return None to fall back to a plain 512-word dense tile.
+
+    Header words 0..2: c1 | c1_off<<16, c2 | c2_off<<16, m2 | m2_off<<16 for 3-thread ([0,c1), [c1,c2), [c2,1024))
+    and 2-thread ([0,m2), [m2,1024)) balanced splits; 1-thread runs straight through [0,1024) from word 3.
+    Don't-care lanes (overwritten by halo or zero sections) bridge runs while staying within [0, max_src]."""
+    v = tile_idx.copy()
+    if tile_dc.any():
+        for j in range(1, 1024):
+            if tile_dc[j] and v[j - 1] + 1 <= max_src:
+                v[j] = v[j - 1] + 1
+        j = 0
+        while j < 1024 and tile_dc[j]:
+            j += 1
+        if j < 1024:
+            for q in range(j - 1, -1, -1):
+                if v[q + 1] > 0:
+                    v[q] = v[q + 1] - 1
+    cont = np.zeros(1024, dtype=bool)
+    cont[1:] = v[1:] == v[:-1] + 1
+    starts = np.flatnonzero(~cont)
+    ends = np.r_[starts[1:], 1024]
+    cost = np.full(1024, 7.47)
+    is_run = np.zeros(1024, dtype=bool)
+    for s0, e0 in zip(starts, ends):
+        if e0 - s0 >= rmin:
+            cost[s0:e0] = 3.82
+            cost[s0] += 10.0
+            is_run[s0:e0] = True
+    nr = ~is_run
+    lit_s = np.flatnonzero(nr & np.r_[True, ~nr[:-1]])
+    if len(lit_s):
+        cost[lit_s] += 10.0
+    cc = np.cumsum(cost)
+    tot = float(cc[-1])
+    wn, wt, wb = weights
+    ws = float(wn + wt + wb)
+    c1 = int(np.clip(np.searchsorted(cc, tot * wn / ws), 1, 1022))
+    c2 = int(np.clip(np.searchsorted(cc, tot * (wn + wt) / ws), c1 + 1, 1023))
+    m2 = int(np.clip(np.searchsorted(cc, tot * 0.5), c1, c2))
+    w0, r0, k0 = _enc_seg(v[:c1], rmin)
+    w1, r1, k1 = _enc_seg(v[c1:m2], rmin)
+    w2, r2, k2 = _enc_seg(v[m2:c2], rmin)
+    w3, r3, k3 = _enc_seg(v[c2:], rmin)
+    c1_off = 3 + len(w0)
+    m2_off = c1_off + len(w1)
+    c2_off = m2_off + len(w2)
+    words = [c1 | (c1_off << 16), c2 | (c2_off << 16), m2 | (m2_off << 16)] + w0 + w1 + w2 + w3
+    if len(words) >= 512:
+        return None
+    # Per-tile win gate: keep plain DENSE if balanced 3T cost does not beat plain DENSE 384-lane gather16
+    if not brk and max(k0, k1 + k2, k3) >= 384 * 7.47:
+        return None
+    if brk:
+        left = brk
+        p = 3
+        while p < len(words) and left > 0:
+            w = words[p]
+            if w >> 31:
+                s = w & 0xFFFF
+                ns = (s + 1) % max(max_src + 1, 1)
+                if ns == s:
+                    ns = s ^ 1
+                words[p] = (w & 0xFFFF0000) | ns
+                left -= 1
+                p += 1
+            else:
+                p += 1 + ((w + 1) >> 1)
+    return words, r0 + r1 + r2 + r3
+
+
 def bpatch_auto(loc, bpatch_min):
     """--bpatch auto: (K, local residue entries per patched map tile). K is 4 when the lowering counted at least
     `bpatch_min` entries per patched (map, tile), else 0. `loc` is stream()'s pair of sums; None when there are no
@@ -114,15 +223,18 @@ def bpatch_auto(loc, bpatch_min):
     return (4 if lm >= bpatch_min else 0), lm
 
 
-def stream(E, sort=False, dense=None, brk=0):
+def stream(E, sort=False, dense=None, brk=0, run=0, run_weights=(1, 1, 1), run_brk=0):
     """dense: [(map, shift, min local entries a tile)]: twin j is map nm + j, the same entries as its map, stored
     dense on a core when the local residue entries per tile reach the minimum (encode.py points the pages whose
     window and residue come from one L1 vector at the twin). brk: the broken arm of the dense gate: on core 0 the
-    first brk pairs of residue lanes of every dense table read each other's source (the state compare must fail)."""
+    first brk pairs of residue lanes of every dense table read each other's source (the state compare must fail).
+    run: RMIN > 0 encodes qualifying dense tiles (< 512 words, faster than gather16) as run-copy command streams
+    with balanced 2T/3T split headers and halo/zero don't-care bridging (vm_ncrisc/vm_brisc/vm_compute CFD_RUNCOPY)."""
     m = E.m
     dense = list(dense or [])
     assert not (dense and _enc.WIDE), "dense tables index 16-bit lanes"
     ndense = 0
+    nrun_tiles = ntot_dense_tiles = run_words = dense_words = run_lanes = tot_lanes = 0
     P, T, nm = len(E.tab), m.T, len(m.maps.tab)      # E's rows: every core, or the cores of Encoded(cores=)
     nparts = [t["nparts"] for t in m.maps.tab]
     nparts += [nparts[o] for o, _, _ in dense]
@@ -149,13 +261,45 @@ def stream(E, sort=False, dense=None, brk=0):
                 if dn and si == 0:
                     assert nparts[mid] == 1 and kind == "l" and len(np.unique(lanes)) == len(lanes)
                     loc_tile += np.diff(bounds)
-                    H += (len(B) - base + np.arange(tm) * 512).tolist()
                     idx = dense_index(ent, tm, dsh)
                     if brk and i == 0:
                         ln = lanes[:2 * (min(brk, len(lanes) // 2))]
                         idx[ln[0::2]], idx[ln[1::2]] = idx[ln[1::2]].copy(), idx[ln[0::2]].copy()
-                    B += _half(idx)
-                    per_tile += 512
+                    if run:
+                        dc = np.zeros(tm * 1024, dtype=bool)
+                        h_lanes = _lane("h", secs[1][1].astype(np.int64))
+                        z_lanes = _lane("z", secs[2][1].astype(np.int64))
+                        if len(h_lanes):
+                            dc[h_lanes[h_lanes < tm * 1024]] = True
+                        if len(z_lanes):
+                            dc[z_lanes[z_lanes < tm * 1024]] = True
+                        real = ~dc
+                        max_src = int(idx[real].max()) if real.any() else 0
+                        for t in range(tm):
+                            H.append(len(B) - base)
+                            sl_t = slice(t * 1024, (t + 1) * 1024)
+                            enc = encode_runcopy(
+                                idx[sl_t], dc[sl_t], max_src, rmin=run, weights=run_weights,
+                                brk=run_brk if i == 0 else 0,
+                            )
+                            ntot_dense_tiles += 1
+                            tot_lanes += 1024
+                            dense_words += 512
+                            if enc is not None:
+                                w_t, rl_t = enc
+                                B += w_t
+                                per_tile[t] += len(w_t)
+                                nrun_tiles += 1
+                                run_words += len(w_t)
+                                run_lanes += rl_t
+                            else:
+                                B += _half(idx[sl_t])
+                                per_tile[t] += 512
+                                run_words += 512
+                    else:
+                        H += (len(B) - base + np.arange(tm) * 512).tolist()
+                        B += _half(idx)
+                        per_tile += 512
                     ndense += 1
                     continue
                 if sort and kind == "l":
@@ -191,7 +335,9 @@ def stream(E, sort=False, dense=None, brk=0):
     # tests their ratio. Two integers, so the chips of a per-chip lowering add up to the global lowering's pair.
     return dict(sort=sort, dense=dense, ndense=ndense, loc=(int(loc.sum()), len(loc)), l1=l1, blob=blob, halo_off=halo_off, staging_words=staging, nparts=nparts,
                 l1_words=max(len(x) for x in l1), blob_words=max(len(x) for x in blob),
-                today_words=E.tab.shape[1])
+                today_words=E.tab.shape[1],
+                run=run, nrun_tiles=nrun_tiles, ntot_dense_tiles=ntot_dense_tiles,
+                run_words=run_words, dense_words=dense_words, run_lanes=run_lanes, tot_lanes=tot_lanes)
 
 
 def gcensus(E):
@@ -247,11 +393,50 @@ def _walk_stream(L, B, mid, nparts, T):
             else [] for t in range(T)]
 
 
+def _unrun(w):
+    """Exact Python mirror of vm_ncrisc/vm_brisc/vm_compute gather_run: verifies 1T, 2T and 3T splits match."""
+    assert 3 <= len(w) < 512, f"bad run-copy tile length {len(w)}"
+    c1, c1_off = int(w[0] & 0xFFFF), int(w[0] >> 16)
+    c2, c2_off = int(w[1] & 0xFFFF), int(w[1] >> 16)
+    m2, m2_off = int(w[2] & 0xFFFF), int(w[2] >> 16)
+
+    def dec(off, nd, expect_end=None):
+        out = []
+        p = off
+        while len(out) < nd:
+            assert p < len(w), f"run-copy overrun at word {p}/{len(w)} (decoded {len(out)}/{nd})"
+            x = int(w[p])
+            p += 1
+            if x >> 31:
+                L = (x >> 16) & 0x7FFF
+                s = x & 0xFFFF
+                out.extend(range(s, s + L))
+            else:
+                L = x
+                nw = (L + 1) >> 1
+                assert p + nw <= len(w), "literal overrun"
+                for k in range(L):
+                    word = int(w[p + (k >> 1)])
+                    out.append((word >> 16) if (k & 1) else (word & 0xFFFF))
+                p += nw
+        assert len(out) == nd, f"run-copy lane overshoot {len(out)} != {nd}"
+        if expect_end is not None:
+            assert p == expect_end, f"run-copy end offset {p} != {expect_end}"
+        return np.array(out, np.int64)
+
+    d1 = dec(3, 1024, len(w))
+    d2 = np.concatenate([dec(3, m2, m2_off), dec(m2_off, 1024 - m2, len(w))])
+    d3 = np.concatenate([dec(3, c1, c1_off), dec(c1_off, c2 - c1, c2_off), dec(c2_off, 1024 - c2, len(w))])
+    assert (d1 == d2).all() and (d1 == d3).all(), "run-copy 1T/2T/3T split mismatch"
+    return d1
+
+
 def _undense(tile, t, shift):
     """a dense tile as the reader applies it, checked against the residue walk: (lane, source) of every lane"""
     w = np.array([x for k, x in tile if k == "d"], np.int64)
-    assert len(w) == 512
-    return np.stack([w & 0xFFFF, w >> 16], 1).ravel()
+    if len(w) == 512:
+        return np.stack([w & 0xFFFF, w >> 16], 1).ravel(), False
+    return _unrun(w), True
 
 
 def check(E, S, tab=None):
@@ -269,17 +454,44 @@ def check(E, S, tab=None):
             if any(k == "d" for tile in b for k, _ in tile):
                 # a dense map: every lane's index is its residue source, or the window's lane; the rest as stored
                 sh = S["dense"][mid - nm][1]
+                # compute max valid source index across all real lanes of this (core, map) for run-copy bounds check
+                max_src = 0
+                if S.get("run"):
+                    for t, ta in enumerate(a):
+                        if not b[t]:
+                            continue
+                        lane = t * 1024 + np.arange(1024)
+                        want = np.where((lane + sh >= 0) & (lane + sh < 1 << 16), lane + sh, lane)
+                        dc = np.zeros(1024, dtype=bool)
+                        for k, x in ta:
+                            if k == "l":
+                                want[(x >> 16) - t * 1024] = x & 0xFFFF
+                            elif k == "h":
+                                dc[(x >> 16) - t * 1024] = True
+                            elif k == "z":
+                                dc[x - t * 1024] = True
+                        if (~dc).any():
+                            max_src = max(max_src, int(want[~dc].max()))
                 for t, (ta, tb) in enumerate(zip(a, b)):
                     if not tb:
                         assert not ta
                         continue
-                    idx = _undense(tb, t, sh)
+                    idx, is_run = _undense(tb, t, sh)
                     lane = t * 1024 + np.arange(1024)
                     want = np.where((lane + sh >= 0) & (lane + sh < 1 << 16), lane + sh, lane)
+                    dc = np.zeros(1024, dtype=bool)
                     for k, x in ta:
                         if k == "l":
                             want[(x >> 16) - t * 1024] = x & 0xFFFF
-                    assert (idx == want).all(), f"core {i} map {mid} tile {t}: dense index differs"
+                        elif k == "h":
+                            dc[(x >> 16) - t * 1024] = True
+                        elif k == "z":
+                            dc[x - t * 1024] = True
+                    if is_run:
+                        assert (idx[~dc] == want[~dc]).all(), f"core {i} map {mid} tile {t}: dense index differs"
+                        assert ((idx >= 0) & (idx <= max_src)).all(), f"core {i} map {mid} tile {t}: run-copy src out of bounds"
+                    else:
+                        assert (idx == want).all(), f"core {i} map {mid} tile {t}: dense index differs"
                     assert sorted(e for e in ta if e[0] != "l") == sorted(e for e in tb if e[0] != "d"), \
                         f"core {i} map {mid}: streamed walk differs"
                 continue

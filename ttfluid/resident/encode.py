@@ -154,7 +154,7 @@ def hrun_words(lane, idx, rmin=8):
 
 class Encoded:
     def __init__(self, m, page=False, pdev=None, tab_stream=False, look=False, cores=None, tab_sort=False, phase=None,
-                 gtile=False, tab_dense=0, tab_break=0):
+                 gtile=False, tab_dense=0, tab_break=0, tab_run=0, run_weights=(1, 1, 1), tab_run_break=0):
         """page: the compute stream is paged from DRAM through a ring NCRISC fills (vm_ncrisc N_CODE): every basic
         block starts on a PW-word page, the padding is C_JMP (in paged mode JMP and BRT end a block and compute moves
         on to the next delivered page), and NCRISC pushes the pages of a MIR instruction before any of its own ops
@@ -181,6 +181,7 @@ class Encoded:
         self.cores = np.arange(m.P) if cores is None else np.asarray(cores)
         assert not (tab_stream and getattr(m, "hrun", False)), "hrun marks the L1 gather tables"
         assert not (tab_dense and (not tab_stream or WIDE)), "dense index tables: streamed, 16-bit lanes"
+        assert not (tab_run and not tab_dense), "run-copy tables require --tabdense"
         twin = {}    # (map, shift) -> the dense twin's map id (tabstream.py dense), in order of first use
         assert tab_stream or not WIDE, "wide gather entries carry the lane within its tile: only the streamed walk"
         self.loop_pages = 1     # paged: the most code pages the ring holds at once (a tile loop's body, or an N_CODE's
@@ -514,7 +515,8 @@ class Encoded:
         if tab_stream:      # residue tables in DRAM, a tile-offset index in L1 (tabstream.py)
             from .tabstream import stream
             self.tab_cursor, self.tab_halo_cursor = self.tab, self.tab_halo
-            self.tab_stream = S = stream(self, sort=tab_sort, dense=[(o, sh, tab_dense) for o, sh in twin], brk=tab_break)
+            self.tab_stream = S = stream(self, sort=tab_sort, dense=[(o, sh, tab_dense) for o, sh in twin], brk=tab_break,
+                                         run=tab_run, run_weights=run_weights, run_brk=tab_run_break)
             self.tab = _pad(S["l1"])
             self.tab_blob = _pad(S["blob"])
             self.tab_halo = np.array(S["halo_off"], np.uint32)

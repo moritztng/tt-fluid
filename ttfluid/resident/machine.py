@@ -944,13 +944,13 @@ def rcm_rank(owner, faces, P):
     return rank
 
 
-def box_rank(owner, mesh, P):
+def box_rank(owner, mesh, P, per_piece=False):
     """Rank of every cell in the lattice order of its core (lattice.box_order): the hexes of one refinement level in
     index order of the octree lattice. A row neighbour is then the next cell, where rcm_rank only keeps it within a
     few tiles, and under ELL slots by direction (Ell order="dir") a slot's gather is the same lane shift for most
-    cells of a row: an offset load (_split_gathers), not a table entry. One axis runs fastest on every core, the one
-    with the most cells of the mesh in rows of 8 or more, so the two slots along it share one shift for the whole
-    machine (Small k2: 26.7 % of the local entries at their map's shift with y, 24.0 % with an axis per piece).
+    cells of a row: an offset load (_split_gathers), not a table entry. With per_piece=False (--order box) one axis
+    runs fastest on every core so two slots share one shift across the machine; with per_piece=True (--order boxu,
+    unquartered, for --tabrun run-copy) each piece picks its own fastest axis.
     The cells on no lattice (refinement interfaces, the snapped layer) follow in rcm_rank's order."""
     from .lattice import box_order, pieces, rows8
     nI = mesh.nInternalFaces
@@ -977,9 +977,11 @@ def box_rank(owner, mesh, P):
         inside = (oth[e] >= 0) & (owner[oth[e]] == i)
         _, comp, xyz, size, _, _ = pieces(cnt[i], loc[row[e]], np.where(inside, loc[oth[e]], 0), inside, dc[e], fc[c])
         lat.append((c, comp, xyz, size))
-        rows += rows8(comp, xyz, len(size)).sum(0)
+        if not per_piece:
+            rows += rows8(comp, xyz, len(size)).sum(0)
+    fast = None if per_piece else "xyz"[int(rows.argmax())]
     for c, comp, xyz, size in lat:
-        rank[c] = box_order(comp, xyz, size, tie[c], "xyz"[int(rows.argmax())])
+        rank[c] = box_order(comp, xyz, size, tie[c], fast)
     return rank
 
 
@@ -1127,7 +1129,10 @@ class Machine:
             # unit of the unpacker's and the NoC's addresses (Small k2, 220 cores, ttfluid.tools.residcensus: 24.0 % of
             # the local neighbour entries at their map's shift against 1.1 % unquartered and 3.3 % by cell id)
             Q = int(layout[4:]) if layout.startswith("rcbq") else LANES // 4 if order == "box" else 0
-            banded = None if order == "index" else (self.slotL, rcm_rank(own, mesh_faces(mesh), P) if order == "rcm" else box_rank(own, mesh, P))
+            banded = None if order == "index" else (
+                self.slotL,
+                rcm_rank(own, mesh_faces(mesh), P) if order == "rcm" else box_rank(own, mesh, P, per_piece=(order == "boxu")),
+            )
             self.lay = Layout(prog, own, P, sliced_lanes(own, face_counts(mesh), P, Q, banded) if sliced else None, amg_vec=amg_vec, ptiles=ptiles,
                               follow=order != "index")
         self.T = max(self.lay.T, tiles or 1)   # tiles: force more tiles per vector than needed (testing)

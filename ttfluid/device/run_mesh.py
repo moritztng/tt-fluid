@@ -97,6 +97,10 @@ ap.add_argument("--tabdense", type=int, default=0, help="N > 0 with --tabstream:
                 "530 is the measured break-even on BH (6.45 cycles a dense lane against 12.1 a residue entry)")
 ap.add_argument("--tabdense-break", type=int, default=0, help="the broken arm of the --tabdense gate: N pairs of lanes of every dense table of "
                 "core 0 read each other's source, so the state must differ from the control's")
+ap.add_argument("--tabrun", type=int, default=0, help="RMIN > 0 with --tabdense: encode qualifying dense tiles (< 512 words) as run-copy command "
+                "streams with balanced 2T/3T splits and halo/zero don't-care bridging (CFD_RUNCOPY; tabstream.encode_runcopy). Bit-exact.")
+ap.add_argument("--run-weights", default="1,1,1", help="comma-separated 3-thread (NCRISC,UNPACK,BRISC) cost weights for --tabrun (e.g. 1,1,1 or 3,3,2)")
+ap.add_argument("--tabrun-break", type=int, default=0, help="the broken arm of the --tabrun gate: corrupt the first N COPY-RUN commands of core 0")
 ap.add_argument("--tsort", type=int, default=None, help="as run_vm.py: tabstream residue entries sorted by source tile (CFD_TSORT). "
                 "Default on with --tabstream; with --from-images as the images were lowered")
 ap.add_argument("--bpatch", type=int, default=None, help="as run_vm.py: -1 / unset auto (4 when --tabstream and >= --bpatch-min local residue entries per patched map tile), K in 1..7 BRISC scatters (8 - K) / 8 of a patched page's L1 residue (CFD_BPATCH; mailbox in the last 256 B of cb_sync)")
@@ -112,10 +116,10 @@ ap.add_argument("--amg", action="store_true", help="p PCG preconditioned by smoo
 ap.add_argument("--amg-kind", default="sa", choices=["sa"])
 ap.add_argument("--amg-stack", action="store_true", help="as run_vm.py: stacked coarse SpMV")
 ap.add_argument("--amg-vec", action="store_true", help="as run_vm.py: coarse values are vector registers (--l1 auto may home them in DRAM)")
-ap.add_argument("--order", default="index", choices=("index", "rcm", "box"), help="with --sliced: the cells of a core inside each slot class. index: by cell id. "
+ap.add_argument("--order", default="index", choices=("index", "rcm", "box", "boxu"), help="with --sliced: the cells of a core inside each slot class. index: by cell id. "
                 "rcm: reverse Cuthill-McKee on the core's cell graph, so face neighbours are a few tiles apart and a small --gcache holds them. "
-                "box: the hexes of a refinement level in the order of their lattice, with ELL slots by face direction, so a slot's neighbour "
-                "is a constant lane shift for a row of cells and is loaded, not gathered. "
+                "box: the hexes of a refinement level in the order of their lattice (quartered), with ELL slots by face direction. "
+                "boxu: unquartered per-piece lattice order with ELL slots by face direction, for --tabrun run-copy gathers. "
                 "Sums run in another order, so the state is not bitwise the index order's")
 ap.add_argument("--sliced", action="store_true", help="sorted rcb lanes; report what sliced ELL slots would save (machine.slot_extents)")
 ap.add_argument("--lsched", action="store_true", help="reorder straight-line IR runs for fewer live vectors (machine._lsched)")
@@ -238,7 +242,7 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit", "order") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit", "order", "tabrun", "run_weights") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
@@ -308,7 +312,7 @@ else:
         print("machine from %s in %.1f s" % (a.mcache, time.time() - t0), flush=True)
     else:
         s = SimpleFoam(a.case, backend="ell", dtype=np.float32, log=lambda *x: None,
-                       ell_order="dir" if a.layout == "lattice" or a.order == "box" else "face")
+                       ell_order="dir" if a.layout == "lattice" or a.order in ("box", "boxu") else "face")
         core = None
         if a.layout == "rcb" and K > 1:   # chip placement first (seconds): an unplaceable partition used to surface at plan(), an hour in
             import ttfluid.resident.machine
@@ -388,12 +392,20 @@ else:
     ttfluid.resident.encode.WIDE = a.wide or m.T > 64   # over 65,536 lanes a core: 22-bit gather entries (ttfluid/resident/encode.py)
     assert a.tabstream or not ttfluid.resident.encode.WIDE, "T=%d > 64 needs --tabstream" % m.T
     assert not (ttfluid.resident.encode.WIDE and (a.tgts or a.gtile)), "--tgts / --gtile hand over 16-bit gather entries (vm_compute tsvc): not with wide ones"
+    run_w = tuple(float(x) for x in a.run_weights.split(","))
+    assert len(run_w) == 3 and all(w > 0 for w in run_w), "--run-weights: three positive numbers"
     if not a.load:
-        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break)
+        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break, tab_run=a.tabrun, run_weights=run_w, tab_run_break=a.tabrun_break)
         if a.tabdense:
             S_ = E.tab_stream
             print("tabdense %d: %d twin maps, %d of %d (core, twin) tables dense, L1 table %d words, blob %d words a core (staging %d)" % (
                 a.tabdense, len(S_["dense"]), S_["ndense"], len(S_["l1"]) * len(S_["dense"]), S_["l1_words"], S_["blob_words"], S_["staging_words"]), flush=True)
+            if a.tabrun:
+                print("tabrun %d (weights %s): %d of %d dense tiles run-copy (%.1f %%), %.1f %% lanes in runs, %.1f words/tile (vs 512)" % (
+                    a.tabrun, a.run_weights, S_["nrun_tiles"], S_["ntot_dense_tiles"],
+                    100.0 * S_["nrun_tiles"] / max(S_["ntot_dense_tiles"], 1),
+                    100.0 * S_["run_lanes"] / max(S_["tot_lanes"], 1),
+                    S_["run_words"] / max(S_["ntot_dense_tiles"], 1)), flush=True)
             from ttfluid.resident.tabstream import gcensus
             from ttfluid.resident.program import PHASES
             gc_ = gcensus(E)   # which gathers the dense twin reaches, one execution of every op, means over the cores
@@ -408,7 +420,7 @@ else:
             k = max(0, int((a.l1_bytes - (cb_bytes(E) - m.ntiles * 4096)) // 4096 - m.nsmall) // m.T)
             while True:
                 m.place(k, print)
-                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break)
+                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break, tab_run=a.tabrun, run_weights=run_w, tab_run_break=a.tabrun_break)
                 print("l1 auto: %d vector slots in L1, CB bytes %d" % (k, cb_bytes(E)), flush=True)
                 if cb_bytes(E) <= a.l1_bytes or k == 0:
                     break
@@ -710,6 +722,7 @@ def kd(src, ct, cfg, rt=None, crt=None):
         ([("CFD_BPATCH", str(a.bpatch))] if a.bpatch and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_BGTS", str(a.bgts))] if a.bgts and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_DENSE", "1")] if a.tabdense and src in ("vm_ncrisc.cpp", "vm_brisc.cpp", "vm_compute.cpp") else []) + \
+        ([("CFD_RUNCOPY", "1")] if a.tabrun and src in ("vm_ncrisc.cpp", "vm_brisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_TGTS", str(a.tgts))] if a.tgts and src in ("vm_ncrisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_GTILE", "1")] if a.gtile and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_NARROW", str(CB_H))] if a.narrow and src == "vm_compute.cpp" else []) + \

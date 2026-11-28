@@ -79,21 +79,51 @@ void kernel_main() {
             const uint32_t n = sw[T_JOB + 4 * j + 2];
             uint32_t* out = reinterpret_cast<uint32_t*>(sw[T_JOB + 4 * j + 3]);
 #ifdef CFD_DENSE
-            if (n >> 31) {   // lanes of a dense gather tile (vm_ncrisc.cpp N_GATHER): out[e] = src[ix[e]]
-                const uint16_t* ix = reinterpret_cast<const uint16_t*>(xs);
-                const uint32_t nd = n & 0x7fffffffu;
-                uint32_t e = 0;
-                for (; e + 8 <= nd; e += 8) {
-                    const uint32_t i0 = ix[e], i1 = ix[e + 1], i2 = ix[e + 2], i3 = ix[e + 3];
-                    const uint32_t i4 = ix[e + 4], i5 = ix[e + 5], i6 = ix[e + 6], i7 = ix[e + 7];
-                    const uint32_t v0 = src[i0], v1 = src[i1], v2 = src[i2], v3 = src[i3];
-                    const uint32_t v4 = src[i4], v5 = src[i5], v6 = src[i6], v7 = src[i7];
-                    out[e] = v0, out[e + 1] = v1, out[e + 2] = v2, out[e + 3] = v3;
-                    out[e + 4] = v4, out[e + 5] = v5, out[e + 6] = v6, out[e + 7] = v7;
+            auto gather16 = [](const uint32_t* s_, const uint16_t* ix, uint32_t nd, uint32_t* o_) {
+                uint32_t e_ = 0;
+                for (; e_ + 8 <= nd; e_ += 8) {
+                    const uint32_t i0 = ix[e_], i1 = ix[e_ + 1], i2 = ix[e_ + 2], i3 = ix[e_ + 3];
+                    const uint32_t i4 = ix[e_ + 4], i5 = ix[e_ + 5], i6 = ix[e_ + 6], i7 = ix[e_ + 7];
+                    const uint32_t v0 = s_[i0], v1 = s_[i1], v2 = s_[i2], v3 = s_[i3];
+                    const uint32_t v4 = s_[i4], v5 = s_[i5], v6 = s_[i6], v7 = s_[i7];
+                    o_[e_] = v0, o_[e_ + 1] = v1, o_[e_ + 2] = v2, o_[e_ + 3] = v3;
+                    o_[e_ + 4] = v4, o_[e_ + 5] = v5, o_[e_ + 6] = v6, o_[e_ + 7] = v7;
                 }
-                for (; e < nd; ++e) out[e] = src[ix[e]];
+                for (; e_ < nd; ++e_) o_[e_] = s_[ix[e_]];
+            };
+            if (n >> 31) {   // lanes of a dense gather tile (vm_ncrisc.cpp N_GATHER): out[e] = src[ix[e]]
+                gather16(src, reinterpret_cast<const uint16_t*>(xs), n & 0x7fffffffu, out);
                 continue;
             }
+#ifdef CFD_RUNCOPY
+            if (n & (1u << 30)) {   // run-copy tile slice (vm_ncrisc.cpp gather_run)
+                const uint32_t* cmd = xs;
+                uint32_t* o_ = out;
+                uint32_t* const end_ = o_ + (n & 0x3fffffffu);
+                while (o_ < end_) {
+                    const uint32_t w_ = *cmd++;
+                    if (w_ >> 31) {
+                        const uint32_t len = (w_ >> 16) & 0x7fffu;
+                        const uint32_t* p_ = src + (w_ & 0xffffu);
+                        uint32_t e_ = 0;
+                        for (; e_ + 8 <= len; e_ += 8) {
+                            const uint32_t v0 = p_[e_], v1 = p_[e_ + 1], v2 = p_[e_ + 2], v3 = p_[e_ + 3];
+                            const uint32_t v4 = p_[e_ + 4], v5 = p_[e_ + 5], v6 = p_[e_ + 6], v7 = p_[e_ + 7];
+                            o_[e_] = v0, o_[e_ + 1] = v1, o_[e_ + 2] = v2, o_[e_ + 3] = v3;
+                            o_[e_ + 4] = v4, o_[e_ + 5] = v5, o_[e_ + 6] = v6, o_[e_ + 7] = v7;
+                        }
+                        for (; e_ < len; ++e_) o_[e_] = p_[e_];
+                        o_ += len;
+                    } else {
+                        const uint32_t len = w_;
+                        gather16(src, reinterpret_cast<const uint16_t*>(cmd), len, o_);
+                        o_ += len;
+                        cmd += (len + 1) >> 1;
+                    }
+                }
+                continue;
+            }
+#endif
 #endif
             uint32_t e = 0;
             for (; e + 4 <= n; e += 4) {
