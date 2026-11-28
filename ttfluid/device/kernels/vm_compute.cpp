@@ -118,11 +118,12 @@ void kernel_main() {
     // its Tensix pipeline before a load or an acquire (its own queued work), issues it, and drains again: the post of
     // that drain lands when the unpacker (the packer) has let the instruction through, and each poll's cycles go to the
     // state published at that poll: loads to hdr 700 + 2 (16 unpack state + reader class), acquires to 960 + 2 pack
-    // state, own work to 976, the last poll of each kind to 980 + 2 kind (two words each: low, high); counts at 988..990
+    // state, own work to 976, the load's after-drain to 978, the last poll of each kind to 980 + 2 kind and of the load's
+    // poll to 986 (two words each: low, high); counts at 988..990
 #define USTATE(s) UNPACK((hw[300] = (s)))
 #define PSTATE(s) PACK((hw[301] = (s)))
 #ifdef TRISC_MATH
-    for (uint32_t i = 700; i < 992; ++i) hw[i] = 0;
+    for (uint32_t i = 700; i < 1000; ++i) hw[i] = 0;
     auto wadd = [&](uint32_t i, uint32_t dt) {
         const uint32_t lo = hw[i], nl = lo + dt;
         hw[i] = nl;
@@ -144,13 +145,14 @@ void kernel_main() {
             default: return q ? (q < 32 ? 12 : 11) : 0;
         }
     };
-    // kind 0: after a load (cause: UNPACK's state x the reader's class), 1: after an acquire (PACK's state), 2: own work
+    // kind 0: after a load (cross-check of mload's poll, to 978: only the get and the four clears are left), 1: after an
+    // acquire (PACK's state), 2: own work
     auto mdrain = [&](uint32_t kind) {
         uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
         ckernel::t6_semaphore_wait_on_max<ckernel::p_stall::STALL_SYNC>(ckernel::semaphore::MATH_DONE);
         ckernel::t6_semaphore_post<ckernel::p_stall::MATH | ckernel::p_stall::WAIT_SFPU>(ckernel::semaphore::MATH_DONE);
         while (ckernel::semaphore_read(ckernel::semaphore::MATH_DONE) == 0) {
-            const uint32_t i = kind == 0 ? 700 + 2 * (16 * (hw[300] & 7) + ncls()) : kind == 1 ? 960 + 2 * (hw[301] & 7) : 976;
+            const uint32_t i = kind == 0 ? 978 : kind == 1 ? 960 + 2 * (hw[301] & 7) : 976;
             const uint32_t t = static_cast<uint32_t>(ckernel::read_wall_clock());
             wadd(i, t - tp);
             tp = t;
@@ -158,6 +160,27 @@ void kernel_main() {
         ckernel::semaphore_get(ckernel::semaphore::MATH_DONE);
         wadd(980 + 2 * kind, static_cast<uint32_t>(ckernel::read_wall_clock()) - tp);
         hw[988 + kind] = hw[988 + kind] + 1;
+    };
+    // an fp32 load's MATH side, as the unpack-to-dest branch of _llk_math_eltwise_unary_datacopy_, with the wait for the
+    // unpacker polled on the RISC-V between the mailbox write UNPACK blocks on and the semaphore get: nothing is queued
+    // then, so nothing blocks ahead of the poll, and each poll's cycles go to 700 + 2 (16 unpack state + reader class);
+    // the last poll to 986
+    auto mload = [&](uint32_t dst) {
+        mdrain(2);
+        ckernel::math::math_unpack_to_dest_math_ready();
+        ckernel::math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::DestReg>(dst);
+        uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
+        while (ckernel::semaphore_read(ckernel::semaphore::UNPACK_TO_DEST) == 0) {
+            const uint32_t i = 700 + 2 * (16 * (hw[300] & 7) + ncls());
+            const uint32_t t = static_cast<uint32_t>(ckernel::read_wall_clock());
+            wadd(i, t - tp);
+            tp = t;
+        }
+        wadd(986, static_cast<uint32_t>(ckernel::read_wall_clock()) - tp);
+        ckernel::math::math_unpack_to_dest_tile_ready();
+        const uint32_t lt = dst & 3;   // fp32 dest: four tiles a bank
+        for (uint32_t f = 0; f < 4; ++f) TT_ZEROACC(p_zeroacc::CLR_16, 1, 1, ADDR_MOD_3, ckernel::math::get_dest_index_in_faces(lt, f));
+        mdrain(0);
     };
 #define MDRAIN(k) MATH((mdrain(k)))
 #else
@@ -168,7 +191,12 @@ void kernel_main() {
 #define PSTATE(s)
 #define MDRAIN(k)
 #endif
-#define COPY_TILE(cb, i, d) do { MDRAIN(2); copy_tile(cb, i, d); MDRAIN(0); } while (0)
+#ifdef CFD_PROFW
+#define COPY_TILE(cb, i, d) do { UNPACK((llk_unpack_A<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, UnpackToDestEn>(cb, i))); MATH((mload(d))); } while (0)
+#else
+#define COPY_TILE(cb, i, d) copy_tile(cb, i, d)
+#endif
+#define COPY_TILE_N(cb, i, d) do { MDRAIN(2); copy_tile(cb, i, d); MDRAIN(0); } while (0)   // a bf16 source: not unpack-to-dest
 #ifdef CFD_PHASE
     // run_mesh --phase: wall-clock cycles of this thread per SIMPLE phase (C_PH opens phase id = w >> 16; id 15 = before
     // the first marker), 64-bit, kept by MATH only and written to hdr 512 + 2 id (low word) / 513 + 2 id (high word)
@@ -290,7 +318,7 @@ void kernel_main() {
                 USTATE(0);
                 copy_tile_to_dst_init_short_with_dt(cb_in, CFD_NARROW);
                 UNPACK((get_local_cb_interface(CFD_NARROW).fifo_rd_ptr = get_local_cb_interface(cb_in).fifo_rd_ptr + b));
-                COPY_TILE(CFD_NARROW, 0, a);
+                COPY_TILE_N(CFD_NARROW, 0, a);
                 copy_tile_to_dst_init_short_with_dt(CFD_NARROW, cb_in);
                 LDX();
                 cb_pop_front(cb_in, 1);
