@@ -30,3 +30,8 @@ def test_gahead_host(tmp_path, ngc, gar):
     if ngc > 1:
         assert waits(on) < waits(off) or ngc == 2, on.stdout + off.stdout
         assert broken.returncode == 1, "the read-ahead without its barrier passed: " + broken.stdout
+        # the device's broken arm (--gahead-broken): one wrong lane per read-ahead run
+        exb = tmp_path / "hb"
+        subprocess.run(["g++", "-std=c++17", "-O1", "-w", f"-DNGCV={ngc}", f"-DGARV={gar}", "-DCFD_GAHEAD_BROKEN", "-o", str(exb), str(src)], check=True)
+        rb = subprocess.run([str(exb), "1", "1", "1500"], capture_output=True, text=True)
+        assert rb.returncode == 1, "the broken arm passed: " + rb.stdout

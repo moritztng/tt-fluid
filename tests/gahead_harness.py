@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
             auto& v = dram[rng() % D];
             for (uint32_t i = 0; i < 4096; ++i) v[rng() % v.size()] = rng();
         }
-        const uint32_t np_ = 1 + rng() % 8;
+        const uint32_t np_ = 1 + rng() % 15;   // the kernel's part count is a 4-bit field
         std::vector<std::vector<uint32_t>> X(np_);
         std::vector<uint32_t> src(np_), lanes(1024);
         for (uint32_t i = 0; i < 1024; ++i) lanes[i] = i;

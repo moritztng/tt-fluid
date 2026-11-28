@@ -381,7 +381,7 @@ void kernel_main() {
     // looks up nor waits. Bounded by N runs a page and NGC - 1 pinned slots (one stays free for patch()'s own
     // misses): a part that does not fit goes through patch() as before. Same pages, same values: only the waits move.
     constexpr uint32_t GAR = CFD_GAHEAD;
-    uint32_t ga_end[GAR], ga_pg[GAR], ga_b[8], ga_e[8], ga_n = 0, ga_pin = 0, ga_ok = 0, ga_k = 0;
+    uint32_t ga_end[GAR], ga_pg[GAR], ga_b[16], ga_e[16], ga_n = 0, ga_pin = 0, ga_ok = 0, ga_k = 0;   // a page has at most 15 parts (4-bit field)
     bool ga_rd = false;
     auto gprep = [&](uint32_t k, uint32_t d, const uint32_t* xs, uint32_t n) {
         ga_b[k] = ga_n;
@@ -442,6 +442,9 @@ void kernel_main() {
                 for (uint32_t r = ga_b[ga_k]; r < ga_e[ga_k]; ++r) {
                     const uint32_t* cp = reinterpret_cast<const uint32_t*>(ga_pg[r]);
                     const uint32_t fe = ga_end[r];
+#ifdef CFD_GAHEAD_BROKEN
+                    const uint32_t fb = e;   // test arm (--gahead-broken): each run's first entry takes the neighbour lane
+#endif
                     asm volatile("" ::: "memory");
                     for (; e + 4 <= fe; e += 4) {
                         const uint32_t x0 = xs[e], x1 = xs[e + 1], x2 = xs[e + 2], x3 = xs[e + 3];
@@ -452,6 +455,9 @@ void kernel_main() {
                         out[x3 >> XS] = v3;
                     }
                     for (; e < fe; ++e) out[xs[e] >> XS] = cp[xs[e] & 1023];
+#ifdef CFD_GAHEAD_BROKEN
+                    if (fb < fe) out[xs[fb] >> XS] = cp[(xs[fb] & 1023) ^ 1];
+#endif
                 }
                 ga_ok &= ~(1u << ga_k);
                 asm volatile("" ::: "memory");

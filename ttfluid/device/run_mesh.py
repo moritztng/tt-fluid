@@ -88,6 +88,7 @@ ap.add_argument("--dedup", type=int, default=0, help="as run_vm.py: a fused run 
 ap.add_argument("--gahead", type=int, default=0, help="N > 0 (needs --tsort 1 and a gather cache): the reader looks up the gather-cache pages of a "
                 "patched page before it applies the entries, issues the misses together and waits once (CFD_GAHEAD = N runs a page at most); "
                 "0: one read and one barrier per miss. A run flag: same image, same values")
+ap.add_argument("--gahead-broken", action="store_true", help="test arm of --gahead: every read-ahead run takes one wrong lane, so the state digest has to differ (the gate can fail)")
 ap.add_argument("--tsort", type=int, default=None, help="as run_vm.py: tabstream residue entries sorted by source tile (CFD_TSORT). "
                 "Default on with --tabstream; with --from-images as the images were lowered")
 ap.add_argument("--bpatch", type=int, default=None, help="as run_vm.py: -1 / unset auto (4 when --tabstream and >= --bpatch-min local residue entries per patched map tile), K in 1..7 BRISC scatters (8 - K) / 8 of a patched page's L1 residue (CFD_BPATCH; mailbox in the last 256 B of cb_sync)")
@@ -643,6 +644,7 @@ def kd(src, ct, cfg, rt=None, crt=None):
         ([("CFD_PHASE", "1")] if a.phase and src in ("vm_compute.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_TSORT", "1")] if a.tsort and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_GAHEAD", str(a.gahead))] if a.gahead and a.tsort and src == "vm_ncrisc.cpp" else []) + \
+        ([("CFD_GAHEAD_BROKEN", "1")] if a.gahead and a.gahead_broken and a.tsort and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_BPATCH", str(a.bpatch))] if a.bpatch and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_BGTS", str(a.bgts))] if a.bgts and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_TGTS", str(a.tgts))] if a.tgts and src in ("vm_ncrisc.cpp", "vm_compute.cpp") else []) + \
@@ -949,7 +951,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         h[:, w] += h[:, w + 400] << 32
     root = [k * P for k in range(K)]
     gws = sorted(gtab)
-    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, gahead=a.gahead, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
+    res = dict(jointred=a.jointred, cg1=a.cg1, fold1=a.fold1, fusepart=a.fusepart, gsplit=a.gsplit, wplace=a.wplace, bcast=a.bcast, ring=a.ring, page=a.page, nwin=a.nwin, sched=a.sched, dedup=a.dedup, tsort=a.tsort, gahead_broken=a.gahead_broken, gahead=a.gahead, bpatch=a.bpatch, bgts=a.bgts, tgts=a.tgts, gtile=a.gtile, amg=a.amg, amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, hoist=a.hoist, tabstream=a.tabstream, state_in=a.state_in, gcache=a.gcache, icache=a.icache, red2=m.red2, redm=m.redm, fuse=a.fuse, what=a.what, n=a.n, chips=umd, mesh=[R, C], K=K, layout=a.layout, T=m.T, l1_vec=a.l1, ndram=m.ndram, narrow=a.narrow, case=a.case,
                plan=info, sizes=E.sizes(), l1=l1, rows=nrow, walls=walls, ticks=ticks,
                ms_device=[max(t) / amax / 1e3 for t in ticks], aiclk=clks,
                same_history_all_chips=bool(all(np.array_equal(hist_all[0, :nrow], hist_all[k, :nrow]) for k in range(K))),
