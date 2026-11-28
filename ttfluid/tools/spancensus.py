@@ -17,6 +17,7 @@ resident while the loop runs, so a loop with need > S keeps its extra sources on
 import argparse, io, json, pickle
 from collections import OrderedDict, defaultdict
 
+from ttfluid.resident.machine import _mir_defs
 from ttfluid.resident.program import PHASES
 
 
@@ -64,13 +65,14 @@ def census(prog, m, spans=(1, 2, 3, 4)):
         if ins[0] == "label" and ins[1] in pa:
             cur = pa[ins[1]]
         ph_of.append(cur)
-    info = {}   # tile loop -> (gather pages, window pages from DRAM, plain DRAM loads, DRAM gather sources, stores)
-    for i, ins in enumerate(mir):
+    defs = [tuple(_mir_defs(ins)) for ins in mir]
+    info = {}   # tile loop -> (gather pages, window pages from DRAM, plain DRAM loads, DRAM gather sources, the part
+    for i, ins in enumerate(mir):   # sources of every gather page, L1 gather pages)
         if ins[0] not in ("blk", "seg"):
             continue
-        blks = [ins] if ins[0] == "blk" else ins[1]
+        blks = [ins] if ins[0] == "blk" else [b for b in ins[1] if b[0] == "blk"]   # a seg also carries reds and gathers
         g = wd = pl = l1g = 0
-        src = OrderedDict()
+        src, gp = OrderedDict(), []
         for b in blks:
             for u in b[1]:
                 if u[0] != "ldr":
@@ -84,17 +86,20 @@ def census(prog, m, spans=(1, 2, 3, 4)):
                     continue
                 g += 1
                 wd += u[2] is not None and u[2] in D
+                gp.append(tuple(s for s, _ in u[5]))
                 for s in ds:
                     src[s] = None
-        info[i] = (g, wd, pl, tuple(src), tuple(r for b in blks for _, r in b[2]), l1g)
+        info[i] = (g, wd, pl, tuple(src), gp, l1g)
     out = {}
     order = walk(mir, getattr(prog, "trips", {}))
     for S in spans:
         lru, st = OrderedDict(), defaultdict(lambda: defaultdict(float))
         for i, w in order:
             if i not in info:
+                for x in defs[i]:
+                    lru.pop(x, None)
                 continue
-            g, wd, pl, src, stores, l1g = info[i]
+            g, wd, pl, src, gp, l1g = info[i]
             r = st[ph_of[i]]
             r["loops"] += w
             r["plain"] += w * pl
@@ -113,10 +118,8 @@ def census(prog, m, spans=(1, 2, 3, 4)):
                         lru[s] = None
                         while len(lru) > S:
                             lru.popitem(last=False)
-                r["pages_spanned"] += w * sum(1 for b in ([mir[i]] if mir[i][0] == "blk" else mir[i][1]) for u in b[1]
-                                              if u[0] == "ldr" and u[4] is not None and any(s in src[:S] for s, _ in u[5])
-                                              and all(s in src[:S] or s not in D for s, _ in u[5]))
-            for x in stores:
+                r["pages_spanned"] += w * sum(1 for ps in gp if all(s in src[:S] or s not in D for s in ps))
+            for x in defs[i]:
                 lru.pop(x, None)
         out[S] = {("top" if k is None else PHASES[k]): dict(v) for k, v in st.items()}
     return out, T
