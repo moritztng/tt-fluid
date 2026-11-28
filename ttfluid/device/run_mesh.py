@@ -142,6 +142,8 @@ ap.add_argument("--hre", type=int, default=0, help="G > 0: a halo whose last gat
 ap.add_argument("--forces", default=None, metavar="FUNC", help="Cd/Cl of each outer iteration's incoming state in the history (result keys Cd_in, Cl_in), from the controlDict function FUNC (ttfluid.solver.forces.coeff_hook)")
 ap.add_argument("--phase", action="store_true", help="per-SIMPLE-phase device cycles (program.PHASES markers, CFD_PHASE): result key phase")
 ap.add_argument("--cap", type=int, default=32, help="as run_vm.py: scratch cap, live one-tile values per fused run")
+ap.add_argument("--lsplit", type=int, default=0, help="1: a vector that holds an L1 colour across a Krylov loop it is not used in is parked in DRAM "
+                "for the loop, so the loop's own vectors take the colour (Machine(lsplit)). Data movement only: same values. Needs a lowering")
 ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3, 4 need --tabstream (mesh has no trid). Default 0 keeps the built images unchanged")
 ap.add_argument("--os", type=int, default=0, help="1: BRISC built for size (#pragma GCC optimize Os), 2: NCRISC too, for a program over the kernel config buffer")
 ap.add_argument("--prof", action="store_true", help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores")
@@ -194,6 +196,7 @@ if a.owner:
     ttfluid.resident.machine.rcb = lambda xyz, P, chips=None: _parts
 from ttfluid.resident.memu import MachineEmu  # noqa: E402
 from ttfluid.resident.encode import Encoded  # noqa: E402
+from ttfluid.resident.tabstream import bpatch_auto  # noqa: E402
 from ttfluid.resident.program import build  # noqa: E402
 import ttfluid.resident.krylov  # noqa: E402
 
@@ -218,7 +221,7 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
@@ -302,7 +305,7 @@ else:
                     l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
                     joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
                     bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span)
+                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span, lsplit=bool(a.lsplit))
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))
@@ -407,6 +410,8 @@ else:
                 gateways={f"{x}->{y}" + (f".{k}" if a.gw > 1 else ""): g for (x, y, k), g in gw.items()}, shadow_kb=NSH * SHS * 4 / 1024,
                 gw_load={g: (v["gP"], v["gR"], len(v["rec"])) for g, v in gtab.items()},
                 cells_per_chip=[int(np.sum(m.lay.owner[prog.cells.name] // P == k)) for k in range(K)])
+    if E.tab_stream:
+        info["loc"] = list(E.tab_stream["loc"])   # for --bpatch auto on a run from the images
     print("plan", json.dumps(info), flush=True)
     if cb_bytes(E) > a.l1_bytes:   # images that cannot fit L1 fail only at launch, after the whole lowering: refuse them here
         msg = "CB bytes %d over --l1-bytes %d (halo %d B): more chips or a smaller case" % (cb_bytes(E), a.l1_bytes, E.m.hwords * 4)
@@ -568,9 +573,10 @@ GB = 1024 if 1024 + 32 * P <= 4000 else 4096   # vm_brisc.cpp gather slots: befo
 RB = 4096 if GB == 1024 else GB + 32 * P       # reduction broadcast
 E0 = RB + 2 * BW    # mesh words to E0 + 1616
 if a.bpatch is None or a.bpatch < 0:
-    lm = E.tab_stream.get("loc_mean", 0.0) if isinstance(getattr(E, "tab_stream", None), dict) else 0.0   # (images: pass --bpatch)
-    a.bpatch = 4 if lm >= a.bpatch_min else 0
-    print("--bpatch auto: %.1f local residue entries per patched map tile (min %.0f) -> %d" % (lm, a.bpatch_min, a.bpatch), flush=True)
+    loc = E.tab_stream["loc"] if isinstance(E.tab_stream, dict) else None   # None: no streamed tables, or images lowered before they recorded it
+    a.bpatch, lm = bpatch_auto(loc, a.bpatch_min)
+    print("--bpatch auto: %.1f local residue entries per patched map tile (min %.0f) -> %d" % (lm, a.bpatch_min, a.bpatch)
+          + (" (these images do not record the entries: lower again, or pass --bpatch 4)" if E.tab_stream and not loc else ""), flush=True)
 assert 0 <= a.bpatch < 8 and not (a.bpatch and not a.tabstream), "--bpatch K: 1..7 with --tabstream"
 assert 0 <= a.bgts < 8 and not (a.bgts and not a.tabstream), "--bgts K: 1..7 with --tabstream"
 assert not a.tsort or a.tabstream, "--tsort 1 needs --tabstream"
@@ -625,9 +631,10 @@ elif IMG is not None:   # chip by chip: chip k's arrays are built from its image
             STATE = {k: z[k] for k in z.files if k != "hist"}
         print("state from %s" % a.state_in, flush=True)
         stamp("state read")
-    up = lambda name: image_dev.upload(md, K, DEVBLK, lambda k: image_dev.chip_arrays(IMG, k, P, STATE, name)[name], to_dev)
+    filled = lambda name: (image_dev.chip_shape(IMG, P, name), lambda k, out: image_dev.chip_fill(IMG, k, P, name, out, STATE))
+    up = lambda name: image_dev.upload(md, K, DEVBLK, *filled(name), name)
     t_arena, t_const, t_home, t_blob = up("arena"), up("consts"), up("home"), up("blob")
-    t_tab = image_dev.upload(md, K, DEVBLK, chip_tab, to_dev)
+    t_tab = image_dev.upload(md, K, DEVBLK, (P, L), lambda k, out: np.copyto(out, chip_tab(k)), "tab")
     stamp("images uploaded (arena, consts, home, blob, tab)")
     t_c, t_b, t_n = (to_dev(np.tile(code[k], (K, 1))) for k in "cbn")
     t_hist = to_dev(np.zeros((K * H, 16), np.uint32))
@@ -790,8 +797,8 @@ def main():
             stamp("case %d: homes written" % rr)
         elif rr and a.legs:   # the next leg continues: homes stay on the device, the arena's state registers from the dump
             ttnn.deallocate(t_arena)
-            t_arena = image_dev.upload(md, K, DEVBLK, lambda k: image_dev.carry_arena(
-                IMG, k, P, o[k * P:(k + 1) * P, 1024:].reshape(P, nv, 1024)), to_dev)
+            t_arena = image_dev.upload(md, K, DEVBLK, image_dev.chip_shape(IMG, P, "arena"), lambda k, out: np.copyto(
+                out, image_dev.carry_arena(IMG, k, P, o[k * P:(k + 1) * P, 1024:].reshape(P, nv, 1024))))
             io[0] = t_arena
             common[0] = t_arena.buffer_address()
             stamp("leg %d: arena carried" % rr)
@@ -858,7 +865,7 @@ def mesh_program():
 
 
 def next_homes():   # the next case's homes as one multi-device host tensor (the image's start or --state-in)
-    return image_dev.host_shards(md, K, DEVBLK, lambda k: image_dev.chip_arrays(IMG, k, P, STATE, "home")["home"])[0]
+    return image_dev.host_shards(md, K, DEVBLK, *filled("home"))[0]
 
 
 def core0_ticks(o):

@@ -66,8 +66,8 @@ UNARY = ("neg", "abs", "sqrt", "tanh", "log", "exp")
 # =================================================================================================================
 def rcb(xyz, P, chips=None, faces=None):
     """Recursive coordinate bisection of points into P parts of near-equal size. chips = K > 1: chip first, for a
-    line of K chips: K equal strips along the longest axis (strip k on chip k, neighbours one hop apart), then
-    bisection of each strip into its P / K cores. faces = (owner, neighbour) of the internal faces: each bisection
+    line of K chips: K equal strips along the longest axis (strip k on chip k, neighbours one hop apart; with faces,
+    cells that would join strips two apart are moved so that none do), then bisection of each strip into its P / K cores. faces = (owner, neighbour) of the internal faces: each bisection
     cuts along the axis that cuts the fewest faces, not the longest one. On a mesh with a thin dense layer (the
     refinement above occDrivAer's ground) the longest axis slices the layer into parts 2-3 cells thick, almost all
     halo: the worst core's halo, which sizes every core's halo buffer, drops 3.3x on the coarse occDrivAer."""
@@ -78,6 +78,18 @@ def rcb(xyz, P, chips=None, faces=None):
         cut = [int(round(len(xyz) * k / chips)) for k in range(chips + 1)]
         for k in range(chips):
             parts[order[cut[k]:cut[k + 1]]] = k
+        if faces is not None:
+            # A strip thinner than the mesh's coarsest cells (equal counts make the strip through the refinement thin)
+            # lets its two neighbours share faces, and chips two apart on the line are not one hop apart. The cells that
+            # reach across move one strip up until every face joins the same or adjacent strips: a one-cell layer of
+            # coarse cells, so the counts stay near equal. Strips only rise and are bounded, so this ends.
+            fo, fn = np.asarray(faces[0]), np.asarray(faces[1])
+            while True:
+                a, b = parts[fo], parts[fn]
+                far = np.abs(a - b) > 1
+                if not far.any():
+                    break
+                parts[np.unique(np.where(a < b, fo, fn)[far])] += 1
         strip = parts.copy()
         for k in range(chips):
             sel = np.nonzero(strip == k)[0]
@@ -950,7 +962,7 @@ def slot_extents(code, space, cells, slotfold, L, T):
 class Machine:
     def __init__(self, prog, mesh, P, nslot=NSLOT, log=print, layout="rcb", tiles=None, l1_vec=None, fuse=False, scratch_cap=32,
                  span_homes=False, hoist=False, cap_min=False, sched=False, amg_vec=False, ptiles=False, bcast_run=False, joint_red=False, fold1=False,
-                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0):
+                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0, lsplit=False):
         # two-stage reductions: fold the chip's partials, then the K chip sums; no joint reductions then. Needed when
         # K * P partials do not fit one fold tile, and the default from 8 chips (r13 2x4: 520.3 vs 546.9 ms/it)
         self.red2 = bool(chip_cores) and ((P > LANES or P >= 8 * chip_cores) if red2 is None else red2)
@@ -1059,6 +1071,11 @@ class Machine:
             self._segments()
             self._scratch()
         self._allocate()
+        if lsplit:
+            k = self._split_loops(l1_vec)
+            log("lsplit: %d live ranges split around innermost loops" % k)
+            if k:
+                self._allocate()
         self.dedup = dedup
         self._pre_place = (list(self.mir), dict(self.phys), self.ntiles, self.nvec, self.nsmall)
         self.place(l1_vec, log)
@@ -1879,22 +1896,7 @@ class Machine:
     def _allocate(self):
         mir = self.mir
         n = len(mir)
-        succ = _mir_succ(mir)
-        ud = [(_mir_uses(i), _mir_defs(i)) for i in mir]
-        live_in = [set() for _ in range(n)]
-        live_out = [set() for _ in range(n)]
-        changed = True
-        while changed:
-            changed = False
-            for i in range(n - 1, -1, -1):
-                o = set()
-                for s in succ[i]:
-                    o |= live_in[s]
-                u, d = ud[i]
-                inn = (o - set(d)) | set(u)
-                if o != live_out[i] or inn != live_in[i]:
-                    live_out[i], live_in[i] = o, inn
-                    changed = True
+        ud, live_in, live_out = _liveness(mir)
         tiles = set()
         for u, d in ud:
             tiles |= set(u) | set(d)
@@ -2044,6 +2046,54 @@ class Machine:
         self.phys, self.hphys = phys, hphys
         self.adj = adj
         self.live_entry = live0
+
+    def _split_loops(self, l1_vec):
+        """lsplit: free the L1 colours that values merely live across a Krylov loop hold while it runs. A written vector
+        with an L1 colour that the solve neither reads nor writes is copied to a new register in front of it and back
+        behind it: in between it is dead, so the loop's own vectors can take its colour, and the copy (two uses) goes
+        to DRAM. That is T pages out and T back per solve, nothing per pass. The region is the innermost loop widened
+        to its exits and to the jumps that skip it (label LOOP .. label END, from the first jump to END): one way in
+        at the top, one way out at the bottom, or the loop is left alone. Only for a loop with a vector the placement
+        without the split left in DRAM (the U, k, omega solves: the other velocity components held colours through
+        each of them, unused). Data movement only: same values. Returns the number of (loop, register) splits."""
+        if l1_vec is None or self.T == 1:
+            return 0
+        snap = (self.mir, dict(self.phys), self.ntiles, self.nvec, self.nsmall)
+        self.mir = list(self.mir)
+        self._place(l1_vec)          # trial: who holds a colour without the split
+        isv = lambda r: isinstance(r, int) and self.is_vec(r)
+        l1 = {r for r in self.phys if isv(r) and r not in self.dram and r not in self.ovl}
+        dram = set(self.dram)
+        self.mir, self.phys, self.ntiles, self.nvec, self.nsmall = snap
+        mir = self.mir
+        labels = {ins[1]: i for i, ins in enumerate(mir) if ins[0] == "label"}
+        jumps = {k: labels[ins[-1]] for k, ins in enumerate(mir) if ins[0] in ("jump", "jumpif")}
+        back = [(t, k) for k, t in jumps.items() if t < k]
+        inner = [(i, j) for i, j in back if not any((a, b) != (i, j) and i <= a and b <= j for a, b in back)]
+        ud, live_in, _ = _liveness(mir)
+        touch = lambda ins: [r for x in (ins[1] if ins[0] == "seg" else [ins]) for r in _mir_uses(x) + _mir_defs(x)]
+        writes = {r for ins in mir if ins[0] != "fetch" for r in _mir_defs(ins)}
+        fetched = getattr(self, "fetched_from", {})
+        front, behind, n = defaultdict(list), defaultdict(list), 0
+        for i, j in sorted(inner):
+            hi = max([t for k, t in jumps.items() if i <= k <= j] + [j])         # the last exit label
+            lo = min([k for k, t in jumps.items() if k < i and i <= t <= hi] + [i])   # the first jump that skips the loop
+            if any((lo <= k <= hi) != (lo <= t <= hi) for k, t in jumps.items()) or mir[hi][0] not in ("label", "jumpif"):
+                continue
+            if not {r for ins in mir[i:j + 1] for r in touch(ins)} & dram:
+                continue
+            inside = {r for ins in mir[lo:hi + 1] for r in touch(ins)}
+            for r in sorted(r for r in live_in[lo] if isv(r) and r in l1 and r not in inside and r in writes
+                            and r not in fetched and not self.space[r].stack):
+                c = self._tmp(self.space[r])
+                if r in self.ext:
+                    self.ext[c] = self.ext[r]
+                front[lo].append(("blk", [("ld", 0, r)], [(0, c)]))
+                behind[hi].append(("blk", [("ld", 0, c)], [(0, r)]))
+                n += 1
+        if n:
+            self.mir = [x for k, ins in enumerate(mir) for x in front.get(k, []) + [ins] + behind.get(k, [])]
+        return n
 
     # ---- DRAM homes. With l1_vec set (and T > 1), only that many vector slots stay in L1; the rest live in DRAM, each
     # as many pages per core as its widest register's tiles, packed: phys DBASE + the slot's tile offset, page core *
@@ -2813,6 +2863,28 @@ def _adjacent_reduces(code, window=64):
         out += ind + [a, hit] + dins
         i = k + 1
     return out
+
+
+def _liveness(mir):
+    """Per MIR instruction: (uses, defs), the registers live into it and the registers live out of it."""
+    n = len(mir)
+    succ = _mir_succ(mir)
+    ud = [(_mir_uses(i), _mir_defs(i)) for i in mir]
+    live_in = [set() for _ in range(n)]
+    live_out = [set() for _ in range(n)]
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n - 1, -1, -1):
+            o = set()
+            for s in succ[i]:
+                o |= live_in[s]
+            u, d = ud[i]
+            inn = (o - set(d)) | set(u)
+            if o != live_out[i] or inn != live_in[i]:
+                live_out[i], live_in[i] = o, inn
+                changed = True
+    return ud, live_in, live_out
 
 
 def _mir_succ(mir):

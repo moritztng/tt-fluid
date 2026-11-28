@@ -106,6 +106,14 @@ def dense_index(ent, tm, shift):
     return idx
 
 
+def bpatch_auto(loc, bpatch_min):
+    """--bpatch auto: (K, local residue entries per patched map tile). K is 4 when the lowering counted at least
+    `bpatch_min` entries per patched (map, tile), else 0. `loc` is stream()'s pair of sums; None when there are no
+    streamed tables or the images were lowered before they recorded it."""
+    lm = loc[0] / max(loc[1], 1) if loc else 0.0
+    return (4 if lm >= bpatch_min else 0), lm
+
+
 def stream(E, sort=False, dense=None, brk=0):
     """dense: [(map, shift, min local entries a tile)]: twin j is map nm + j, the same entries as its map, stored
     dense on a core when the local residue entries per tile reach the minimum (encode.py points the pages whose
@@ -179,8 +187,9 @@ def stream(E, sort=False, dense=None, brk=0):
         l1.append(np.array(L, np.uint32))
         blob.append(np.array(B, np.uint32))
     loc = np.concatenate(loc) if loc else np.zeros(0)
-    # loc_mean: local residue entries per patched (map, tile), mean over cores (run_vm --bpatch auto)
-    return dict(sort=sort, dense=dense, ndense=ndense, loc_mean=float(loc.mean()) if len(loc) else 0.0, l1=l1, blob=blob, halo_off=halo_off, staging_words=staging, nparts=nparts,
+    # loc: local residue entries and the patched (map, tile)s they sit in, over these cores; run_mesh --bpatch auto
+    # tests their ratio. Two integers, so the chips of a per-chip lowering add up to the global lowering's pair.
+    return dict(sort=sort, dense=dense, ndense=ndense, loc=(int(loc.sum()), len(loc)), l1=l1, blob=blob, halo_off=halo_off, staging_words=staging, nparts=nparts,
                 l1_words=max(len(x) for x in l1), blob_words=max(len(x) for x in blob),
                 today_words=E.tab.shape[1])
 

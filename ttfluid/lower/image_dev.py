@@ -3,16 +3,15 @@ downloading chip by chip so the host never holds all K chips' arrays (an occDriv
 
     IMG, m, E, gtab, info, cells, place, SHS, NSH = setup(d, LOWER, K, P, R, C)
     tab_gw, chip_tab, L = gateway_tables(IMG, gtab, xyw, K, P)
-    t = upload(md, K, DEVBLK, f, to_dev)         # f(k) -> chip k's (rows, words) uint32 array
+    t = upload(md, K, DEVBLK, shape, fill)       # fill(k, out) writes chip k's (rows, words) uint32 array into out
     x = download_chip(t, d)                      # device d's shard of a mesh tensor, as numpy
 
 m and E are stand-ins carrying exactly the attributes run_mesh's device code reads. Upload: a mesh tensor is allocated
-on the device and each chip's shard is written into its device's buffer (ttnn.get_device_tensors +
-copy_host_to_device_tensor), one chip's host array at a time. CFD_IMG_UPLOAD=full instead builds the whole
-(K * rows, words) array and uses run_mesh's to_dev (host holds every chip: small cases, and the A/B for the chip-wise
-path); CFD_IMG_VERIFY=1 reads every uploaded tensor back chip by chip and compares it with the image.
+on the device and written from one host buffer that holds only the bytes the image files store (host_shards);
+CFD_IMG_VERIFY=1 reads every uploaded tensor back chip by chip and compares it with the image.
 """
 import os
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -68,7 +67,8 @@ def setup(d, LOWER, K, P, R, C):
     tab_halo = np.concatenate([np.asarray(img.chip(k)["tab_halo"]) for k in range(K)])
     sizes = dict(sh["sizes"])
     c = sh["c"] if flags.get("n") == LOWER["n"] else set_outer(sh["c"], flags["n"], LOWER["n"])
-    E = SimpleNamespace(c=c, b=sh["b"], n=sh["n"], tab_stream=s["tab_stream"], loop_pages=s["loop_pages"],
+    # tab_stream as the encoding has it where run_mesh reads it: the local entry counts of --bpatch auto
+    E = SimpleNamespace(c=c, b=sh["b"], n=sh["n"], tab_stream=dict(loc=info["loc"]) if "loc" in info else s["tab_stream"], loop_pages=s["loop_pages"],
                         n_maxop=lambda: s["nmaxop"], sizes=lambda: sizes, out_names=list(sh["out_names"]),
                         tab_halo=tab_halo)
     gtab = {int(g): v for g, v in sh["gtab"].items()}
@@ -118,28 +118,30 @@ def pad16(arr):
     return out
 
 
-def chip_arrays(img, k, P, state=None, want=None):
-    """Chip k's arrays as run_mesh's device code builds them from E (arena, consts, home, blob). state: name -> global
-    array (Image.state's layout) written over the arena and homes, so the run starts from it (run_mesh --state-in);
-    want: the one array the caller takes, so only it is copied and written."""
+def chip_shape(img, P, name):
+    """(rows, words) of one chip's device array `name` (arena, consts, home, blob): the same on every chip."""
+    if name == "blob":
+        return P * img.s["TBP"], LANES
+    n = img.chip(0)[name].size       # mapped: only the header is read
+    return (P, -(-n // P // 16) * 16) if name == "arena" else (n // LANES, LANES)
+
+
+def chip_fill(img, k, P, name, out, state=None):
+    """Chip k's device array `name` as run_mesh's device code builds it from E, written into out: a zeroed
+    (rows, words) uint32 buffer of chip_shape. Only the bytes the image file stores are read, so the zero pages of
+    the constants and the homes (80 % of a Small image) are never touched on the host. state: name -> global array
+    (Image.state's layout) written over the arena and the homes, so the run starts from it (run_mesh --state-in)."""
     ch = img.chip(k)
-    TBP = img.s["TBP"]
-    out = dict(arena=pad16(np.asarray(ch["arena"]).reshape(P, -1)),
-               consts=pad16(np.asarray(ch["consts"]).reshape(-1, 1024)),
-               home=np.ascontiguousarray(np.asarray(ch["home"]).reshape(-1, 1024).view(np.uint32)))
-    if state is not None and want in (None, "arena", "home"):   # copies: the image files are mapped read-only
-        A = H = None
-        if want in (None, "arena"):
-            out["arena"] = out["arena"].copy()
-            nt = img.s["ntiles"]
-            A = out["arena"][:, :nt * 1024].view(np.float32).reshape(P, nt, 1024)
-        if want in (None, "home"):
-            out["home"] = out["home"].copy()
-            H = out["home"].view(np.float32).reshape(P, -1, 1024)
-        img.put_state(k, A, H, state)
-    out["blob"] = (np.asarray(ch["blob"]).reshape(P * TBP, 1024) if img.s["tab_stream"]
-                   else np.zeros((P * TBP, 1024), np.uint32))
-    return out
+    if name == "arena":
+        a = np.asarray(ch["arena"]).reshape(P, -1).view(np.uint32)
+        out[:, :a.shape[1]] = a
+    elif name != "blob" or img.s["tab_stream"]:
+        ch.read_into(name, out)
+    if state is not None and name in ("arena", "home"):
+        f = out.view(np.float32)
+        nt = img.s["ntiles"]
+        img.put_state(k, f[:, :nt * LANES].reshape(P, nt, LANES) if name == "arena" else None,
+                      f.reshape(P, -1, LANES) if name == "home" else None, state)
 
 
 def carry_arena(img, k, P, a_out):
@@ -162,42 +164,50 @@ def carry_arena(img, k, P, a_out):
     return ar
 
 
-def upload(md, K, DEVBLK, f, to_dev):
-    """A (K * rows, words) uint32 mesh tensor whose device d holds f(DEVBLK[d]), its shards written in one copy (built one chip at a time)."""
+def upload(md, K, DEVBLK, shape, fill, name=None):
+    """A (K * rows, words) uint32 mesh tensor whose device d holds the array fill(DEVBLK[d], out) writes into its zeroed
+    (rows, words) buffer out, all shards written in one copy. With CFD_UPLOAD_PROFILE set and a name, prints where the
+    upload's wall clock went: building the host buffer (image read, state overlay) against the write to the chips,
+    which is synchronized so the split is the device's."""
     import ttnn
-    if os.environ.get("CFD_IMG_UPLOAD") == "full":
-        return to_dev(np.concatenate([f(k) for k in range(K)]))
-    h, shape = host_shards(md, K, DEVBLK, f)
-    t = ttnn.allocate_tensor_on_device(shape, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
+    prof = name and os.environ.get("CFD_UPLOAD_PROFILE")
+    t0 = time.time()
+    h, shard = host_shards(md, K, DEVBLK, shape, fill)
+    t1 = time.time()
+    t = ttnn.allocate_tensor_on_device(shard, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT, md, ttnn.DRAM_MEMORY_CONFIG)
     ttnn.copy_host_to_device_tensor(h, t)
+    if prof:
+        ttnn.synchronize_device(md)
+        mb = shape[0] * shape[1] * 4 / 2**20
+        print("upload %s: %d chips x %.0f MB, host shards %.2f s, write %.2f s (%.0f MB/s over the mesh)"
+              % (name, K, mb, t1 - t0, time.time() - t1, K * mb / max(time.time() - t1, 1e-9)), flush=True)
     del h
     if os.environ.get("CFD_IMG_VERIFY"):
         for d in range(K):
-            assert np.array_equal(download_chip(t, d), f(DEVBLK[d])), ("chip-wise upload read back differs", d)
+            ref = np.zeros(shape, np.uint32)
+            fill(DEVBLK[d], ref)
+            assert np.array_equal(download_chip(t, d), ref), ("upload read back differs", name, d)
     return t
 
 
-def host_shards(md, K, DEVBLK, f):
+def host_shards(md, K, DEVBLK, shape, fill):
     """upload's host side: the K shards as one multi-device host tensor and one shard's shape, ready for
-    copy_host_to_device_tensor (run_mesh --cases builds the next case's homes with it while the device runs this one)."""
+    copy_host_to_device_tensor (run_mesh --cases builds the next case's homes with it while the device runs this one).
+    The shards are slices of one zeroed buffer, which costs RAM only where fill writes, and ttnn borrows it: a shard
+    along dim 0 of a row-major buffer needs no copy (a from_torch without a mesh mapper always makes one, at ~1 GB/s).
+    One write of all shards also sidesteps copy_host_to_device_tensor into a get_device_tensors() view, which writes
+    EVERY device (ttnn 0.68: all 8 chips read back the last chip's data)."""
     import torch
     import ttnn
-    # one write of K host shards: copy_host_to_device_tensor into a get_device_tensors() view writes EVERY device
-    # (ttnn 0.68: all 8 chips read back the last chip's data), so the shards go in together via from_host_shards.
-    # The host holds one array of every chip at a time, not every array.
-    # the K host shards are built in parallel (image reads + copies release the GIL); CFD_IMG_THREADS=1 is the old serial path
     from concurrent.futures import ThreadPoolExecutor
-
-    def shard(d):
-        x = np.ascontiguousarray(f(DEVBLK[d]))
-        assert x.dtype == np.uint32, (x.shape, x.dtype)
-        # tagged int32, not uint32: the same bytes, and from_torch builds an int32 host tensor at ~2 GB/s against ~1 GB/s
-        # for uint32 (measured with a host-to-device transfer benchmark); the program reads the buffer as raw words either way
-        return ttnn.from_torch(torch.from_numpy(x.view(np.int32)), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT)
-    with ThreadPoolExecutor(int(os.environ.get("CFD_IMG_THREADS", min(K, 16)))) as ex:
-        hs = list(ex.map(shard, range(K)))
-    assert len({tuple(h.shape) for h in hs}) == 1, [tuple(h.shape) for h in hs]
-    return ttnn.from_host_shards(hs, md.shape), ttnn.Shape(list(hs[0].shape))   # the shape: one device's shard
+    rows, words = shape
+    buf = np.zeros((K * rows, words), np.uint32)
+    with ThreadPoolExecutor(K) as ex:
+        list(ex.map(lambda d: fill(DEVBLK[d], buf[d * rows:(d + 1) * rows]), range(K)))
+    # tagged int32, not uint32: the same bytes, and the program reads the buffer as raw words either way
+    h = ttnn.from_torch(torch.from_numpy(buf.view(np.int32)), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+                        mesh_mapper=ttnn.ShardTensorToMesh(md, dim=0))
+    return h, ttnn.Shape([rows, words])
 
 
 def download_chip(t, d):

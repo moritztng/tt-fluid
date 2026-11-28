@@ -1,0 +1,39 @@
+index, name, memory.total [MiB], clocks.max.sm [MHz], clocks.max.memory [MHz], power.limit [W], driver_version, compute_mode
+0, NVIDIA H100 80GB HBM3, 81559 MiB, 1980 MHz, 2619 MHz, 700.00 W, 615.71.09, Default
+pid, process_name, used_gpu_memory [MiB]
+CPU(s):                                  192
+Model name:                              INTEL(R) XEON(R) PLATINUM 8568Y+
+Socket(s):                               2
+CPU(s) scaling MHz:                      21%
+192
+               total        used        free      shared  buff/cache   available
+Mem:             850         243         235           0         379         606
+[2026-11-28T01:10:08Z] P_mps_k12_it300 MPS daemon rc=0
+[2026-11-28T01:10:08Z] P_mps_k12_it300: 12 cases x 300 it, pool 8 GiB each, 1875s left
+[2026-11-28T01:29:30Z] P_mps_k12_it300 MPS stopped
+CELL P_mps_k12_it300 1161.4 per_case=96.8 ok=12/12 its=300,300,300,300,300,300,300,300,300,300,300,300 clock=1139,1125,1127,1121,1127,1152,1145,1147,1111,1147,1144,1147 power_mean=409.5W power_busy=426.3W util_mean=94.3% sm_median=1980MHz sm_at_max=100% gpu_mem_max=73182MiB host_rss_max=60880MiB
+/root/s/P_mps_k12_it300_c0 iters=300 wall=1150.9s first_it=76.8s s/iter median=3.5300 mean=3.4663 min=2.2100 max=3.9400
+/root/s/P_mps_k12_it300_c1 iters=300 wall=1140.9s first_it=69.3s s/iter median=3.4800 mean=3.4393 min=2.0100 max=3.9800
+/root/s/P_mps_k12_it300_c10 iters=300 wall=1140.9s first_it=76.5s s/iter median=3.4800 mean=3.4386 min=2.3800 max=3.9200
+/root/s/P_mps_k12_it300_c11 iters=300 wall=1130.9s first_it=84.7s s/iter median=3.4300 mean=3.3883 min=2.2100 max=3.7600
+/root/s/P_mps_k12_it300_c2 iters=300 wall=1140.9s first_it=75.8s s/iter median=3.4850 mean=3.4410 min=2.4800 max=4.1700
+/root/s/P_mps_k12_it300_c3 iters=300 wall=1160.9s first_it=74.0s s/iter median=3.6200 mean=3.4844 min=0.8500 max=4.0400
+/root/s/P_mps_k12_it300_c4 iters=300 wall=1150.9s first_it=71.4s s/iter median=3.5400 mean=3.4770 min=1.9300 max=3.9700
+/root/s/P_mps_k12_it300_c5 iters=300 wall=1160.9s first_it=68.8s s/iter median=3.5800 mean=3.4996 min=1.5100 max=4.0100
+/root/s/P_mps_k12_it300_c6 iters=300 wall=1120.8s first_it=67.8s s/iter median=3.4300 mean=3.3828 min=2.2900 max=3.8500
+/root/s/P_mps_k12_it300_c7 iters=300 wall=1160.9s first_it=76.3s s/iter median=3.5900 mean=3.4885 min=1.0100 max=4.0100
+/root/s/P_mps_k12_it300_c8 iters=300 wall=1150.9s first_it=60.2s s/iter median=3.5850 mean=3.5165 min=1.9900 max=3.9500
+/root/s/P_mps_k12_it300_c9 iters=300 wall=1160.9s first_it=73.8s s/iter median=3.5700 mean=3.4766 min=1.4300 max=3.9800
+[2026-11-28T01:29:30Z] P_mps_k8_richardson MPS daemon rc=0
+[2026-11-28T01:29:30Z] P_mps_k8_richardson: 8 cases x 800 it, pool 9 GiB each, 2228s left
+[2026-11-28T02:03:52Z] P_mps_k8_richardson MPS stopped
+CELL P_mps_k8_richardson 2062.2 per_case=257.8 ok=8/8 its=800,800,800,800,800,800,800,800 clock=2050,2000,1993,2041,2002,2047,1985,2035 power_mean=395.9W power_busy=405.2W util_mean=96.1% sm_median=1980MHz sm_at_max=100% gpu_mem_max=48768MiB host_rss_max=42272MiB
+/root/s/P_mps_k8_richardson_c0 iters=800 wall=2061.8s first_it=64.3s s/iter median=2.4900 mean=2.4269 min=0.7900 max=2.8700
+/root/s/P_mps_k8_richardson_c1 iters=800 wall=2011.6s first_it=66.4s s/iter median=2.3900 mean=2.3708 min=1.3200 max=2.7800
+/root/s/P_mps_k8_richardson_c2 iters=800 wall=2001.7s first_it=62.2s s/iter median=2.3700 mean=2.3616 min=1.5100 max=2.7200
+/root/s/P_mps_k8_richardson_c3 iters=800 wall=2051.7s first_it=71.0s s/iter median=2.4500 mean=2.4141 min=1.3200 max=2.8600
+/root/s/P_mps_k8_richardson_c4 iters=800 wall=2011.7s first_it=67.9s s/iter median=2.3800 mean=2.3654 min=1.5800 max=2.6800
+/root/s/P_mps_k8_richardson_c5 iters=800 wall=2061.7s first_it=67.7s s/iter median=2.4900 mean=2.4365 min=1.0200 max=2.9600
+/root/s/P_mps_k8_richardson_c6 iters=800 wall=1991.7s first_it=64.2s s/iter median=2.3700 mean=2.3549 min=1.5200 max=2.6800
+/root/s/P_mps_k8_richardson_c7 iters=800 wall=2041.7s first_it=63.1s s/iter median=2.4600 mean=2.4148 min=1.4600 max=2.7700
+[2026-11-28T02:03:53Z] PLAN-END

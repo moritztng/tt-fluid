@@ -1,0 +1,1 @@
+/root/s/P_mps_k8_richardson_c0 iters=800 wall=2061.8s first_it=64.3s s/iter median=2.4900 mean=2.4269 min=0.7900 max=2.8700

@@ -59,11 +59,12 @@ differs from the one-chip run in the low bits, because fp32 sums are taken in a 
 
 ## Part 2: HPC_motorbike Small on a QuietBox 2
 
-This is the run behind the README's cost table. It needs a host with about 220 GB of RAM for the one-time lowering and a
-QuietBox 2 (or any machine with p300 boards) for the run. Each step below is the step that produced the published
-numbers, and the logs in `results/tenstorrent/quietbox2-p300x4/` hold the exact flags of those runs (the `jsonl` rows
-record every option). Unlike everything else in these docs, Part 2 was not re-run from a clean clone for v0.1.0: it
-needs the big-memory host and several hours. If a step does not work as written, please open an issue.
+This is the largest case in the README's cost table. It needs a host with about 90 GB of RAM for the one-time lowering
+(it peaks at 84 GB) and a QuietBox 2, or any machine with p300 boards, for the run. The steps below are the fastest
+line measured so far. The README's table was made with the v0.1.0 line, and the logs in
+`results/tenstorrent/quietbox2-p300x4/` hold the exact flags of those runs (the `jsonl` rows record every option).
+Part 2 was not re-run from a clean clone: it needs the big-memory host and about an hour. If a step does not work as
+written, please open an issue.
 
 ### 1. Get the case
 
@@ -75,18 +76,24 @@ The case is `incompressible/simpleFoam/HPC_motorbike/Small` of the OpenFOAM HPC 
 ### 2. Lower once, write per-chip images
 
 ```bash
-FLAGS="--arch bh --mesh 1,2 --layout rcb --l1 0 --wplace 2 --gw 1 --nsh 1 --page 16 --nwin 1024 --tabstream \
-  --amg --amg-stack --amg-vec --amg-smoothed 0 --amg-min-core 10 --amg-depth 0 --vcoarse 8 \
-  --lsched --phase --sliced --fuse --cse 1 --hlate 1 --vpre 1 --vpost 1 --strips"
-python -m ttfluid.device.run_mesh case 800 --case motorbike $FLAGS --images img_k2
+FLAGS="--arch bh --mesh 1,2 --layout rcb --wplace 2 --gw 1 --nsh 1 --page 16 --tabstream --lsched --phase --sliced \
+  --fuse --cse 1 --hlate 1 --strips --tsort 1 --l1 2 --l1-bytes 1461760 --lsplit 1 \
+  --forces motorbike/system/controlDict:forceCoeffsAll"
+PYTHONHASHSEED=0 python -m ttfluid.device.run_mesh case 800 --case motorbike $FLAGS --nwin 8192 --images img_k2
 ```
 
 This traces one SIMPLE iteration of the full case, partitions it over the two chips of one board, schedules and encodes
-it, and writes one image per chip. It runs on the CPU only. It refuses to start if the write would leave the disk with
-less than 200 GB free (`--min-free-gb`).
+it, and writes one image per chip. It runs on the CPU only and takes about half an hour. It refuses to start if the
+write would leave the disk with less than 200 GB free (`--min-free-gb`). `PYTHONHASHSEED=0` fixes the order of the
+reductions, so two lowerings give the same images.
 
-The pressure solve is Jacobi-preconditioned CG (`--amg-depth 0` builds no coarse level). On Blackhole that is faster
+The pressure solve is Jacobi-preconditioned CG, the default when `--amg` is not given. On Blackhole that is faster
 than an aggregation V-cycle: it needs about six times as many iterations, but each costs a twentieth.
+
+`--l1 2` keeps two solver vectors in each core's L1 memory and `--lsplit 1` moves a vector out to DRAM for the
+duration of a solver loop that does not use it. With the cache and patch settings the run now chooses itself
+(step 4), that is 1.18 times faster on the device than the line before it (`--l1 1 --gcache 14`), and the state
+after 100 iterations is bit for bit the same.
 
 ### 3. Starting state from potentialFoam
 
@@ -100,29 +107,25 @@ python -m ttfluid.lower.of_state img_k2 motorbike motorbike/0 state0.npz
 export TT_VISIBLE_DEVICES=0,1
 export TT_MESH_GRAPH_DESC_PATH=$(python -c "import ttnn, pathlib; print(pathlib.Path(ttnn.__file__).parent / \
   'tt_metal/fabric/mesh_graph_descriptors/p300_mesh_graph_descriptor.textproto')")
-python -m ttfluid.device.run_mesh case 800 $FLAGS --from-images img_k2 --state-in state0.npz --noemu --runs 1 \
-  --links 0 --rlink 1 --os 1 --tsort 1 --gcache 14 --bgts 5 --tgts 2 --l1 1 \
-  --forces motorbike/system/controlDict:forceCoeffsAll --out motorbike.jsonl
+python -m ttfluid.device.run_mesh case 800 --case motorbike $FLAGS --from-images img_k2 --state-in state0.npz \
+  --noemu --runs 1 --nwin 1024 --links 0 --rlink 1 --os 1 --bgts 5 --tgts 2 --out motorbike.jsonl
 ```
 
-On one p300c board at 1350 MHz this takes about 1250 s of device time for 800 iterations. A QuietBox 2 runs two such
-cases at once, one per board (`TT_VISIBLE_DEVICES=2,3` for the second).
+On two Blackhole chips at 1350 MHz this takes about 1030 s of device time for 800 iterations (measured on two chips
+of a Blackhole Galaxy). A QuietBox 2 runs two such cases at once, one per board (`TT_VISIBLE_DEVICES=2,3` for the
+second). The run sizes its gather cache to the L1 memory that is left and chooses `--bpatch` from counts stored in
+the images, and prints both choices.
 
 `--forces` evaluates the case's `forceCoeffs` function object on the state each iteration starts from and stores Cd
-and Cl in the history, which is saved with the final state in `motorbike_case_1x2_state.npz` (key `hist`). Extract it
-for the grader:
-
-```bash
-python -c "import numpy as np; open('motorbike.hist.json', 'w').write(str(np.load('motorbike_case_1x2_state.npz')['hist']))"
-```
+and Cl in the history, which is saved with the final state in `motorbike_case_1x2_state.npz`.
 
 ### 5. Grade and price it
 
 ```bash
-python3 bench/nvidia/cdwindow.py --dev motorbike.hist.json:0 --of coefficient.dat --from 101 --to 799
+python3 bench/cdgrade.py --run motorbike_case_1x2_state.npz:0
 python3 bench/per_dollar.py
 ```
 
-`coefficient.dat` is OpenFOAM's `postProcessing/forceCoeffsAll/0/coefficient.dat` from a CPU run of the same case,
-from the same potentialFoam start. [accuracy.md](accuracy.md) explains the windowed comparison, and
-[performance.md](performance.md) the cost model.
+`cdgrade.py` compares the mean drag over iterations 201-799 with OpenFOAM v2412 in fp64 (`results/openfoam/`, a CPU run
+of the same case from the same potentialFoam start) and exits 0 on a pass. [accuracy.md](accuracy.md) explains the
+windowed comparison, and [performance.md](performance.md) the cost model.
