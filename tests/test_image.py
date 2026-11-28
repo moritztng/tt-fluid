@@ -1,7 +1,8 @@
 """Per-chip images: the sparse read of a chip array and the state round trip (host only, no device)."""
 import numpy as np
 
-from ttfluid.lower.image import GAP, LANES, Image, _ChipFiles
+from ttfluid.lower import image_dev
+from ttfluid.lower.image import GAP, LANES, Image, Pages, _ChipFiles
 from ttfluid.resident.machine import DBASE
 
 
@@ -38,7 +39,7 @@ def test_put_state_is_the_inverse_of_state():
 
 def lay(sg, k, W, stage):
     """kernels/place.cpp on the host: what W workers leave in a chip's array, from the map and the arguments they get."""
-    m, args = sg.work(k, W)
+    m, args = image_dev.page_map(sg.on[k], W)
     out = np.full(sg.full, 0xDEADBEEF, np.uint32)        # whatever the DRAM held before
     for w, first, count, staged in args:
         for j in range(count):
@@ -48,7 +49,6 @@ def lay(sg, k, W, stage):
 
 
 def test_staged_upload_lays_the_array_a_full_upload_writes(tmp_path):
-    from ttfluid.lower import image_dev
     rng = np.random.default_rng(2)
     P, hp, n = 3, 700, 5000                              # cores, home pages per core, cells
     home = np.zeros((P * hp, LANES), np.float32)
@@ -79,3 +79,66 @@ def test_staged_upload_lays_the_array_a_full_upload_writes(tmp_path):
         on = sg.on[0].copy()                             # the gate can fail: one staged page marked zero
         sg.on[0][np.flatnonzero(on)[3]] = False
         assert not np.array_equal(lay(sg, 0, 2 * P, stage), full)
+
+
+def scan(X, W, HPG, ranges):
+    """kernels/scan.cpp on the host: the page map W workers write for a chip's homes X (pages, LANES)."""
+    m, args = image_dev.page_map(np.zeros(len(X), bool), W)
+    for w, first, count, _ in args:
+        c = first // HPG
+        while c * HPG < first + count:
+            for lo, hi in ranges:
+                for p in range(max(first, c * HPG + lo), min(first + count, c * HPG + hi)):
+                    if X[p].any():
+                        m[w, (p - first) >> 5] |= np.uint32(1 << ((p - first) & 31))
+            c += 1
+    return m
+
+
+def collect(X, m, on, W, S):
+    """kernels/place.cpp backwards on the host: the stage of S + 1 rows the workers fill from the marked pages."""
+    stage = np.full((S + 1, LANES), 0xDEADBEEF, np.uint32)
+    for w, first, count, staged in image_dev.page_map(on, W)[1]:
+        for j in range(count):
+            if m[w, j >> 5] >> (j & 31) & 1:
+                stage[staged] = X[first + j]
+                staged += 1
+    stage[S] = 0
+    return stage
+
+
+def test_state_download_reads_only_the_pages_that_hold_a_value():
+    rng = np.random.default_rng(2)
+    P, n, nt, hp = 3, 5000, 4, 8
+    core = rng.integers(0, P, n).astype(np.int32)
+    lane = np.zeros(n, np.int32)
+    for c in range(P):
+        m = np.flatnonzero(core == c)
+        lane[m] = rng.permutation(2 * LANES)[:len(m)]
+    regs = [["cells", 1, 2], ["cells", DBASE + 2, 2], ["cells", DBASE + 4, 2]]
+    shared = dict(scalars=dict(K=1, P=P), spaces={"cells": n}, const_state={},
+                  state=[["U", [3], regs], ["p", [], [["cells", DBASE, 2]]]])
+    img = Image(shared, {0: {"ids/cells": np.arange(n), "core/cells": core, "lane/cells": lane}})
+    state = {"U": rng.standard_normal((n, 3)).astype(np.float32), "p": np.zeros(n, np.float32)}
+    state["U"][:, 2] = 0                                  # two of the three DRAM-homed registers hold nothing
+    A, H = np.zeros((P, nt, LANES), np.float32), np.zeros((P, hp, LANES), np.float32)
+    img.put_state(0, A, H, state)
+    H[:, 6:] = 7.0                                        # pages past the state: not the download's to read
+    ranges = image_dev.state_pages(img)
+    assert ranges == [(0, 6)]
+    X = H.view(np.uint32).reshape(P * hp, LANES)
+    for W in (2 * P, 7, 1):
+        m = scan(X, W, hp, ranges)
+        on = image_dev.map_pages(m, len(X))
+        S = int(on.sum())
+        assert S == 2 * P                                 # of 6 * P state pages
+        row = np.where(on, np.cumsum(on) - 1, S).reshape(P, hp)
+        pages = Pages(collect(X, m, on, W, S), row)
+        back = img.state(lambda k: A, lambda k: pages.view(np.float32))
+        assert all(np.array_equal(back[k], state[k]) for k in state)
+        m[0, 0] ^= np.uint32(1 << 2)                      # a page the scan missed: the state has to differ
+        on = image_dev.map_pages(m, len(X))
+        S = int(on.sum())
+        pages = Pages(collect(X, m, on, W, S), np.where(on, np.cumsum(on) - 1, S).reshape(P, hp))
+        back = img.state(lambda k: A, lambda k: pages.view(np.float32))
+        assert not np.array_equal(back["U"], state["U"])
