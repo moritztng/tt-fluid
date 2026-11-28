@@ -1682,11 +1682,36 @@ class Machine:
                     left[q] -= 1
                     if not left[q]:
                         bisect.insort(ready, q)
+        if self.levels >= 2:
+            order = self._sink(order, pred, cls)
         assert sorted(order) == list(range(n))
         pos = {k: i for i, k in enumerate(order)}
         assert all(pos[q] < pos[k] for k in range(n) for q in pred[k]), "level order broke a dependence"
         self.level_runs.append((max(lvl) + 1 if n else 0, n))
         return [x for k in order for x in units[k]]
+
+    @staticmethod
+    def _sink(order, pred, cls):
+        """Level order with its heads sunk: a unit that is not a vector block (gather, halo push, one-tile block) moves
+        down to the start of the same-tile-count run that holds its first reader, so a gathered vector is live for
+        that run only and a short one keeps its place in L1. Nothing between the two places depends on it."""
+        seq = list(order)
+        i = len(seq) - 1
+        while i >= 0:               # from the end: a reader has found its place before what it reads moves
+            h = seq[i]
+            if not cls[h]:
+                j = i + 1
+                while j < len(seq) and h not in pred[seq[j]]:
+                    j += 1
+                if i + 1 < j < len(seq):    # no reader in this piece: it stays
+                    r, c = j, cls[seq[j]]
+                    while c and r - 1 > i and cls[seq[r - 1]] == c:
+                        r -= 1
+                    if r > i + 1:
+                        seq.insert(r, h)
+                        del seq[i]
+            i -= 1
+        return seq
 
     # ---- halos: one push per (straight-line segment, source value), hoisted to just after the source's last write
     def _segments(self):

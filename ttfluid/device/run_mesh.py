@@ -131,7 +131,7 @@ ap.add_argument("--hre", type=int, default=0, help="G > 0: a halo whose last gat
 ap.add_argument("--forces", default=None, metavar="FUNC", help="Cd/Cl of each outer iteration's incoming state in the history (result keys Cd_in, Cl_in), from the controlDict function FUNC (ttfluid.solver.forces.coeff_hook)")
 ap.add_argument("--phase", action="store_true", help="per-SIMPLE-phase device cycles (program.PHASES markers, CFD_PHASE): result key phase")
 ap.add_argument("--cap", type=int, default=32, help="as run_vm.py: scratch cap, live one-tile values per fused run")
-ap.add_argument("--levels", type=int, default=0, help="Machine(levels=1): the outer iteration's body is ordered by gather level before the fused runs are formed (a level's blocks in one run per tile count); the values are unchanged")
+ap.add_argument("--levels", type=int, default=0, help="Machine(levels=1): the outer iteration's body is ordered by gather level before the fused runs are formed (a level's blocks in one run per tile count); 2: its gathers, halo pushes and one-tile blocks stand right before the run that first reads them instead of at the head of the level; the values are unchanged")
 ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3, 4 need --tabstream (mesh has no trid). Default 0 keeps the built images unchanged")
 ap.add_argument("--os", type=int, default=0, help="1: BRISC built for size (#pragma GCC optimize Os), 2: NCRISC too, for a program over the kernel config buffer")
 ap.add_argument("--prof", action="store_true", help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores")
