@@ -633,8 +633,11 @@ elif IMG is not None:   # chip by chip: chip k's arrays are built from its image
     # the host tensors borrow the buffers built since the start (pop: a future keeps its result, and the buffer has
     # to go when its array is on the chips); the blob's is built while the constants are written
     ahead = ThreadPoolExecutor(1)
-    pre = lambda name: ahead.submit(lambda: image_dev.host_shards(
-        md, K, DEVBLK, *src(name), early_buf[name].result().pop(name) if name in early_buf else None))
+    def pre(name):
+        def job():   # the early buffer first: its thread marked the array's pages, with the state in hand
+            buf = early_buf[name].result().pop(name) if name in early_buf else None
+            return image_dev.host_shards(md, K, DEVBLK, *src(name), buf)
+        return ahead.submit(job)
     up = lambda name, host: (image_dev.upload_placed(md, cells, grid, cores, DEVBLK, staged[name], name, host) if name in staged
                              else image_dev.upload(md, K, DEVBLK, *filled(name), name, host))
     hosts = [pre(name) for name in ("arena", "consts", "home", "blob")]
