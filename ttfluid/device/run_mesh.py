@@ -152,6 +152,9 @@ ap.add_argument("--images", help="CPU only: lower, write per-chip device images 
                 "their sha256 per chip goes to digests.json there")
 ap.add_argument("--min-free-gb", type=int, default=200, help="refuse an --images/--save/--mcache write that would leave its disk "
                 "under this many GB free (checked before lowering, and again with the image's exact size before writing it)")
+ap.add_argument("--cache", help="CPU lowering: directory of the staged cache (ttfluid/lower/cache.py). A stage whose flags, input files and "
+                "source did not change is read from it instead of rebuilt; the images are byte-equal to an uncached lowering's")
+ap.add_argument("--cache-omit", default="", help=argparse.SUPPRESS)   # tests only: key inputs left out, to show the digest gate fails
 ap.add_argument("--stages", help="CPU lowering: seconds and peak resident GB of every lowering stage as JSON lines in this file "
                 "(ttfluid/lower/stages.py)")
 a = ap.parse_args()
@@ -262,44 +265,60 @@ else:
         assert saved == low, ("--mcache: lowering flags differ", {k: (saved.get(k), low[k]) for k in low if saved.get(k) != low[k]})
         print("machine from %s in %.1f s" % (a.mcache, time.time() - t0), flush=True)
     else:
-        with ST("case"):
-            s = SimpleFoam(a.case, backend="ell", dtype=np.float32, log=lambda *x: None,
-                           ell_order="dir" if a.layout == "lattice" else "face")
-        core = None
-        if a.layout == "rcb" and K > 1:   # chip placement first (seconds): an unplaceable partition used to surface at plan(), an hour in
-            import ttfluid.resident.machine
-            from ttfluid.resident import chipplan
-            with ST("partition"):
-                core = ttfluid.resident.machine.rcb(s.mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None, faces=ttfluid.resident.machine.mesh_faces(s.mesh))
-            nI = s.mesh.nInternalFaces
-            chipplan.place_blocks(chipplan.chip_adjacency(core // P, s.mesh.owner[:nI], s.mesh.neighbour, K), K, R, C)
-            print("placement ok: %d chip blocks one-hop on %dx%d" % (K, R, C), flush=True)
-        if a.forces:
-            from ttfluid.solver.forces import coeff_hook
-            s.force_hook = coeff_hook(s, a.forces)
-        if a.what == "synth":
-            from ttfluid.resident.synth import synth
-            prog = synth(s, a.n)
-        elif a.amg:
-            import ttfluid.resident.machine
-            assert a.layout == "rcb", "--amg: rcb (the owner below is Machine's rcb)"
-            owner = core if core is not None else ttfluid.resident.machine.rcb(s.mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None, faces=ttfluid.resident.machine.mesh_faces(s.mesh))
-            prog = build(s, a.n, phase=a.phase, amg_owner=owner, amg_kind=a.amg_kind, amg_smoothed=a.amg_smoothed, amg_stack=a.amg_stack,
-                         amg_lag=a.amg_lag, amg_lag_warm=a.amg_lag_warm, amg_chip_cores=None if a.amg_global else P,
-                         amg_depth=a.amg_depth, amg_min_core=a.amg_min_core,
-                         amg_vshape=VSHAPE)
-        else:
+        def trace():   # case read, chip placement check, one SIMPLE iteration traced: all the solver's work, none of the machine's
+            with ST("case"):
+                s = SimpleFoam(a.case, backend="ell", dtype=np.float32, log=lambda *x: None,
+                               ell_order="dir" if a.layout == "lattice" else "face")
+            rcb = lambda: ttfluid.resident.machine.rcb(s.mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None, faces=ttfluid.resident.machine.mesh_faces(s.mesh))
+            core = None
+            if a.layout == "rcb" and K > 1:   # chip placement first (seconds): an unplaceable partition used to surface at plan(), an hour in
+                from ttfluid.resident import chipplan
+                with ST("partition"):
+                    core = rcb()
+                nI = s.mesh.nInternalFaces
+                chipplan.place_blocks(chipplan.chip_adjacency(core // P, s.mesh.owner[:nI], s.mesh.neighbour, K), K, R, C)
+                print("placement ok: %d chip blocks one-hop on %dx%d" % (K, R, C), flush=True)
+            if a.forces:
+                from ttfluid.solver.forces import coeff_hook
+                s.force_hook = coeff_hook(s, a.forces)
             with ST("trace"):
-                prog = build(s, a.n, phase=a.phase)
+                if a.what == "synth":
+                    from ttfluid.resident.synth import synth
+                    prog = synth(s, a.n)
+                elif a.amg:
+                    assert a.layout == "rcb", "--amg: rcb (the owner below is Machine's rcb)"
+                    prog = build(s, a.n, phase=a.phase, amg_owner=core if core is not None else rcb(), amg_kind=a.amg_kind, amg_smoothed=a.amg_smoothed,
+                                 amg_stack=a.amg_stack, amg_lag=a.amg_lag, amg_lag_warm=a.amg_lag_warm, amg_chip_cores=None if a.amg_global else P,
+                                 amg_depth=a.amg_depth, amg_min_core=a.amg_min_core, amg_vshape=VSHAPE)
+                else:
+                    prog = build(s, a.n, phase=a.phase)
+            return s.mesh, prog
+
+        import ttfluid.resident.machine
+        if a.cache:   # the stage's key: every flag, file, environment variable and source file the trace reads (lower/cache.py)
+            from ttfluid.lower import cache as lcache
+            TRACE_FLAGS = ("what", "n", "layout", "mesh", "strips", "arch", "cores", "phase", "amg", "amg_kind", "amg_smoothed", "amg_stack", "amg_lag", "amg_lag_warm",
+                           "amg_global", "amg_depth", "amg_min_core", "vpre", "vpost", "vcoarse", "vgamma", "jointred", "cg1", "bjoint", "hlate")
+            with ST("cache key"):
+                key = dict({k: getattr(a, k) for k in TRACE_FLAGS}, case=lcache.tree_digest(a.case),
+                           forces=a.forces and [a.forces.rsplit(":", 1)[-1], ":" in a.forces and lcache.tree_digest(a.forces.rsplit(":", 1)[0])],
+                           owner=a.owner and lcache.tree_digest(a.owner), env={k: v for k, v in os.environ.items() if k.startswith(("CFD_AMG", "WM_PROJECT"))},
+                           source=lcache.source_digest(["ttfluid.solver", "ttfluid.resident.trace", "ttfluid.resident.program", "ttfluid.resident.krylov",
+                                                        "ttfluid.resident.sa", "ttfluid.resident.amg", "ttfluid.resident.synth", "ttfluid.resident.chipplan"]),
+                           rcb=lcache.source_digest(["ttfluid.resident.machine"]) if a.amg or (a.layout == "rcb" and K > 1) else None)
+            with ST("trace stage"):
+                mesh, prog = lcache.Cache(a.cache, omit=a.cache_omit.split(",")).get("trace", key, trace)
+        else:
+            mesh, prog = trace()
         ST.methods(Machine, ["_sliced", "_lower", "_fetches", "_split_gathers", "_halos", "_segments", "_scratch", "_allocate", "place"])
         ST.methods(ttfluid.resident.machine.Maps, ["finish"])
         ST.methods(ttfluid.resident.machine.Layout, ["__init__"])
         with ST("machine"):
-          m = Machine(prog, s.mesh, K * P, layout=a.layout, tiles=a.tiles, chip_cores=P, red2=None if a.red2 < 0 else bool(a.red2), chip_line=a.strips or min(R, C) == 1,
-                      l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
-                      joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
-                      bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                      amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg)
+            m = Machine(prog, mesh, K * P, layout=a.layout, tiles=a.tiles, chip_cores=P, red2=None if a.red2 < 0 else bool(a.red2), chip_line=a.strips or min(R, C) == 1,
+                        l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
+                        joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
+                        bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
+                        amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg)
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))

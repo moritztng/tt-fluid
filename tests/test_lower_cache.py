@@ -1,0 +1,51 @@
+"""The staged lowering cache (ttfluid/lower/cache.py) must not change what the device runs: an image lowered through
+it, cold or warm, is byte-equal to one lowered without it. And the gate can fail: a key that leaves out one of its
+inputs serves a stale stage, and the same comparison catches it."""
+import hashlib
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+# pitzDaily on two Blackhole chips of four cores each: two tiles a vector, DRAM homes, streamed tables, as a large case
+FLAGS = ("--arch bh --mesh 1,2 --cores 4 --layout rcb --strips --wplace 2 --gw 1 --nsh 1 --page 16 --nwin 8192 --tabstream --tsort 1 "
+         "--lsched --phase --sliced --fuse --cse 1 --hlate 1 --l1 1 --min-free-gb 1").split()
+
+
+def lower(d, *extra, n=50):
+    """Lower into directory d; returns ({file or shared array: sha256}, the lowering's output)."""
+    r = subprocess.run([sys.executable, "-m", "ttfluid.device.run_mesh", "case", str(n), *FLAGS, "--case", str(ROOT / "cases" / "pitzDaily"),
+                        "--images", str(d), *map(str, extra)], cwd=ROOT, env=dict(os.environ, PYTHONHASHSEED="0"),
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    sha = lambda b: hashlib.sha256(b).hexdigest()
+    files = {str(f.relative_to(d)): sha(f.read_bytes()) for f in sorted(Path(d).rglob("*")) if f.is_file() and f.name != "shared.npz"}
+    z = np.load(Path(d) / "shared.npz")   # a zip: its bytes carry the time of writing, its arrays do not
+    files.update({"shared.npz/" + k: sha(str(z[k].dtype).encode() + str(z[k].shape).encode() + z[k].tobytes()) for k in z.files})
+    assert len(files) > 20
+    return files, r.stdout
+
+
+def test_cached_lowering_is_byte_equal(tmp_path):
+    cache = tmp_path / "cache"
+    cold, out = lower(tmp_path / "cold", "--cache", cache)
+    assert "cache: trace built" in out
+    assert cold == lower(tmp_path / "plain")[0]
+    warm, out = lower(tmp_path / "warm", "--cache", cache, "--pseg", 3)     # one flag of the machine changed
+    assert "cache: trace read" in out
+    plain = lower(tmp_path / "plain_pseg", "--pseg", 3)[0]
+    assert plain != cold
+    assert warm == plain
+
+
+def test_key_missing_an_input_is_caught(tmp_path):
+    cache = tmp_path / "cache"
+    lower(tmp_path / "n50", "--cache", cache, "--cache-omit", "n")
+    stale, out = lower(tmp_path / "n60", "--cache", cache, "--cache-omit", "n", n=60)   # the iteration cap is not in the key
+    assert "cache: trace read" in out
+    assert stale != lower(tmp_path / "plain_n60", n=60)[0]
+    good, out = lower(tmp_path / "n60_good", "--cache", cache, n=60)
+    assert "cache: trace built" in out and good == lower(tmp_path / "plain_n60b", n=60)[0]
