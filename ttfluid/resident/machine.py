@@ -173,7 +173,7 @@ def quarter_lanes(owner, P, Q):
 class Layout:
     """Owner core and lane of every element of every space."""
 
-    def __init__(self, prog, cell_owner, P, cell_lane=None, amg_vec=False, ptiles=False):
+    def __init__(self, prog, cell_owner, P, cell_lane=None, amg_vec=False, ptiles=False, follow=False):
         self.P = P
         self.owner, self.lane, self.count = {}, {}, {}
         spaces = [prog.cells] + list(prog.pspace.values())
@@ -187,6 +187,12 @@ class Layout:
             if sp is prog.cells and cell_lane is not None:
                 lane = np.asarray(cell_lane, np.int64)
                 cnt = np.array([lane[own == i].max(initial=-1) + 1 for i in range(P)])
+            elif follow and sp.cells is not None and getattr(sp, "stack", None) is None:
+                # --order rcm: a patch's entries in the lane order of their owning cells, not in face order, so a
+                # boundary gather walks the core's tiles once (hood proxy, core 0, outlet faces reading their cells
+                # through 14 cache tiles: 192 page misses in face order under the banded cells, 37 tiles to read)
+                order = np.lexsort((np.arange(sp.n), self.lane[prog.cells.name][sp.cells], own))
+                lane[order] = np.arange(sp.n) - (np.cumsum(cnt) - cnt)[own[order]]
             if getattr(sp, "stack", None) is not None:   # block k at lanes k w + (lane in base), sa._stack
                 base, S, w = sp.stack
                 own = self.owner[base.name][np.arange(sp.n) % base.n]
@@ -1069,7 +1075,8 @@ class Machine:
             own = self._own if sliced else rcb(mesh.C, P, chips=P // chip_cores if chip_cores and chip_line else None, faces=mesh_faces(mesh))
             Q = int(layout[4:]) if layout.startswith("rcbq") else 0
             banded = (self.slotL, rcm_rank(own, mesh_faces(mesh), P)) if order == "rcm" else None
-            self.lay = Layout(prog, own, P, sliced_lanes(own, face_counts(mesh), P, Q, banded) if sliced else None, amg_vec=amg_vec, ptiles=ptiles)
+            self.lay = Layout(prog, own, P, sliced_lanes(own, face_counts(mesh), P, Q, banded) if sliced else None, amg_vec=amg_vec, ptiles=ptiles,
+                              follow=order == "rcm")
         self.T = max(self.lay.T, tiles or 1)   # tiles: force more tiles per vector than needed (testing)
         self.Ts = {n: (self.T if t == self.lay.T else t) for n, t in self.lay.Ts.items()}   # T: the slot stride
         assert not sliced or layout == "rcb" or layout.startswith("rcbq"), "--sliced sorts rcb lanes"
