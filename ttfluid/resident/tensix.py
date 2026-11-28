@@ -385,3 +385,86 @@ if __name__ == "__main__":
     n, names = selftest(sys.argv[1] if len(sys.argv) > 1 else None, verbose="-v" in sys.argv)
     print("tensix selftest: %d instruction words match the compiled kernel (%d encoders: %s); not in any compiled "
           "sample: %s" % (n, len(names), " ".join(names), " ".join(sorted(set(LAYOUT) - set(names)))))
+
+
+# ---------------------------------------------------------------------------------------------------------
+# ROWS: the per-row SFPU sequence of every fusable op as the stock tile op executes it in the compiled VM
+# kernel (disassembly of vm_compute.cpp, TRISC1), Dest loads and stores left out. Tuples are
+# (mnemonic, fields in TT_OP order); strings are placeholders: inputs a, b, c; result r; temporaries t0..;
+# constants by name (CONSTS). 9 = LCONST_0, 10 = LCONST_1. Details and caveats: ~/flx/kernel/forks/isa.md.
+def _cmp(modes, if_true, if_false):
+    return ([("sfpsetcc", 0, "a", 0, m) for m in modes]
+            + [("sfpmov", 0, if_true, "r", 0), ("sfpcompc", 0, 0, 0, 0), ("sfpmov", 0, if_false, "r", 0),
+               ("sfpencc", 3, 0, 0, 10)])
+
+
+ROWS = {
+    "add": [("sfpadd", 10, "a", "b", "r", 0), ("sfpnop",)],          # stock: L0 = L0 + L1
+    "sub": [("sfpadd", 10, "a", "b", "r", 2), ("sfpnop",)],          # mod1 2 = negate VC: a - b
+    "mul": [("sfpmul", "a", "b", 9, "r", 0), ("sfpnop",)],           # a * b + L9 (0.0)
+    # addcmul_tile(in0, in1, in2, out, k): out = in0 + k * in1 * in2; stock L0 = in0, L1 = in1, L2 = in2,
+    # L3 = k, L4 = t0, L5 = r. a = in0, b = in1, c = in2 (operand map expected from the call, NOT re-read
+    # against ckernel_sfpu_addcmul.h).
+    "mad": [("sfpmul", "b", "k_pos1", 9, "t0", 0), ("sfpmad", "c", "t0", "a", "r", 0), ("sfpnop",)],
+    "msb": [("sfpmul", "b", "k_neg1", 9, "t0", 0), ("sfpmad", "c", "t0", "a", "r", 0), ("sfpnop",)],
+    "neg": [("sfpmov", 0, "a", "r", 1)],                             # mod1 1 = complement sign
+    "abs": [("sfpabs", 0, "a", "r", 1)],                             # mod1 1 = float
+    # comparisons: 1.0 where the predicate holds, else 0.0. SFPSETCC modes 6 = EQ0, 4 = GTE0, 2 = NE0;
+    # two SFPSETCCs AND. Stock: value and result both L2, constants in L0 / L1.
+    "eqz": _cmp([6], "one", "zero"),
+    "nez": _cmp([6], "zero", "one"),
+    "gez": _cmp([4], "one", "zero"),
+    "ltz": _cmp([4], "zero", "one"),
+    "gtz": _cmp([4, 2], "one", "zero"),
+    "lez": _cmp([4, 2], "zero", "one"),
+    # plain forms (the stock forms use load macros: MACRO_ROWS). where(a, b, c) = a != 0 ? b : c is the
+    # DISABLE_SFPLOADMACRO path of ckernel_sfpu_where.h with the two loads of L1 turned into moves.
+    "where": [("sfpmov", 0, "b", "r", 0), ("sfpsetcc", 0, "a", 0, 6), ("sfpmov", 0, "c", "r", 0),
+              ("sfpencc", 0, 0, 0, 0)],
+    # SFPSWAP(VC, VD, 1 = VEC_MIN_MAX): VD = min, VC = max; 9 = VEC_MAX_MIN the reverse. r ends as VC.
+    "max": [("sfpmov", 0, "a", "t0", 0), ("sfpmov", 0, "b", "r", 0), ("sfpswap", 0, "r", "t0", 1), ("sfpnop",)],
+    "min": [("sfpmov", 0, "a", "t0", 0), ("sfpmov", 0, "b", "r", 0), ("sfpswap", 0, "r", "t0", 9), ("sfpnop",)],
+}
+
+# constants an op needs in an LREG, as float32 bits (stock loads them once per call with SFPLOADI)
+CONSTS = {"k_pos1": 0x3F800000, "k_neg1": 0xBF800000, "one": 0x3F800000, "zero": 0x00000000}
+
+# stock LREGs per op (inputs, result, others)
+STOCK_LREGS = {
+    "add": "L0 a/r, L1 b", "sub": "L0 a/r, L1 b", "mul": "L0 a/r, L1 b",
+    "mad": "L0 a, L1 b, L2 c, L3 k, L4 t0, L5 r", "msb": "L0 a, L1 b, L2 c, L3 k, L4 t0, L5 r",
+    "neg": "L0", "abs": "L0", "where": "L0 (macro form), L0 + L1 (plain form)",
+    "max": "templates read L2 and L0, result through L16 (row words not decoded)",
+    "min": "templates read L2 and L0, result through L16 (row words not decoded)",
+    **{k: "L2 a/r, L0 and L1 constants" for k in ("eqz", "nez", "gez", "ltz", "gtz", "lez")},
+}
+
+# stock load-macro configuration (decoded from the compiled words; where also read in ckernel_sfpu_where.h)
+MACRO_ROWS = {
+    "where": dict(
+        templates={0: ("sfpsetcc", 0, 0, 12, 6), 1: ("sfpencc", 0, 0, 13, 0)},
+        sequence={0: 0x13000004, 1: 0x00000004, 2: 0x00000005},   # store << 24 | round << 16 | mad << 8 | simple
+        misc=0x770,
+        row_out_ne_in0=[("sfploadmacro", 1 << 2, 4, 7, "a"), ("sfploadmacro", 2 << 2, 4, 7, "b"),
+                        ("sfpload", 0, 4, 7, "c"), ("sfpstore", 0, 4, 6, "r")],
+        row_out_eq_in0=[("sfploadmacro", 0 << 2, 4, 7, "a"), ("sfploadmacro", 2 << 2, 4, 7, "b"),
+                        ("sfpload", 0, 4, 6, "c")],
+        conditional_load="the third (plain SFPLOAD of c): written only where a == 0",
+    ),
+    "max": dict(templates={0: ("sfpswap", 0, 2, 12, 1), 1: ("sfpshft2", 0, 0, 13, 6)},
+                sequence={0: 0x00DD008C, 1: 0x53000000}, misc=0x330, flush_nops=3, row=None),
+    "min": dict(templates={0: ("sfpswap", 0, 2, 12, 9), 1: ("sfpshft2", 0, 0, 13, 6)},
+                sequence={0: 0x00DD008C, 1: 0x53000000}, misc=0x330, flush_nops=3, row=None),
+}
+
+
+def start_words(dest_half=0, tile=0):
+    """Words of _llk_math_eltwise_binary_sfpu_start_: SETC16(1 = DEST_TARGET_REG_CFG_MATH_Offset,
+    half base + tile * 64), STALLWAIT(STALL_SFPU, MATH)."""
+    return [0xB2010000 | (512 * dest_half + 64 * tile), 0xA2800010]
+
+
+def done_words():
+    """Words of _llk_math_eltwise_binary_sfpu_done_ as compiled: SETRWC(CLR_NONE, 0, 0, 0, 0, SET_D),
+    STALLWAIT(STALL_CFG, WAIT_SFPU), SETC16(2, 0)."""
+    return [0x37000004, 0xA2400800, 0xB2020000]
