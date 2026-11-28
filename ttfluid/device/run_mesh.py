@@ -144,6 +144,10 @@ ap.add_argument("--phase", action="store_true", help="per-SIMPLE-phase device cy
 ap.add_argument("--cap", type=int, default=32, help="as run_vm.py: scratch cap, live one-tile values per fused run")
 ap.add_argument("--lsplit", type=int, default=0, help="1: a vector that holds an L1 colour across a Krylov loop it is not used in is parked in DRAM "
                 "for the loop, so the loop's own vectors take the colour (Machine(lsplit)). Data movement only: same values. Needs a lowering")
+ap.add_argument("--kfold", type=int, default=0, help="1: a DRAM constant page that holds one bit pattern (zeros, ones, ...) is not streamed: a per-core "
+                "table in one more arena tile tells the reader to skip it and compute to fill the slot (Machine(kfold)). Same values. Needs a lowering")
+ap.add_argument("--kfold-broken", type=int, default=0, help="test arms of --kfold on core 0, the result has to differ: 1 a page that is not uniform "
+                "is coded as uniform, 2 one palette value is one ulp off")
 ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3, 4 need --tabstream (mesh has no trid). Default 0 keeps the built images unchanged")
 ap.add_argument("--os", type=int, default=0, help="1: BRISC built for size (#pragma GCC optimize Os), 2: NCRISC too, for a program over the kernel config buffer")
 ap.add_argument("--prof", action="store_true", help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores")
@@ -224,7 +228,7 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit", "kfold", "kfold_broken") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
@@ -308,7 +312,7 @@ else:
                     l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
                     joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
                     bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span, lsplit=bool(a.lsplit))
+                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span, lsplit=bool(a.lsplit), kfold=bool(a.kfold))
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))
@@ -364,7 +368,7 @@ else:
     assert a.tabstream or not ttfluid.resident.encode.WIDE, "T=%d > 64 needs --tabstream" % m.T
     assert not (ttfluid.resident.encode.WIDE and (a.tgts or a.gtile)), "--tgts / --gtile hand over 16-bit gather entries (vm_compute tsvc): not with wide ones"
     if not a.load:
-        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break)
+        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break, kfold_broken=a.kfold_broken)
         if a.tabdense:
             S_ = E.tab_stream
             print("tabdense %d: %d twin maps, %d of %d (core, twin) tables dense, L1 table %d words, blob %d words a core (staging %d)" % (
@@ -383,13 +387,19 @@ else:
             k = max(0, int((a.l1_bytes - (cb_bytes(E) - m.ntiles * 4096)) // 4096 - m.nsmall) // m.T)
             while True:
                 m.place(k, print)
-                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break)
+                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break, kfold_broken=a.kfold_broken)
                 print("l1 auto: %d vector slots in L1, CB bytes %d" % (k, cb_bytes(E)), flush=True)
                 if cb_bytes(E) <= a.l1_bytes or k == 0:
                     break
                 k -= 1
         if a.gtile:
             print("gtile: %d gathers hand over per tile" % E.gtile_n, flush=True)
+        if a.kfold:
+            from ttfluid.resident.encode import kfold_codes
+            cd = kfold_codes(E.kfold, np.arange(m.cpages)[None].repeat(len(E.kfold), 0))
+            print("kfold: table at arena tile %d (%d tile), %d constant pages a core, coded per core min %d mean %.0f max %d; core 0 palette %s%s" % (
+                m.kfold_tile, m.kfold_tiles, m.cpages, (cd > 0).sum(1).min(), (cd > 0).sum(1).mean(), (cd > 0).sum(1).max(),
+                " ".join("%#010x" % x for x in E.kfold[0, :3]), "; BROKEN " + E.kfold_broke if E.kfold_broke else ""), flush=True)
     if a.gruns:
         from ttfluid.lower import gruns
         assert E.tab_stream, "--gruns reads the tabstream tables"
@@ -448,6 +458,7 @@ if a.ref and not a.emuonly:
 elif not a.noemu:
     t0 = time.time()
     me = MachineEmu(m, np.float32)
+    me.kfold = E.kfold   # --kfold: the emulator fills from the table the device gets (None: off)
     me.check = a.emu_check
     me.run()
     ref = (me.history, me.state())

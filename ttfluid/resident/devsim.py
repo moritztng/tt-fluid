@@ -85,6 +85,10 @@ class DevSim:
             out.append(nh > 0)
         return out
 
+    def _kfolded(self, i, coff, t):
+        """--kfold: core i's fold table codes page coff + t (Encoded.kfold), so no ring page moves for it."""
+        return bool(E.kfold_codes(self.e.kfold[i:i + 1], np.array([[coff + t]]))[0, 0])
+
     def run(self, max_steps=10 ** 8):
         P, D = self.P, self.depth
         streams = {"c": self.e.c, "b": self.e.b, "n": self.e.n}
@@ -224,6 +228,13 @@ class DevSim:
                     return None
                 q[(i, "rin")] -= 1
                 pcs[ag] = pc + 1
+            elif op == E.C_LDK:     # --kfold: a coded page fills the slot, no ring page (the tile loop counter picks it)
+                lp = self.tloop.get(ag)
+                if not self._kfolded(i, int(S[pc + 1]), lp[0] if lp and lp[0] < lp[1] else 0):
+                    if q[(i, "rin")] == 0:
+                        return None
+                    q[(i, "rin")] -= 1
+                pcs[ag] = pc + 2
             elif op in (E.C_STW, E.C_STWH):
                 if q[(i, "rout")] >= self.ring:
                     return None
@@ -344,12 +355,16 @@ class DevSim:
             for _ in range(n):
                 x = int(S[p + 1])
                 mid1, npart = (x >> 4) & (0x3ff if E.WIDE else 0xfff), x & 0xf
-                ents.append((mid1, [int(y) for y in S[p + 3:p + 2 + 2 * npart:2]]))
+                ents.append((mid1, [int(y) for y in S[p + 3:p + 2 + 2 * npart:2]], int(S[p])))
                 p += 2 + 2 * npart
             if k == 0:
-                for mid1, slots in ents:
+                for mid1, slots, _ in ents:
                     if mid1 and not self._halo_ready(i, mid1 - 1, slots, data, hcntN):
                         return None
+            # --kfold: page k is tile k // n of entry k % n; the reader skips the ones the fold table codes
+            while k < n * tn and ents[k % n][2] & E.FOLD and self._kfolded(i, ents[k % n][2] & (E.FOLD - 1), k // n):
+                k += 1
+            self.prog[ag] = k
             if k < n * tn:
                 if q[(i, "rin")] >= self.ring:
                     return None

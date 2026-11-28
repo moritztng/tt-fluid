@@ -962,7 +962,7 @@ def slot_extents(code, space, cells, slotfold, L, T):
 class Machine:
     def __init__(self, prog, mesh, P, nslot=NSLOT, log=print, layout="rcb", tiles=None, l1_vec=None, fuse=False, scratch_cap=32,
                  span_homes=False, hoist=False, cap_min=False, sched=False, amg_vec=False, ptiles=False, bcast_run=False, joint_red=False, fold1=False,
-                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0, lsplit=False):
+                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0, lsplit=False, kfold=False):
         # two-stage reductions: fold the chip's partials, then the K chip sums; no joint reductions then. Needed when
         # K * P partials do not fit one fold tile, and the default from 8 chips (r13 2x4: 520.3 vs 546.9 ms/it)
         self.red2 = bool(chip_cores) and ((P > LANES or P >= 8 * chip_cores) if red2 is None else red2)
@@ -979,6 +979,9 @@ class Machine:
         self.hlate = hlate     # a halo goes out right before its first gather, not after its source's last write
         self.hre = hre         # >0: a halo last read more than hre MIR back is sent again, not held in its slot
         self.pseg = pseg
+        # kfold: a constant page holding one bit pattern is not streamed; the reader and compute read a per-core table
+        # of 2-bit codes in kfold_tiles extra arena tiles from kfold_tile on (encode.py kfold_table, _kfold below)
+        self.kfold, self.kfold_tile, self.kfold_tiles = kfold, None, 0
         self.narrow_on, self.narrow, self.narrow_slot, self.pre_h, self.narrow_home = narrow, set(), {}, {}, set()   # narrow: bf16 DRAM pages for eligible constants (_narrow)
         self.coff, self.cpages, self.hpages, self.dslots = {}, 0, 0, []
         self.F = prog.dtype.type
@@ -1096,7 +1099,21 @@ class Machine:
         if self.narrow_on:
             self._narrow()
         self._sync()
+        if self.kfold:
+            self._kfold()
         log(self.summary())
+
+    def kfolds(self, u):
+        """--kfold: an ldr the fold table serves: an in-place fp32 DRAM constant read plainly (no shift, no patch)."""
+        return bool(getattr(self, "kfold", False) and u[0] == "ldr" and u[2] is not None and self.phys[u[2]] >= KBASE
+                    and self.fetched_from.get(u[2]) not in self.narrow and u[3] == 0 and u[4] is None)
+
+    def _kfold(self):
+        """Reserve the fold table's arena tiles behind every register: 4 header words, then a 2-bit code per constant
+        page. T more entries than pages: a loop may read past a constant's own tiles (codes there: the next pages')."""
+        self.kfold_tile = self.ntiles
+        self.kfold_tiles = -(-(4 + -(-(self.cpages + self.T) // 16)) // LANES)
+        self.ntiles += self.kfold_tiles
 
     def _sliced(self, code, prog, mesh, P, tiles, chips, log):
         """--sliced: each core's cells sorted widest first, so ELL slot k is a lane prefix of L_k tiles; every cells

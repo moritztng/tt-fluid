@@ -33,6 +33,9 @@ C_LDRH = 43             # C_LDR of a bf16 page (Machine narrow), widened to fp32
 C_STWH = 44             # C_STW packed to bf16 (Machine narrow 2)
 C_PH = 45               # phase marker (Encoded(phase=...)): phase id in the top 16 bits; vm_compute CFD_PHASE
 NARROW = 1 << 27        # desc bit: a bf16 constant page (vm_ncrisc window)
+C_LDK = 46              # C_LDR of a constant page the fold table may serve (Machine kfold): operand word = the
+#                         constant's page offset; a non-zero code of page offset + tile fills the slot, no page comes
+FOLD = 1 << 26          # desc bit: the reader skips the pages of this constant that the fold table codes (vm_ncrisc)
 TILE = 0x80     # op bit: tile operand += loop counter
 # BRISC
 B_END, B_SIGC, B_WAITC, B_SIGN, B_WAITN, B_HALO, B_RED, B_OUT, B_FETCH, B_JMP, B_BRT, B_SINK = range(12)
@@ -69,6 +72,38 @@ def phase_h(d):
 def f32bits(v):
     return int(np.float32(v).view(np.uint32))
 
+
+
+def kfold_table(pages, entries):
+    """The fold table of one core. pages: (cpages, LANES) uint32, the core's DRAM constant pages as the image stores
+    them. A page whose 1,024 words are one bit pattern is uniform; the palette is the three patterns with the most
+    uniform pages (ties: the smaller pattern), and such a page gets code 1 + its palette index, every other page and
+    every entry past the pages code 0 (streamed). Returns (palette (3,) uint32, codes (entries,) uint8). Content
+    only, so the encoder, the emulator and the census (tools/const_census.py) agree on it by calling this."""
+    pal, code = np.zeros(3, np.uint32), np.zeros(entries, np.uint8)
+    if len(pages):
+        uni = (pages == pages[:, :1]).all(1)
+        vals, cnt = np.unique(pages[uni, 0], return_counts=True)
+        top = vals[np.lexsort((vals, -cnt))[:3]]
+        pal[:len(top)] = top
+        for k, v in enumerate(top):
+            code[:len(pages)][uni & (pages[:, 0] == v)] = k + 1
+    return pal, code
+
+
+def kfold_words(pal, code):
+    """The table's words as the arena holds them: palette in words 0-2, word 3 zero, page i's code in bits
+    2 (i & 15) of word 4 + (i >> 4)."""
+    c = np.zeros(-(-len(code) // 16) * 16, np.uint32)
+    c[:len(code)] = code
+    return np.r_[pal, np.uint32(0), (c.reshape(-1, 16) << (2 * np.arange(16, dtype=np.uint32))).sum(1, dtype=np.uint32)]
+
+
+def kfold_codes(words, i):
+    """Codes of pages i (any integer array) read back from table words (..., n): kfold_words inverted, as the kernels do."""
+    i = np.asarray(i)
+    return (np.take_along_axis(words, np.broadcast_to(4 + (i >> 4), words.shape[:-1] + i.shape[-1:]), -1)
+            >> (2 * (i & 15)).astype(np.uint32)) & 3
 
 
 class Stream:
@@ -154,7 +189,7 @@ def hrun_words(lane, idx, rmin=8):
 
 class Encoded:
     def __init__(self, m, page=False, pdev=None, tab_stream=False, look=False, cores=None, tab_sort=False, phase=None,
-                 gtile=False, tab_dense=0, tab_break=0):
+                 gtile=False, tab_dense=0, tab_break=0, kfold_broken=0):
         """page: the compute stream is paged from DRAM through a ring NCRISC fills (vm_ncrisc N_CODE): every basic
         block starts on a PW-word page, the padding is C_JMP (in paged mode JMP and BRT end a block and compute moves
         on to the next delivered page), and NCRISC pushes the pages of a MIR instruction before any of its own ops
@@ -178,6 +213,7 @@ class Encoded:
         C_TBEG. Paged: that gather's N_CODE also looks ahead over the loop's pages. Same values, same order."""
         phase = phase or {}
         self.m, self.page, self.look = m, page, look
+        self.kfold, self.kfold_broken, self.kfold_broke = None, kfold_broken, None   # --kfold: the tables (P, words), see _arena
         self.cores = np.arange(m.P) if cores is None else np.asarray(cores)
         assert not (tab_stream and getattr(m, "hrun", False)), "hrun marks the L1 gather tables"
         assert not (tab_dense and (not tab_stream or WIDE)), "dense index tables: streamed, 16-bit lanes"
@@ -269,7 +305,7 @@ class Encoded:
                                           "dram" if phys[u[2]] >= DBASE else "same l1" if xs == [u[2]] else "other l1"),
                                           u[4], mid if mid != u[4] else None, len(xs), cur_ph[0]))
                     assert -(1 << 31 - ss) <= u[3] < 1 << 31 - ss and (mid or 0) < (1 << 28 - ss) - 1, (u[3], mid)
-                    n(desc(u[2]), (u[3] & (1 << 32 - ss) - 1) << ss | (0 if mid is None else mid + 1) << 4 | len(u[5]))
+                    n(desc(u[2]) | (FOLD if m.kfolds(u) else 0), (u[3] & (1 << 32 - ss) - 1) << ss | (0 if mid is None else mid + 1) << 4 | len(u[5]))
                     for x, h in u[5]:
                         n(desc(x), NONE16 if h is None else halo_slot(h))
             sink = [r for r in sts if phys[r] >= DBASE]
@@ -289,6 +325,9 @@ class Encoded:
                 elif k == "lds":      # offset load: lane l reads lane l + u[3] (a multiple of 4 = 16 B)
                     assert u[3] % 4 == 0
                     c(W(C_LDS, u[1]) | tf(u[2]) | phys[u[2]] << 16, u[3] // 4)
+                elif k == "ldr" and m.kfolds(u):
+                    assert phys[u[2]] - KBASE < FOLD
+                    c(W(C_LDK, u[1]), phys[u[2]] - KBASE)
                 elif k == "ldr":
                     if u[2] is not None and (m.fetched_from.get(u[2]) in m.narrow or u[2] in m.narrow_home):
                         assert u[3] % 8 == 0 and u[4] is None
@@ -654,6 +693,42 @@ class Encoded:
             h = self._scatter(m.space[r], widen_bf16(m.pre_h[r]), n).view(np.uint32) >> 16
             C[:, o:o + n].view(np.uint32)[..., :LANES // 2] = np.ascontiguousarray(h.astype(np.uint16)).view(np.uint32)
         self.consts = C
+        if getattr(m, "kfold", False):
+            # --kfold: every core's fold table in the arena tiles the Machine reserved (kfold_table: content only)
+            n = m.cpages + m.T
+            for r in range(P):
+                pal, code = kfold_table(C[r, :m.cpages].view(np.uint32), n)
+                if self.kfold_broken and r == 0:
+                    self._kfold_break(C[0, :m.cpages].view(np.uint32), pal, code)
+                w = kfold_words(pal, code)
+                A[r, m.kfold_tile:m.kfold_tile + m.kfold_tiles].view(np.uint32).reshape(-1)[:len(w)] = w
+            self.kfold = A[:, m.kfold_tile:m.kfold_tile + m.kfold_tiles].view(np.uint32).reshape(P, -1)
+
+    def _kfold_break(self, pages, pal, code):
+        """--kfold-broken on core 0, the arms a gate has to fail on: 1 = one page that is not uniform gets a code (the
+        page a stream reads whose words differ most from the palette value); 2 = one palette value is one ulp off."""
+        m = self.m
+        if self.kfold_broken == 2:
+            k = int(np.argmax(np.bincount(code[code > 0], minlength=4)[1:] * (pal != 0)))   # the most used non-zero value
+            assert pal[k] != 0 and (code == k + 1).any(), "no non-zero uniform page on core 0"
+            pal[k] += 1
+            self.kfold_broke = "core 0: palette %d %#010x -> %#010x" % (k, pal[k] - 1, pal[k])
+            return
+        read = np.zeros(len(code), bool)     # pages some FOLD stream reads
+        for x in m.mir:
+            for bk in (x[1] if x[0] == "seg" else [x] if x[0] == "blk" else []):
+                if bk[0] != "blk":
+                    continue
+                for u in bk[1]:
+                    if m.kfolds(u):
+                        o = m.phys[u[2]] - KBASE
+                        read[o:o + m.size(u[2])] = True
+        cand = np.nonzero(read[:len(pages)] & (code[:len(pages)] == 0))[0]
+        assert len(cand), "no streamed constant page on core 0"
+        diff = (pages[cand] != pal[0]).sum(1)
+        i = int(cand[np.argmax(diff)])
+        code[i] = 1
+        self.kfold_broke = "core 0: page %d (%d of %d words differ from %#010x) coded 1" % (i, diff.max(), LANES, pal[0])
 
     def state_from_arena(self, arena, home=None):
         """arena (P, ntiles, LANES) and DRAM homes (P, hpages, LANES) -> state name -> global arrays."""

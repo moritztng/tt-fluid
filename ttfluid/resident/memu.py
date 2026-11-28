@@ -62,6 +62,7 @@ class MachineEmu:
     def __init__(self, m, dtype=None):
         self.m = m
         self._bsc_seen = set()
+        self.kfold = None   # --kfold: Encoded.kfold, the fold tables (P, words); None: every constant page is streamed
         self.F = np.dtype(dtype or m.prog.dtype).type
         P = m.P
         T = m.T
@@ -393,6 +394,17 @@ class MachineEmu:
                 if t == 0:
                     self._page[id(u)] = self._ldr_vector(u)
                 D[u[1]] = self._page[id(u)][:, t * LANES:(t + 1) * LANES].copy()
+                if self.kfold is not None and m.kfolds(u):
+                    # --kfold: where the fold table codes page coff + t the device fills the slot from the palette and
+                    # no page comes. Read from the table words the device gets, so a wrong table shows here
+                    from .encode import kfold_codes
+                    code = kfold_codes(self.kfold, np.full((m.P, 1), m.phys[u[2]] - KBASE + t))[:, 0]
+                    sel = code > 0
+                    D[u[1]][sel] = self.kfold[sel, code[sel] - 1].view(np.float32).astype(F)[:, None]
+                    if t == 0:
+                        self.counts["kfold:streams"] += 1
+                    self.counts["kfold:pages"] += 1
+                    self.counts["kfold:folded"] += sel.sum() / m.P
             elif k == "lds":
                 D[u[1]] = self._shifted(u[2], t, u[3])
             elif k == "fill":
