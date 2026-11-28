@@ -22,6 +22,7 @@ The lowered program (MIR) is a list of
 Registers are IR register numbers plus temporaries; after allocation they are arena tile numbers (`phys`).
 """
 import bisect
+import hashlib
 import os
 from collections import Counter, defaultdict
 
@@ -278,12 +279,21 @@ def _aid(a):
     return (a.__array_interface__["data"][0], a.shape, a.strides, a.dtype.str)
 
 
-def cse(code):
+def _acid(a):
+    """An index array's identity by its content (dtype, shape, digest of the bytes): --cse 2. The tracer builds equal
+    index arrays again per caller (interp and grad of one field from two schemes), and by memory identity those
+    gathers never match, so everything computed from them is computed and gathered once per caller."""
+    a = np.asarray(a)
+    return (a.dtype.str, a.shape, hashlib.sha1(np.ascontiguousarray(a).tobytes()).digest())
+
+
+def cse(code, content=False):
     """Value numbering: an ew / gather / bsum / reduce that repeats an earlier one (same op on the same registers) is
     dropped and its uses read the earlier result. Same operations on the same values, so bit-exact; what goes is the
     trace's recomputation (grad U built three times in the momentum phase, interp of one field per caller, ...).
     Only single-definition registers take part as results. A copy into a register forgets every entry that reads it;
     a jump target forgets everything (a value from before a loop head or a merge may not hold on every path)."""
+    aid = _acid if content else _aid     # content: equal index arrays match whatever object holds them (--cse 2)
     defs = Counter(d for ins in code for d in _uses_defs(ins)[1])
     targets = {ins[-1] for ins in code if ins[0] in ("jump", "jumpif")}
     memo, readers, ren, out = {}, defaultdict(list), {}, []
@@ -300,7 +310,7 @@ def cse(code):
         elif op == "gather":
             ins = ("gather", ins[1], [(rn(s), c, p) for s, c, p in ins[2]])
             args = tuple(s for s, _, _ in ins[2])
-            key = ("gather",) + tuple((s, _aid(c), _aid(p)) for s, c, p in ins[2])
+            key = ("gather",) + tuple((s, aid(c), aid(p)) for s, c, p in ins[2])
         elif op == "bsum":
             ins, args = ("bsum", ins[1], rn(ins[2])), (rn(ins[2]),)
             key = ("bsum",) + args
@@ -988,8 +998,8 @@ class Machine:
         code = fold_constants(code, prog.space, prog.dtype)
         if cse_ir:
             n0 = len(code)
-            code = cse(code)[0]
-            log(f"cse: {n0} -> {len(code)} instructions")
+            code = cse(code, content=int(cse_ir) >= 2)[0]
+            log(f"cse: {n0} -> {len(code)} instructions" + (" (index arrays by content)" if int(cse_ir) >= 2 else ""))
         code = dce(code)
         self.sliced, self.ext = sliced, {}
         if sliced:
