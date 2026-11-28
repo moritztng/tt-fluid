@@ -1052,12 +1052,12 @@ class Machine:
         self.maps.finish(hrun)
         assert not (hsplit and len(self.maps.plans) > 1), "hsplit reads plan 0 only (vm_ncrisc N_HALO)"
         self._split_gathers()
-        self._halos()
         self.scratch_cap, self.span_homes, self.hoist, self.cap_min = scratch_cap, span_homes, hoist, cap_min
         self.sched = sched
+        if fuse and self.T > 1 and self.levels:
+            self._levels()      # before the halo pushes exist: each then goes out by its gathers' place in the level order
+        self._halos()
         if fuse and self.T > 1:
-            if self.levels:
-                self._levels()
             self._segments()
             self._scratch()
             if self.levels:
@@ -1563,11 +1563,13 @@ class Machine:
         """Order each straight-line piece of the outer iteration's body by gather level, so a level's blocks stand
         together and _segments fuses them. A value's level is the number of barriers on its longest path from the
         piece's inputs; a barrier is a read that needs every tile of its operand before the first tile of the result:
-        a gather or halo push of it, a shifted load, a read of a sum a tile loop accumulated. Inside a level the
-        gathers, halo pushes and one-tile blocks that depend on earlier levels only come first (grouped by source
-        value, so a halo push stays next to its gathers), then the vector blocks, same tile count together (a run has
-        one tile count). Every dependence is kept (read/write, write/read, write/write on every register), so each
-        block computes what it did. The solves' loops are left alone."""
+        a gather of it, a shifted load, a read of a sum a tile loop accumulated. Inside a level the gathers and
+        one-tile blocks that depend on earlier levels only come first (grouped by source value, so the gathers of one
+        halo stand together), then the vector blocks, same tile count together (a run has one tile count). Every
+        dependence is kept (read/write, write/read, write/write on every register), so each block computes what it
+        did. The solves' loops are left alone. Runs before _halos: a push placed on the ordered program holds its
+        slot from its first gather to its last, where pushes carried through the order all went out at their
+        level's head (23 slots live against 9 on the hood cut, more L1 than Small k2 has)."""
         from .census import region_of
         mir = self.mir
         reg = region_of(mir)
@@ -1581,7 +1583,7 @@ class Machine:
                 out.extend(cur)
             cur.clear()
         for j, ins in enumerate(mir):
-            if reg[j] == "outer" and ins[0] in ("blk", "gather", "halo", "red", "red2", "fetch", "out"):
+            if reg[j] == "outer" and ins[0] in ("blk", "gather", "red", "red2", "fetch", "out"):
                 cur.append(ins)
             else:
                 flush()
@@ -1610,7 +1612,7 @@ class Machine:
             for x in u:
                 if x[0] == "blk":
                     bar |= {v[2] for v in x[1] if v[0] == "lds"}
-                elif x[0] in ("gather", "halo"):
+                elif x[0] == "gather":
                     bar |= set(_mir_uses(x))
             if u[0][0] == "out":    # outputs keep their order
                 us.add("__out__")
@@ -1640,11 +1642,10 @@ class Machine:
             for r in D[k]:
                 lastw[r], reads[r] = k, []
         cls = [self.tiles(u) if len(u) == 1 and vecblk(u[0]) else 0 for u in units]     # 0: not a vector block
-        key = {}                   # head order: a source value's halo push and gathers stand together
+        key = {}                   # head order: a source value's gathers stand together
         for k in range(n):
             src = sorted((r for r in U[k] if isinstance(r, int)), key=lambda r: lastw.get(r, -1))
-            h = sorted(r for r in U[k] | D[k] if isinstance(r, tuple))
-            key[k] = (0, self.halo_regs[h[0][1]], k) if h else (1, src[0] if src else -1, k)
+            key[k] = (src[0] if src else -1, k)
         order = []
         for L in range(max(lvl) + 1 if n else 0):
             mine = [k for k in range(n) if lvl[k] == L]
