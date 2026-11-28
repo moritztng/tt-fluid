@@ -152,6 +152,8 @@ ap.add_argument("--images", help="CPU only: lower, write per-chip device images 
                 "their sha256 per chip goes to digests.json there")
 ap.add_argument("--min-free-gb", type=int, default=200, help="refuse an --images/--save/--mcache write that would leave its disk "
                 "under this many GB free (checked before lowering, and again with the image's exact size before writing it)")
+ap.add_argument("--stages", help="CPU lowering: seconds and peak resident GB of every lowering stage as JSON lines in this file "
+                "(ttfluid/lower/stages.py)")
 a = ap.parse_args()
 if a.tsort is None and not a.from_images:
     a.tsort = int(a.tabstream)
@@ -164,12 +166,16 @@ assert min(R, C) == 1 or a.block2d or a.plan or a.emuonly, "2D mesh %dx%d needs 
 GRID, l1_default, NCB, DA = ARCH[a.arch]
 a.l1_bytes = a.l1_bytes or l1_default
 K, P = R * C, GRID[0] * GRID[1]
-assert not a.cores or a.plan or a.emuonly or a.solve_census, "--cores: a CPU lowering only (the device grid is --arch's)"
+assert not a.cores or a.plan or a.emuonly or a.solve_census or a.images, "--cores: a CPU lowering only (the device grid is --arch's)"
 P = a.cores or P
 PP = -(-P // 4) * 4   # one chip's partials padded to 16 B (vm_brisc.cpp PP): P = 110 on BH, 72 on WH (unchanged)
 import ttfluid.resident.encode  # noqa: E402
 ttfluid.resident.encode.DA = DA
 
+from ttfluid.lower.stages import Stages  # noqa: E402
+ST = Stages(a.stages)
+with ST("imports"):
+    import ttfluid.solver.simple, ttfluid.resident.machine, ttfluid.resident.memu, ttfluid.resident.program  # noqa: E401,E402
 from ttfluid.solver.simple import SimpleFoam  # noqa: E402
 from ttfluid.resident.machine import Machine  # noqa: E402
 if a.owner:
@@ -256,13 +262,15 @@ else:
         assert saved == low, ("--mcache: lowering flags differ", {k: (saved.get(k), low[k]) for k in low if saved.get(k) != low[k]})
         print("machine from %s in %.1f s" % (a.mcache, time.time() - t0), flush=True)
     else:
-        s = SimpleFoam(a.case, backend="ell", dtype=np.float32, log=lambda *x: None,
-                       ell_order="dir" if a.layout == "lattice" else "face")
+        with ST("case"):
+            s = SimpleFoam(a.case, backend="ell", dtype=np.float32, log=lambda *x: None,
+                           ell_order="dir" if a.layout == "lattice" else "face")
         core = None
         if a.layout == "rcb" and K > 1:   # chip placement first (seconds): an unplaceable partition used to surface at plan(), an hour in
             import ttfluid.resident.machine
             from ttfluid.resident import chipplan
-            core = ttfluid.resident.machine.rcb(s.mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None, faces=ttfluid.resident.machine.mesh_faces(s.mesh))
+            with ST("partition"):
+                core = ttfluid.resident.machine.rcb(s.mesh.C, K * P, chips=K if a.strips or min(R, C) == 1 else None, faces=ttfluid.resident.machine.mesh_faces(s.mesh))
             nI = s.mesh.nInternalFaces
             chipplan.place_blocks(chipplan.chip_adjacency(core // P, s.mesh.owner[:nI], s.mesh.neighbour, K), K, R, C)
             print("placement ok: %d chip blocks one-hop on %dx%d" % (K, R, C), flush=True)
@@ -281,12 +289,17 @@ else:
                          amg_depth=a.amg_depth, amg_min_core=a.amg_min_core,
                          amg_vshape=VSHAPE)
         else:
-            prog = build(s, a.n, phase=a.phase)
-        m = Machine(prog, s.mesh, K * P, layout=a.layout, tiles=a.tiles, chip_cores=P, red2=None if a.red2 < 0 else bool(a.red2), chip_line=a.strips or min(R, C) == 1,
-                    l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
-                    joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
-                    bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg)
+            with ST("trace"):
+                prog = build(s, a.n, phase=a.phase)
+        ST.methods(Machine, ["_sliced", "_lower", "_fetches", "_split_gathers", "_halos", "_segments", "_scratch", "_allocate", "place"])
+        ST.methods(ttfluid.resident.machine.Maps, ["finish"])
+        ST.methods(ttfluid.resident.machine.Layout, ["__init__"])
+        with ST("machine"):
+          m = Machine(prog, s.mesh, K * P, layout=a.layout, tiles=a.tiles, chip_cores=P, red2=None if a.red2 < 0 else bool(a.red2), chip_line=a.strips or min(R, C) == 1,
+                      l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
+                      joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
+                      bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
+                      amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg)
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))
@@ -338,7 +351,11 @@ else:
     assert a.tabstream or not ttfluid.resident.encode.WIDE, "T=%d > 64 needs --tabstream" % m.T
     assert not (ttfluid.resident.encode.WIDE and (a.tgts or a.gtile)), "--tgts / --gtile hand over 16-bit gather entries (vm_compute tsvc): not with wide ones"
     if not a.load:
-        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
+        ST.methods(Encoded, ["_tables", "_arena"])
+        import ttfluid.resident.tabstream
+        ST.methods(ttfluid.resident.tabstream, ["stream"])
+        with ST("encode"):
+            E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
         if a.tscheck:   # as run_vm.py: NCRISC's streamed walk replayed against the cursor tables, every core
             from ttfluid.resident.tabstream import check
             check(E, E.tab_stream, E.tab_cursor)
@@ -373,8 +390,9 @@ else:
     if a.nwin and a.nwin < NMAX + 255:
         a.nwin = -(-(NMAX + 255) // 256) * 256
         print("--nwin raised to %d words (longest N op %d)" % (a.nwin, NMAX), flush=True)
-    tab = [list(row) for row in E.tab]
-    chipplan.rewrite(tab, E.tab_halo, range(K * P), pl, 1 if a.amg_global else NPL)   # halo sections: local ids, remote via gateways
+    with ST("rewrite"):
+        tab = [list(row) for row in E.tab]
+        chipplan.rewrite(tab, E.tab_halo, range(K * P), pl, 1 if a.amg_global else NPL)   # halo sections: local ids, remote via gateways
     gtab = pl["gtab"]
     info = dict(K=K, mesh=[R, C], place={k: cells[place[k]] for k in range(K)}, T=m.T, hmax=mp.hmax, nhalo=m.nhalo, shs=SHS, nsh=NSH,
                 cross_pairs={f"{x}->{y}": len(v) for (x, y), v in pairs.items()},
@@ -390,9 +408,12 @@ else:
     if a.images:
         from ttfluid.lower.image import Image
         t1 = time.time()
-        img = Image.from_lowering(m, E, tab, gtab, info, K, P, LOWER)
-        img.write(a.images, a.min_free_gb)
-        dig = {k: img.digest(k) for k in range(K)}
+        with ST("image"):
+            img = Image.from_lowering(m, E, tab, gtab, info, K, P, LOWER)
+        with ST("write"):
+            img.write(a.images, a.min_free_gb)
+        with ST("digest"):
+            dig = {k: img.digest(k) for k in range(K)}
         Path(a.images, "digests.json").write_text(json.dumps(dig, indent=1))
         print("images %s written in %.1f s, digests %s" % (a.images, time.time() - t1, json.dumps(dig)), flush=True)
         sys.exit(0)
