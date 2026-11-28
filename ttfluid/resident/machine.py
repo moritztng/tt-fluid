@@ -1250,6 +1250,7 @@ class Machine:
                         break
                     group.append(nxt)
                 skip.update(range(idx + 1, idx + len(group)))
+                last = idx + len(group) - 1   # where a run opened by the broadcasts ends (a round's member: here)
                 parts, tmps = [], []
                 for g in group:
                     assert g[2] == "sum", g
@@ -1302,7 +1303,7 @@ class Machine:
                     for g, tmp in zip(group, tmps):
                         if self.bcast_run:   # the broadcast opens the next fused run: its consumers share the block
                             run.append(("bcast", g[1], tmp))
-                            run_end = idx
+                            run_end = last
                         else:
                             mir.append(("blk", [("rvf", 0, tmp)], [(0, g[1])]))
             elif op == "out":
