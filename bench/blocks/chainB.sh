@@ -24,13 +24,16 @@ mkdir -p $HOME/flx/locks; exec 9>>$LOCK
 st "chainB armed pid $$ chip $CHIPS tree $SHA pz until $(date -u -d @$PZEND +%T)Z hood from $(date -u -d @$HSTART +%T)Z gives up $(date -u -d @$GIVEUP +%T)Z desc $TT_MESH_GRAPH_DESC_PATH"
 [ -e "$TT_MESH_GRAPH_DESC_PATH" ] || { st "no p150 mesh graph descriptor: not started"; exit 2; }
 
-leg() { # NAME IMG "LOWERING FLAGS" BLOCKS LEGMAX END(epoch, 0 = none) EXTRA -> run_mesh's rc; 6 refused, 7 no lock, 9 past END
+imgfail() { # IMG -> 0 once the newest hprep has failed this image or has ended without it
+  awk -v i="$1" '/hprep start/ {f = 0; d = 0} $2 == "img" && $3 == i && $4 != "rc=0" {f = 1} /hprep done/ {d = 1} END {exit !(f || d)}' $L/prep.status
+}
+leg() { # NAME IMG "LOWERING FLAGS" BLOCKS LEGMAX END(epoch, 0 = none) EXTRA -> run_mesh's rc; 8 image not built, 9 past END
   local n=$1 rc a d ms w=0
   while :; do
     [ -e $HOME/fleet/HANDBACK ] && { st "$n refused: HANDBACK"; exit 3; }
     [ $(now) -gt $GIVEUP ] && { st "$n: gave up"; exit 5; }
     [ $6 != 0 ] && [ $(( $(now) + $5 )) -gt $6 ] && { st "$n not started: it would not end by $(date -u -d @$6 +%T)Z"; return 9; }
-    [ -e $R/img/$2.ready ] || { [ $w = 0 ] && st "$n waits for image $2"; w=1; sleep 10; continue; }
+    [ -e $R/img/$2.ready ] || { imgfail $2 && { st "$n: image $2 was not built"; return 8; }; [ $w = 0 ] && st "$n waits for image $2"; w=1; sleep 10; continue; }
     if win $n && holder $n && flock -w 60 9; then
       closed $n 30 && break
       flock -u 9
