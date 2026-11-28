@@ -73,7 +73,8 @@ Each run appends one JSON row to `ttfluid_runs.jsonl` (`--out` to change). Usefu
 Other options:
 
 - `--chips 2` uses both chips of a p300 board (a 1x2 mesh). `--chips 4`, `8`, `16`, `32` map to 2x2, 2x4, 4x4 and 4x8
-  meshes for multi-card systems and Galaxies.
+  meshes for multi-card systems and Galaxies. On a Blackhole Galaxy `--chips 2` and `4` take a block of
+  neighbouring chips ([architecture.md](architecture.md#chips-boards-and-meshes)).
 - `--arch wh` for Wormhole.
 - `--no-check` skips the emulator (for large cases the emulator is slow).
 - Everything after `--` goes to the underlying runner, `python -m ttfluid.device.run_mesh --help`.

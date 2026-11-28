@@ -66,8 +66,8 @@ UNARY = ("neg", "abs", "sqrt", "tanh", "log", "exp")
 # =================================================================================================================
 def rcb(xyz, P, chips=None, faces=None):
     """Recursive coordinate bisection of points into P parts of near-equal size. chips = K > 1: chip first, for a
-    line of K chips: K equal strips along the longest axis (strip k on chip k, neighbours one hop apart), then
-    bisection of each strip into its P / K cores. faces = (owner, neighbour) of the internal faces: each bisection
+    line of K chips: K equal strips along the longest axis (strip k on chip k, neighbours one hop apart; with faces,
+    cells that would join strips two apart are moved so that none do), then bisection of each strip into its P / K cores. faces = (owner, neighbour) of the internal faces: each bisection
     cuts along the axis that cuts the fewest faces, not the longest one. On a mesh with a thin dense layer (the
     refinement above occDrivAer's ground) the longest axis slices the layer into parts 2-3 cells thick, almost all
     halo: the worst core's halo, which sizes every core's halo buffer, drops 3.3x on the coarse occDrivAer."""
@@ -78,6 +78,18 @@ def rcb(xyz, P, chips=None, faces=None):
         cut = [int(round(len(xyz) * k / chips)) for k in range(chips + 1)]
         for k in range(chips):
             parts[order[cut[k]:cut[k + 1]]] = k
+        if faces is not None:
+            # A strip thinner than the mesh's coarsest cells (equal counts make the strip through the refinement thin)
+            # lets its two neighbours share faces, and chips two apart on the line are not one hop apart. The cells that
+            # reach across move one strip up until every face joins the same or adjacent strips: a one-cell layer of
+            # coarse cells, so the counts stay near equal. Strips only rise and are bounded, so this ends.
+            fo, fn = np.asarray(faces[0]), np.asarray(faces[1])
+            while True:
+                a, b = parts[fo], parts[fn]
+                far = np.abs(a - b) > 1
+                if not far.any():
+                    break
+                parts[np.unique(np.where(a < b, fo, fn)[far])] += 1
         strip = parts.copy()
         for k in range(chips):
             sel = np.nonzero(strip == k)[0]

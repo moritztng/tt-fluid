@@ -109,20 +109,15 @@ On one p300c board at 1350 MHz this takes about 1250 s of device time for 800 it
 cases at once, one per board (`TT_VISIBLE_DEVICES=2,3` for the second).
 
 `--forces` evaluates the case's `forceCoeffs` function object on the state each iteration starts from and stores Cd
-and Cl in the history, which is saved with the final state in `motorbike_case_1x2_state.npz` (key `hist`). Extract it
-for the grader:
-
-```bash
-python -c "import numpy as np; open('motorbike.hist.json', 'w').write(str(np.load('motorbike_case_1x2_state.npz')['hist']))"
-```
+and Cl in the history, which is saved with the final state in `motorbike_case_1x2_state.npz`.
 
 ### 5. Grade and price it
 
 ```bash
-python3 bench/nvidia/cdwindow.py --dev motorbike.hist.json:0 --of coefficient.dat --from 101 --to 799
+python3 bench/cdgrade.py --run motorbike_case_1x2_state.npz:0
 python3 bench/per_dollar.py
 ```
 
-`coefficient.dat` is OpenFOAM's `postProcessing/forceCoeffsAll/0/coefficient.dat` from a CPU run of the same case,
-from the same potentialFoam start. [accuracy.md](accuracy.md) explains the windowed comparison, and
-[performance.md](performance.md) the cost model.
+`cdgrade.py` compares the mean drag over iterations 201-799 with OpenFOAM v2412 in fp64 (`results/openfoam/`, a CPU run
+of the same case from the same potentialFoam start) and exits 0 on a pass. [accuracy.md](accuracy.md) explains the
+windowed comparison, and [performance.md](performance.md) the cost model.
