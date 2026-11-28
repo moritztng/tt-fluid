@@ -379,7 +379,19 @@ class Encoded:
                 b(W(B_GATHER, len(ins[3])), phys[ins[1]], ins[2], *[phys[s] for s, _ in ins[3]])
             elif op == "gather":
                 assert phys[ins[1]] < DBASE and len(ins[3]) < 16, "an N_GATHER carries at most 15 parts"
-                n(W(N_GATHER, len(ins[3]), ins[4] if len(ins) > 4 else 0) | gt.get(j, 0) << 16, phys[ins[1]], ins[2])
+                mid = ins[2]
+                if tab_dense and len(ins[3]) == 1 and not (len(ins) > 4 and ins[4]) and phys[ins[3][0][0]] < DBASE:
+                    # a split gather (machine.py _place): the block in front stored the source read at the map's
+                    # shift, this op patches the residue. From one L1 vector both halves are one dense table: the
+                    # op reads the twin and writes every lane of its tiles (the block's copy stays, overwritten)
+                    k = j - 1
+                    while k >= 0 and mir[k][0] in ("sync", "tok"):
+                        k -= 1
+                    x = mir[k] if k >= 0 else ("",)
+                    if (x[0] == "blk" and [r for _, r in x[2]] == [ins[1]] and x[1][-1][0] == "lds"
+                            and x[1][-1][2] == ins[3][0][0] and all(u[2] == "__anchor__" for u in x[1][:-1])):
+                        mid = twin.setdefault((mid, x[1][-1][3]), len(m.maps.tab) + len(twin))
+                n(W(N_GATHER, len(ins[3]), ins[4] if len(ins) > 4 else 0) | gt.get(j, 0) << 16, phys[ins[1]], mid)
                 for src, h in ins[3]:
                     n(desc(src), NONE16 if h is None else halo_slot(h))
             elif op == "bscal":

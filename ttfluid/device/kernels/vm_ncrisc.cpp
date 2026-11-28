@@ -666,6 +666,9 @@ void kernel_main() {
                     const uint32_t* parts = N + pc + 2;
                     pc += 2 + 2 * nparts;
                     ++ngather;
+#ifdef CFD_DENSE
+                    const bool dn = (T[q0 + 1] >> 31) != 0;   // this core's table of the map is a dense twin: one part
+#endif
                     // tile 0's table reads go out before the halo wait, tile t + 1's before tile t is applied
                     load_tile(q0, 2 * nparts + 1, 0, 0, tm);
                     for (uint32_t k = 0; k < nparts && run; ++k)
@@ -688,6 +691,51 @@ void kernel_main() {
                         sp = sp_[t & 1], sn = sn_[t & 1];
                         if (t + 1 < tm) load_tile(q0, 2 * nparts + 1, t + 1, (t + 1) & 1, tm);
                         uint32_t* const dt = dst + WT * t;   // CFD_WIDE: entries carry the lane within tile t
+#ifdef CFD_DENSE
+                        if (dn) {
+                            // dense twin (tabstream.py): section 0 is this tile's 1,024 source lanes as uint16 in lane
+                            // order, so every lane is gathered once with a sequential store. The lanes are split over
+                            // this core, UNPACK and BRISC as --bgts/--tgts split entries; halo values and zero lanes
+                            // go on top once both have answered (their lanes got a dense value first)
+                            const uint32_t* const gs = A + parts[0] * 1024;
+                            const uint16_t* const ix = reinterpret_cast<const uint16_t*>(sp[0]);
+                            uint32_t* const o = dst + 1024 * t;
+                            uint32_t lo = 1024;
+#ifdef CFD_BGTS
+                            lo = 1024 * CFD_BGTS / 8;
+                            S[M_JOB] = reinterpret_cast<uint32_t>(gs);
+                            S[M_JOB + 1] = reinterpret_cast<uint32_t>(ix + lo);
+                            S[M_JOB + 2] = (1024 - lo) | 1u << 31;
+                            S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + lo);
+                            S[M_N] = 1;
+                            asm volatile("" ::: "memory");
+                            S[M_SEQ] = ++bseq;
+#endif
+#ifdef CFD_TGTS
+                            const uint32_t dq = 1024 * CFD_TGTS / 8 < lo ? 1024 * CFD_TGTS / 8 : 0;
+                            if (dq) {
+                                lo -= dq;
+                                S[T_JOB] = reinterpret_cast<uint32_t>(gs);
+                                S[T_JOB + 1] = reinterpret_cast<uint32_t>(ix + lo);
+                                S[T_JOB + 2] = dq | 1u << 31;
+                                S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + lo);
+                                S[T_N] = 1;
+                                asm volatile("" ::: "memory");
+                                S[T_SEQ] = ++tseq;
+                            }
+#endif
+                            gather16(gs, ix, lo, o);
+#ifdef CFD_BGTS
+                            if (!WAIT_UNTIL(S[M_DONE] == bseq, 21)) { run = false; break; }
+#endif
+#ifdef CFD_TGTS
+                            if (dq && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
+#endif
+                            scatter(hbuf(parts[1]), sp[1], sn[1], dt);
+                            for (uint32_t e = 0; e < sn[2]; ++e) dt[sp[2][e]] = 0;
+                        } else
+#endif
+                        {
 #ifdef CFD_BGTS
                         // BRISC scatters the upper (8 - CFD_BGTS) / 8 of every L1-source local and every halo section
                         // of this tile (vm_brisc.cpp bsvc, from inside its waits); this core does the rest and the
@@ -753,6 +801,7 @@ void kernel_main() {
 #ifdef CFD_TGTS
                         if (nt && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
 #endif
+                        }
 #ifdef CFD_GTILE
                         if (gowe + t + 1 >= gt && gowe && cb_pages_reservable_at_back(cb_nc, 1)) {
                             cb_reserve_back(cb_nc, 1);

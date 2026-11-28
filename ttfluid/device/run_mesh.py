@@ -657,7 +657,7 @@ def kd(src, ct, cfg, rt=None, crt=None):
         ([("CFD_TSORT", "1")] if a.tsort and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_BPATCH", str(a.bpatch))] if a.bpatch and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_BGTS", str(a.bgts))] if a.bgts and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
-        ([("CFD_DENSE", "1")] if a.tabdense and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
+        ([("CFD_DENSE", "1")] if a.tabdense and src in ("vm_ncrisc.cpp", "vm_brisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_TGTS", str(a.tgts))] if a.tgts and src in ("vm_ncrisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_GTILE", "1")] if a.gtile and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_NARROW", str(CB_H))] if a.narrow and src == "vm_compute.cpp" else []) + \
