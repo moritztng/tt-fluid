@@ -1890,12 +1890,13 @@ class Machine:
             for j, b in enumerate(blks):
                 uops = [(u[0], u[1], ren.get(u[2], u[2])) + u[3:] if u[0] in ("ld", "rvf") else u for u in b[1]]
                 later = {r for x in blks[j + 1:] for r in _mir_uses(x)}
+                later_defs = {r for x in blks[j + 1:] for _, r in x[2]}
                 sts = []
                 for slot, r in b[2]:
                     ren.pop(r, None)
                     if not self.is_vec(r):
                         sts.append((slot, r))
-                    elif r not in after:
+                    elif r not in after or r in later_defs:
                         ren[r] = self._tmp(SCRATCH)
                         self.stiles[ren[r]] = self.size(r)
                         sts.append((slot, ren[r]))
@@ -1906,7 +1907,106 @@ class Machine:
                     else:
                         sts.append((slot, r))
                 out.append(("blk", uops, sts))
-            mir[i] = ("seg", out)
+            out = self._seg_fuse(out)
+            mir[i] = ("seg", out) if len(out) > 1 else out[0]
+
+    def _seg_fuse(self, blks):
+        """Within one fused segment, eliminate one-tile scratch round-trips (bit-exact, same ldr order and tile count):
+        1) inline a single-use pseg ldr block into its immediate consumer block;
+        2) merge consecutive single-use scratch producer->consumer blocks when Dest slots fit in self.nslot."""
+        def u_slots(u):
+            k = u[0]
+            if k in ("ld", "ldr", "lds", "fill", "rvf", "fold"):
+                return (u[1],)
+            if k == "cpd":
+                return (u[1], u[2])
+            if k == "un":
+                return (u[2],)
+            if k == "op":
+                return u[2:]
+            raise ValueError(u)
+
+        def u_remap(u, mp):
+            k = u[0]
+            if k in ("ld", "ldr", "lds", "fill", "rvf", "fold"):
+                return (k, mp[u[1]]) + u[2:]
+            if k == "cpd":
+                return (k, mp[u[1]], mp[u[2]])
+            if k == "un":
+                return (k, u[1], mp[u[2]])
+            if k == "op":
+                return (k, u[1]) + tuple(mp[x] for x in u[2:])
+            raise ValueError(u)
+
+        t_orig = self.tiles(blks)
+        # Pass 1: inline single-use pseg ldr blocks ("blk", [("ldr", 0, ...)], [(0, s)]) into blks[j + 1]
+        out, j = [], 0
+        while j < len(blks):
+            if j + 1 < len(blks):
+                u0, s0 = blks[j][1], blks[j][2]
+                if len(u0) == 1 and u0[0][0] == "ldr" and len(s0) == 1 and s0[0][0] == u0[0][1]:
+                    s = s0[0][1]
+                    if isinstance(s, int) and self.space[s] is SCRATCH and all(s not in _mir_uses(b) for b in blks[j + 2:]):
+                        u1, s1 = blks[j + 1][1], blks[j + 1][2]
+                        idxs = [k for k, u in enumerate(u1) if u[0] == "ld" and u[2] == s]
+                        other = any((u[0] in ("lds", "rvf") and u[2] == s) or
+                                    (u[0] == "ldr" and (u[2] == s or any(x == s for x, _ in u[5]))) for u in u1)
+                        if len(idxs) == 1 and not other and s not in _mir_defs(blks[j + 1]):
+                            k = idxs[0]
+                            sl = u1[k][1]
+                            ldr_u = ("ldr", sl) + u0[0][2:]
+                            pre_sl = {x for u in u1[:k] for x in u_slots(u)}
+                            new_u = ([ldr_u] + u1[:k] + u1[k + 1:]) if sl not in pre_sl else (u1[:k] + [ldr_u] + u1[k + 1:])
+                            cand = ("blk", new_u, s1)
+                            if self.tiles(out + [cand] + blks[j + 2:]) == t_orig:
+                                out.append(cand)
+                                j += 2
+                                continue
+            out.append(blks[j])
+            j += 1
+        blks = out
+
+        # Pass 2: merge consecutive single-use scratch producer->consumer blocks within self.nslot Dest slots
+        out, j = [], 0
+        while j < len(blks):
+            cur = blks[j]
+            while j + 1 < len(blks):
+                uA, sA = cur[1], cur[2]
+                if len(sA) != 1:
+                    break
+                slA, rA = sA[0]
+                if not (isinstance(rA, int) and self.space[rA] is SCRATCH):
+                    break
+                if any(rA in _mir_uses(b) for b in blks[j + 2:]):
+                    break
+                uB, sB = blks[j + 1][1], blks[j + 1][2]
+                idxs = [k for k, u in enumerate(uB) if u[0] == "ld" and u[2] == rA]
+                other = any((u[0] in ("lds", "rvf") and u[2] == rA) or
+                            (u[0] == "ldr" and (u[2] == rA or any(x == rA for x, _ in u[5]))) for u in uB)
+                if len(idxs) != 1 or other or rA in _mir_defs(blks[j + 1]):
+                    break
+                k = idxs[0]
+                slB = uB[k][1]
+                pre_sl = {x for u in uB[:k] for x in u_slots(u)}
+                s_hold = next((s for s in (slB, slA, *range(self.nslot)) if s not in pre_sl), None)
+                if s_hold is None:
+                    break
+                mpA = list(range(self.nslot))
+                mpA[slA], mpA[s_hold] = s_hold, slA
+                mpB = list(range(self.nslot))
+                mpB[slB], mpB[s_hold] = s_hold, slB
+                new_u = ([u_remap(u, mpA) for u in uA]
+                         + list(uB[:k])
+                         + [u_remap(u, mpB) for u in uB[k + 1:]])
+                new_s = [(mpB[sl], r) for sl, r in sB]
+                cand = ("blk", new_u, new_s)
+                if self.tiles(out + [cand] + blks[j + 2:]) != t_orig:
+                    break
+                cur = cand
+                j += 1
+            out.append(cur)
+            j += 1
+        return out
 
     def _halos(self):
         mir = self.mir
@@ -2374,6 +2474,19 @@ class Machine:
     def _span_fill(self, mir, D, base):
         out, cur, held, nfill, npage, skipped = [], None, None, 0, 0, Counter()
         self.span_held = set()
+
+        def ensure(src):
+            nonlocal cur, held, nfill
+            if cur != src:
+                held = self._tmp(self.space[src])
+                if src in self.ext:
+                    self.ext[held] = self.ext[src]
+                self.phys[held] = base
+                self.span_held.add(held)
+                out.append(("blk", [("ld", 0, src)], [(0, held)]))
+                cur, nfill = src, nfill + 1
+            return held
+
         i = 0
         while i < len(mir):
             ins = mir[i]
@@ -2392,19 +2505,53 @@ class Machine:
                     else:
                         skipped[why] += 1
             if src is not None:
-                if cur != src:
-                    held = self._tmp(self.space[src])
-                    if src in self.ext:
-                        self.ext[held] = self.ext[src]
-                    self.phys[held] = base
-                    self.span_held.add(held)
-                    out.append(("blk", [("ld", 0, src)], [(0, held)]))
-                    cur, nfill = src, nfill + 1
-                out.append(("blk", list(ins[1][:-1]) + [("lds", u[1], held, u[3])], ins[2]))
-                out.append(("gather", nxt[1], nxt[2], [(held, h) for _, h in nxt[3]]))
+                h = ensure(src)
+                out.append(("blk", list(ins[1][:-1]) + [("lds", u[1], h, u[3])], ins[2]))
+                out.append(("gather", nxt[1], nxt[2], [(h, hl) for _, hl in nxt[3]]))
                 npage += 1
                 i += 2
                 continue
+            if ins[0] in ("seg", "blk"):
+                is_seg = ins[0] == "seg"
+                blks = ins[1] if is_seg else [ins]
+                sdefs = {r for b in blks for r in _mir_defs(b)}
+                cands = Counter()
+                for b in blks:
+                    for u in b[1]:
+                        if u[0] == "ldr" and u[4] is not None and u[2] is not None and u[2] in D:
+                            s = u[2]
+                            why = "constant" if s in self.alias else "parts" if any(x != s for x, _ in u[5]) \
+                                else "self" if s in sdefs else "nobase" if u[4] not in self.base else None
+                            if why is None:
+                                cands[s] += 1
+                            else:
+                                skipped[why] += 1
+                if cands:
+                    pick = max(cands, key=lambda r: (cands[r], r == cur))
+                    for r, cnt in cands.items():
+                        if r != pick:
+                            skipped["seg-multi"] += cnt
+                    h = ensure(pick)
+                    nblks = []
+                    for b in blks:
+                        nu = []
+                        for u in b[1]:
+                            if u[0] == "ldr" and u[4] is not None and u[2] == pick and \
+                                    all(x == pick for x, _ in u[5]) and u[4] in self.base:
+                                nu.append((u[0], u[1], h, u[3], u[4], [(h, hl) for _, hl in u[5]]))
+                                npage += 1
+                            elif u[0] == "ldr" and u[4] is not None and u[2] is None and \
+                                    u[5] and all(x == pick for x, _ in u[5]):
+                                nu.append((u[0], u[1], None, u[3], u[4], [(h, hl) for _, hl in u[5]]))
+                                npage += 1
+                            elif u[0] == "ld" and u[2] == pick:
+                                nu.append((u[0], u[1], h))
+                            elif u[0] == "lds" and u[2] == pick:
+                                nu.append((u[0], u[1], h, u[3]))
+                            else:
+                                nu.append(u)
+                        nblks.append(("blk", nu, b[2]))
+                    ins = ("seg", nblks) if is_seg else nblks[0]
             if cur is not None and cur in _mir_defs(ins):
                 cur = None
             out.append(ins)
@@ -2947,8 +3094,9 @@ def _adjacent_reduces(code, window=64):
                 break
             else:
                 ind.append(b)
+                wr |= d
             k += 1
-        if hit is None or not dins:
+        if hit is None or (not dins and not ind):
             out.append(a)
             i += 1
             continue

@@ -94,17 +94,19 @@ def pcg(A, x, b, c):
     q = A(p)
     alpha = rho / (p @ q)
     X.set(X.t + alpha * p)
-    R.set(r - alpha * q)
+    rn = r - alpha * q
+    R.set(rn)
     P.set(p)
     RHO_OLD.set(rho)
     it = IT.t + 1.0
     IT.set(it)
-    rn = R.t
-    res = np.abs(rn).sum() / nf
-    RES.set(res)
     wn = rD * rn
     W.set(wn)
-    RHO.set(rn @ wn)
+    a, g = np.abs(rn), rn * wn
+    sa, sg = a.sum(), g.sum()
+    res = sa / nf
+    RES.set(res)
+    RHO.set(sg)
     done = _converged(res, r0, c)
     if c.minIter > 0:
         done = done * (it >= float(c.minIter))
@@ -359,10 +361,13 @@ def pbicgstab(A, x, b, c):
         tr.jumpif(_converged(r0n, r0n, c).c[()], END)
     rD = 1.0 / A.d
     r0 = r.copy()
+    # rho = r0.r of the next pass sits beside |r| at the end of the loop (and t.t beside t.s), so --redm pairs each
+    # into one reduction and reuses r / t without re-reading DRAM; same values, same order
+    RHO_NEXT = Var(r0 @ r)
     tr.trips[LOOP] = 5
     tr.label(LOOP)
     tr.jumpif((IT.t >= float(c.maxIter)).c[()], END)
-    rho = r0 @ R.t
+    rho = RHO_NEXT.t
     beta = (rho / RHO.t) * (ALPHA.t / OMEGA.t)
     RHO.set(rho)
     tr.jumpif((np.abs(rho) < _vsmall(tr)).c[()], END)
@@ -384,13 +389,18 @@ def pbicgstab(A, x, b, c):
     tr.jumpif(done.c[()], EXIT_S)        # converged on s: x += alpha y, r = s, stop
     z = rD * s
     t = A(z)
-    tt = t @ t
-    omega = np.where(tt > 0, (t @ s) / tt, 0.0)
+    tt_, ts_ = t * t, t * s
+    tt, ts = tt_.sum(), ts_.sum()
+    omega = np.where(tt > 0, ts / tt, 0.0)
     OMEGA.set(omega)
     X.set(X.t + (alpha * y + omega * z))
-    R.set(s - omega * t)
-    res = np.abs(R.t).sum() / nf
+    rn = s - omega * t
+    R.set(rn)
+    a, g = np.abs(rn), r0 * rn
+    sa, rho_n = a.sum(), g.sum()
+    res = sa / nf
     RES.set(res)
+    RHO_NEXT.set(rho_n)
     done = _converged(res, r0n, c)
     done = done if gate is None else done * gate
     tr.jumpif(done.c[()], END)
