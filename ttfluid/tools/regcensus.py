@@ -317,7 +317,7 @@ def show(tag, o, log):
         f"{100 * o['regular_mod4']:.2f} % with shift % 4 == 0")
     for k in ("any", "mod4"):
         log(f"   runs {k}: " + "  ".join(f">={m}: {100 * v:.2f} %" for m, v in o[f"runs_{k}"].items())
-            + f" | runs per core >=4/16/64: " + "/".join(f"{v:.0f}" for v in o[f"nruns_{k}"].values()))
+            + " | runs per core >=4/16/64: " + "/".join(f"{v:.0f}" for v in o[f"nruns_{k}"].values()))
     log(f"   values per run {o['values_per_run']:.3f}; share of entries by run length 2^k..2^(k+1)-1: "
         + " ".join(f"{100 * x:.1f}" for x in o["run_hist_log2"]))
 

@@ -77,6 +77,25 @@ on the chip exactly as OpenFOAM's `tolerance` and `relTol` would decide it.
    allocates SRAM. Small cases keep every vector in SRAM. Large cases home vectors in DRAM and stream them through SRAM
    pages (`--tabstream`, `--page`, `--nwin`).
 
+On a large case most of a core's time goes into gathers: every neighbour value of every cell passes through a map
+table. Two lowering options make a gathered value cheaper without changing a value or the order of a sum, so the state
+stays bit-identical. Both are off by default.
+
+- `--tabdense N` stores a map whose window and residue read one SRAM vector a second time as a dense table, one 16-bit
+  source index per lane, on every core where it has at least N residue entries per tile. The kernels gather such a tile
+  with eight loads followed by eight stores: 6.4 cycles a value on Blackhole, against 12.1 for the residue entry by
+  entry (`ttfluid.tools.gbench` measures both on a chip).
+- `--span 1` gives a gather whose source vector is homed in DRAM an SRAM copy of that vector to read. The copy lives
+  in the span, one reserved slot of T tiles, and is filled by a streamed copy unless the span already holds the
+  vector. The gather is then served by the dense tables, with no window read and no gather-cache miss. `--span 2`
+  also turns such a gather into a single reader page when its destination is in SRAM.
+
+Two more options, also value-preserving and off by default, keep work out of DRAM. `--lsplit 1` parks a vector that
+holds an SRAM slot across a solver loop that does not use it in DRAM for the duration of the loop, so the loop's own
+vectors get the slot. `--lsplit 2` does the same for the solution of the solve, which the loop touches once a pass.
+`--cse 2` recognises gathers whose index arrays have the same content, so an interpolation or a gradient that several
+callers ask for is computed and gathered once.
+
 `ttfluid.resident.encode` packs the result into three uint32 streams per core, one for each kernel:
 
 - `vm_brisc.cpp` (BRISC) loads the core's arena and code, then runs the B stream: signals and waits, halo pushes with
@@ -114,7 +133,9 @@ the device run never holds the whole program in memory and reads only its chips'
 1. `run_mesh case N ... --images DIR` lowers and writes the images, then exits. For HPC_motorbike Small this takes about
    90 GB of RAM.
 2. `lower/of_state.py` turns an OpenFOAM time directory (for example the potentialFoam result) into a starting state.
-3. `run_mesh case N ... --from-images DIR --state-in STATE.npz` runs on the device.
+3. `run_mesh case N ... --from-images DIR --state-in STATE.npz` runs on the device. The launch reads only the bytes
+   the images store: four fifths of a Small image are zero pages, and they never reach host memory. HPC_motorbike
+   Small on two chips takes about 11 GB of host RAM per run.
 
 `lower/prep.py` and `lower/spmd.py` split the lowering into one process per chip for cases too large for one host
 process. That path is experimental in v0.1.0.

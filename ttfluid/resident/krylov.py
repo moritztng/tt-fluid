@@ -9,6 +9,7 @@ import os
 
 import numpy as np
 
+from ttfluid.solver import linsolve
 from ttfluid.solver.linsolve import Perf, SMALL
 
 from .trace import SCALAR, T, _obj
@@ -39,6 +40,12 @@ class Var:
 
 def _scalar(tr, v):
     return T(tr, SCALAR, np.array(tr.imm(v), object))
+
+
+def _vsmall(tr):
+    """SolverPerformance::vsmall_ (the singularity test of PBiCGStab's rho): VSMALL of the program's precision. The
+    double value 1e-300 is 0.0 as an fp32 constant, and `|rho| < 0` is never true: the test was dead on the device."""
+    return linsolve.vsmall(tr.dtype)
 
 
 def _converged(r, r0, c):
@@ -358,7 +365,7 @@ def pbicgstab(A, x, b, c):
     rho = r0 @ R.t
     beta = (rho / RHO.t) * (ALPHA.t / OMEGA.t)
     RHO.set(rho)
-    tr.jumpif((np.abs(rho) < 1e-300).c[()], END)
+    tr.jumpif((np.abs(rho) < _vsmall(tr)).c[()], END)
     p = R.t + beta * (P.t - OMEGA.t * V.t)
     P.set(p)
     y = rD * p
@@ -422,7 +429,7 @@ def _pbicgstab_joint(A, x, b, c):
     rD = 1.0 / A.d
     r0 = r.copy()
     RHO = Var(r0 @ r)
-    tr.jumpif((np.abs(RHO.t) < 1e-300).c[()], END)
+    tr.jumpif((np.abs(RHO.t) < _vsmall(tr)).c[()], END)
     tr.trips[LOOP] = 5
     tr.label(LOOP)
     rho = RHO.t
@@ -460,7 +467,7 @@ def _pbicgstab_joint(A, x, b, c):
     RHO.set(rho_n)
     done = _converged(res, r0n, c)
     done = done if gate is None else done * gate
-    tr.jumpif((done + (it >= float(c.maxIter)) + (np.abs(rho_n) < 1e-300)).c[()], END)
+    tr.jumpif((done + (it >= float(c.maxIter)) + (np.abs(rho_n) < _vsmall(tr))).c[()], END)
     tr.jump(LOOP)
     tr.label(EXIT_S)
     X.set(X.t + alpha * y)
