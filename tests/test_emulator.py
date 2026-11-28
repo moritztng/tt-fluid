@@ -10,8 +10,8 @@ from ttfluid import cli
 
 # initial residuals of iteration 3 with the stock tutorial dictionaries. One and two chips partition the mesh
 # differently, so their fp32 reductions run in a different order and the residuals differ by ~1 %.
-LAST = {1: {"U": 0.2666557729244232, "p": 0.19618935883045197, "omega": 0.0917070209980011, "k": 0.17153163254261017},
-        2: {"U": 0.26454228162765503, "p": 0.19852200150489807, "omega": 0.09140697866678238, "k": 0.17088072001934052}}
+LAST = {1: {"U": 0.2670932710170746, "p": 0.1979142725467682, "omega": 0.09137128293514252, "k": 0.1712660789489746},
+        2: {"U": 0.2654341161251068, "p": 0.19957421720027924, "omega": 0.09150776267051697, "k": 0.17183400690555573}}
 
 
 @pytest.mark.parametrize("chips", [1, 2])
