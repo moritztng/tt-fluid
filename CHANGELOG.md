@@ -22,8 +22,8 @@ All notable changes to this project are documented here. The format follows
   65 s to 18 s and its peak host memory from 29 GB to 11 GB.
 - Lowering HPC_motorbike Small needs about 90 GB of host RAM (the docs said 220 GB).
 - A run whose residuals become NaN or infinite ends in that iteration: `run_mesh` prints `DIVERGED` with the
-  iteration and the fields, saves the state and exits with status 4. Before, every linear solve of the remaining
-  iterations ran to its cap.
+  iteration and the fields, saves the state and exits with status 4 (with `--cases`, after the last case). Before,
+  every linear solve of the remaining iterations ran to its cap.
 
 ### Fixed
 - HPC_motorbike Small could go NaN in single precision: in iteration 337 of one of nine start states on four

@@ -38,7 +38,8 @@ ap.add_argument("--legs", type=int, default=0, help="with --from-images: chain t
                 "come back from the last run's dump): a whole case per process, the same answer as a --state-in chain")
 ap.add_argument("--cases", type=int, default=0, help="with --from-images: this many whole cases back to back in one process "
                 "(sweep mode), each from the images' start (or --state-in), each with its own state npz and result row; the mesh "
-                "opens once and the next case's DRAM homes are built on the host while the device runs this one")
+                "opens once and the next case's DRAM homes are built on the host while the device runs this one; a case that "
+                "diverges does not stop the cases after it, and the process then exits with status 4")
 ap.add_argument("--overlap", type=int, default=1, help="--cases: 1 = case k's outputs are copied on the device, case k+1 is "
                 "launched, and case k is read and saved over a second command queue while k+1 runs (the next homes are "
                 "written there too); 0 = the serial path (read, save, write, launch)")
@@ -226,6 +227,9 @@ def diverged(rows):
                 q + 1, ", ".join(bad), " ".join("%s=%s" % (k, r[k]) for k in r if not k.startswith("its"))), flush=True)
             return dict(row=q + 1, outer=r.get("outer"), fields=bad)
     return None
+
+
+diverged_cases = []   # --cases: the cases whose run diverged; they decide the exit status once every case has its line
 
 
 def mcache_open(mode):   # a --mcache path ending in .zst is read and written as a zstd stream (Small k4: 121 GB raw)
@@ -1045,12 +1049,17 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         f.write(json.dumps(res) + "\n")
     if res["abort"]["cores"] or not nrow:   # a run that aborted on its bounded waits is a failure, not a row
         raise SystemExit(3)
-    if res["diverged"] and not a.cases:   # the state is saved and the row is in the result; the answer is not one
-        raise SystemExit(4)
+    if res["diverged"]:   # the state is saved and the row is in the result; the answer is not one
+        if not a.cases:
+            raise SystemExit(4)
+        diverged_cases.append(tag)   # the program ended by itself, so the cases after this one still run
 
 
 try:
     main()
+    if diverged_cases:   # a process with a diverged case fails like a single diverged run, after every case has run
+        print("status 4: %d of %d cases diverged (%s)" % (len(diverged_cases), a.cases, " ".join(diverged_cases)), flush=True)
+        raise SystemExit(4)
 finally:   # a failed build or run must still release the mesh, or the interpreter hangs at exit
     ttnn.close_mesh_device(md)
     if FAB:
