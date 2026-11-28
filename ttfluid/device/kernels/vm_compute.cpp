@@ -71,11 +71,10 @@ void kernel_main() {
     // T-gather mailbox (vm_ncrisc.cpp, the 256 B of cb_sync before the B-patch one): NCRISC posts the top CFD_TGTS / 8
     // of each L1-source and halo section of a GATHER tile (src, entries, n, page) and bumps SEQ; UNPACK copies them from
     // inside every wait on a data mover or PACK and answers DONE = SEQ. Disjoint lanes: the same values, bit-exact
+#ifdef TRISC_UNPACK
     constexpr uint32_t TMB = CFD_SYNCB / 4 - 128, T_SEQ = TMB, T_DONE = TMB + 4, T_N = TMB + 8, T_JOB = TMB + 12;
     uint32_t tseen = 0;
-    auto tsvc = [&]() {
-        const uint32_t q = sw[T_SEQ];
-        if (q == tseen) return;
+    auto tsvc_run = [&](uint32_t q) __attribute__((noinline, noclone)) {
         for (uint32_t j = 0, nj = sw[T_N]; j < nj; ++j) {
             const uint32_t* src = reinterpret_cast<const uint32_t*>(sw[T_JOB + 4 * j]);
             const uint32_t* xs = reinterpret_cast<const uint32_t*>(sw[T_JOB + 4 * j + 1]);
@@ -113,9 +112,10 @@ void kernel_main() {
         sw[T_DONE] = q;
         tseen = q;
     };
-    // UNPACK spins on tsvc until cb has a page; the cb_wait_front after it then returns at once. Every CB wait of UNPACK
+#endif
+    // UNPACK spins on T_SEQ until cb has a page; the cb_wait_front after it then returns at once. Every CB wait of UNPACK
     // is one of these; a TRISC stuck behind a PACK that waits on a full cb_cn would not be, and NCRISC then aborts (22)
-#define TWAIT(cb) UNPACK(({ while (static_cast<uint16_t>(reg_read(reinterpret_cast<uint32_t>(get_cb_tiles_received_ptr(cb))) - get_local_cb_interface(cb).tiles_acked) == 0) tsvc(); }))
+#define TWAIT(cb) UNPACK(({ while (static_cast<uint16_t>(reg_read(reinterpret_cast<uint32_t>(get_cb_tiles_received_ptr(cb))) - get_local_cb_interface(cb).tiles_acked) == 0) { const uint32_t q_ = sw[T_SEQ]; if (q_ != tseen) tsvc_run(q_); } }))
 #else
 #define TWAIT(cb)
 #endif
@@ -125,13 +125,14 @@ void kernel_main() {
     // census: per-op wall-clock cycles of this thread (time from one op's issue to the next's) and op counts
     uint64_t cyc[40];   // stored in 16-cycle units (>> 4): a 100-it mesh run is ~2^35 cycles
     uint32_t cnt[40];
+#pragma GCC unroll 1
     for (uint32_t i = 0; i < 40; ++i) cyc[i] = cnt[i] = 0;
     uint32_t tprev = static_cast<uint32_t>(ckernel::read_wall_clock());
 #endif
 #ifdef CFD_PROFW
-    // run_mesh --prof 2: who MATH waits for. UNPACK and PACK publish what they wait in (hdr 300 / 301: 0 at work; UNPACK
+    // run_mesh --prof 2: who MATH waits for. UNPACK and PACK publish what they wait in (hdr 304 / 305: 0 at work; UNPACK
     // 1 a reader page, 2 NCRISC's token, 3 BRISC's token, 4 PACK's token, 5 a code page; PACK 1 a free writer page, 2 a
-    // code page, 3 / 4 a free token page to BRISC / NCRISC), NCRISC its op and part (hdr 302, vm_ncrisc.cpp). MATH drains
+    // code page, 3 / 4 a free token page to BRISC / NCRISC), NCRISC its op and part (hdr 306, vm_ncrisc.cpp). MATH drains
     // its Tensix pipeline before a load or an acquire (its own queued work), issues it, and drains again: the post of
     // that drain lands when the unpacker (the packer) has let the instruction through, and each poll's cycles go to the
     // state published at that poll: loads to hdr 700 + 2 (16 unpack state + reader class), acquires to 960 + 2 pack
@@ -140,8 +141,9 @@ void kernel_main() {
 #define USTATE(s) UNPACK((hw[304] = (s)))
 #define PSTATE(s) PACK((hw[305] = (s)))
 #ifdef TRISC_MATH
+#pragma GCC unroll 1
     for (uint32_t i = 700; i < 992; ++i) hw[i] = 0;
-    auto wadd = [&](uint32_t i, uint32_t dt) __attribute__((noinline)) {   // out of line, as the three below: one copy each, the kernel config buffer is 69 KB
+    auto wadd = [&](uint32_t i, uint32_t dt) __attribute__((noinline, noclone, optimize("Os"))) {   // out of line, as the three below: one copy each, the kernel config buffer is 69 KB
         const uint32_t lo = hw[i], nl = lo + dt;
         hw[i] = nl;
         if (nl < lo) hw[i + 1] = hw[i + 1] + 1;
@@ -164,7 +166,7 @@ void kernel_main() {
     };
     // kind 0: after a load (cross-check of mload's poll, to 978: only the get and the four clears are left), 1: after an
     // acquire (cross-check of macq's poll, to 952: nothing is left), 2: own work (976)
-    auto mdrain = [&](uint32_t kind) __attribute__((noinline)) {
+    auto mdrain = [&](uint32_t kind) __attribute__((noinline, noclone, optimize("Os"))) {
         uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
         ckernel::t6_semaphore_wait_on_max<ckernel::p_stall::STALL_SYNC>(ckernel::semaphore::MATH_DONE);
         ckernel::t6_semaphore_post<ckernel::p_stall::MATH | ckernel::p_stall::WAIT_SFPU>(ckernel::semaphore::MATH_DONE);
@@ -182,7 +184,7 @@ void kernel_main() {
     // unpacker polled on the RISC-V between the mailbox write UNPACK blocks on and the semaphore get: nothing is queued
     // then, so nothing blocks ahead of the poll, and each poll's cycles go to 700 + 2 (16 unpack state + reader class);
     // the last poll to 986
-    auto mload = [&](uint32_t dst) __attribute__((noinline)) {
+    auto mload = [&](uint32_t dst) __attribute__((noinline, noclone, optimize("Os"))) {
         mdrain(2);
         ckernel::math::math_unpack_to_dest_math_ready();
         ckernel::math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::DestReg>(dst);
@@ -204,7 +206,7 @@ void kernel_main() {
     // an acquire's wait for the packer, polled on the RISC-V before the acquire is issued: MATH_PACK counts the dest
     // sections committed and not yet released, the acquire stalls while it is at its maximum (2 with SyncHalf, 1 with
     // SyncFull). Each poll's cycles go to 960 + 2 pack state, the last poll to 954
-    auto macq = [&]() __attribute__((noinline)) {
+    auto macq = [&]() __attribute__((noinline, noclone, optimize("Os"))) {
         constexpr uint32_t mpmax = (DST_SYNC_MODE == DstSync::SyncFull) ? 1 : 2;
         mdrain(2);
         uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
@@ -499,10 +501,10 @@ void kernel_main() {
     }
 #ifdef CFD_PROF
     // hdr words 128 + 40 * thread + op (UNPACK, MATH, PACK), op counts at 248 + op
-    UNPACK(for (uint32_t i = 0; i < 40; ++i) hw[128 + i] = static_cast<uint32_t>(cyc[i] >> 4));
-    MATH(for (uint32_t i = 0; i < 40; ++i) hw[168 + i] = static_cast<uint32_t>(cyc[i] >> 4));
-    PACK(for (uint32_t i = 0; i < 40; ++i) hw[208 + i] = static_cast<uint32_t>(cyc[i] >> 4));
-    UNPACK(for (uint32_t i = 0; i < 40; ++i) hw[248 + i] = cnt[i]);
+    UNPACK(({ _Pragma("GCC unroll 1") for (uint32_t i = 0; i < 40; ++i) hw[128 + i] = static_cast<uint32_t>(cyc[i] >> 4); }));
+    MATH(({ _Pragma("GCC unroll 1") for (uint32_t i = 0; i < 40; ++i) hw[168 + i] = static_cast<uint32_t>(cyc[i] >> 4); }));
+    PACK(({ _Pragma("GCC unroll 1") for (uint32_t i = 0; i < 40; ++i) hw[208 + i] = static_cast<uint32_t>(cyc[i] >> 4); }));
+    UNPACK(({ _Pragma("GCC unroll 1") for (uint32_t i = 0; i < 40; ++i) hw[248 + i] = cnt[i]; }));
 #endif
 #ifdef CFD_PHASE
     MATH(({
