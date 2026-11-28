@@ -12,6 +12,7 @@
 # pays and host RAM allows, else 3. The batch makespan (launch of the first case to exit of the last) is the number:
 # cases per GPU-hour = k x 3600 / makespan.
 # Usage: pack_plan.sh <work-dir> <deadline-seconds>    env CELLS ("1:off 2:mps 4:mps auto 2:off"), IT (800), GPUS ("0"), WRITE, CPG
+#        pack_plan.sh --check                            checks CELLS and exits (rc 1 and a PLAN-FAILED line on a bad cell)
 # GPUS="0 1 ... 7" fills a whole box: a cell then runs k cases on EACH listed GPU in one batch (cases _c0.. in GPU
 # order), so the makespan carries the shared host; per_case stays makespan / k, the per-GPU figure the price uses. One
 # MPS control daemon serves every GPU (NVIDIA: one per node). WRITE=1 has every case write its final fields (binary)
@@ -21,9 +22,20 @@
 # host with more cores cannot flatter a packed cell. Without it the cases float over every CPU the container may use.
 # Expects in <work-dir>: mbs_np1/ (the case), libspumaBoundFix_spdp.so, and the spumaS bundle unpacked under /opt.
 set -u
-W=$1; DL=$2; T0=$(date +%s); H=$(cd $(dirname $0) && pwd)
+W=$1; DL=${2:-0}; T0=$(date +%s); H=$(cd $(dirname $0) && pwd)
 IT=${IT:-800}; GS=${GPUS:-${GPU:-0}}; NG=$(echo $GS | wc -w); CELLS=${CELLS:-1:off 2:mps 4:mps auto 2:off}
 stamp() { echo "[$(date -u +%FT%TZ)] $*"; }
+# Every cell is checked before the first one runs, and `pack_plan.sh --check` (env CELLS) lets a session driver check
+# them before it rents a box. A cell with a field in the wrong place used to end the plan under `set -u` with no
+# PLAN-END line, and a variant without its dictionary ran the baseline under the variant's name.
+for c in $CELLS; do
+  [ $c = auto ] && continue
+  [[ $c =~ ^[0-9]+:(mps|off)(:[A-Za-z0-9_-]*(:[0-9]*(:[0-9]*(:[A-Za-z0-9_]*)?)?)?)?$ ]] ||
+    { stamp "PLAN-FAILED: bad cell $c, want <k>:<mps|off>[:<variant>[:<its>[:<need-s>[:<case>]]]]"; exit 1; }
+  IFS=: read -r _ _ cv _ <<< "$c"; [ "$cv" = - ] && cv=
+  [ -f $H/fvSolution.spuma.mbs${cv:+.$cv} ] || { stamp "PLAN-FAILED: cell $c, no $H/fvSolution.spuma.mbs${cv:+.$cv}"; exit 1; }
+done
+[ "$W" = --check ] && exit 0
 left() { echo $(( DL - ($(date +%s) - T0) - 60 )); }
 ms() { awk -v t=$1 '$1=="CELL" && $2==t {print $3}' $W/cells.tsv | tail -1; }   # makespan of a finished cell, "" if none
 nvidia-smi --query-gpu=index,name,memory.total,clocks.max.sm,clocks.max.mem,power.limit,driver_version,compute_mode --format=csv
