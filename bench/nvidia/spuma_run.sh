@@ -1,6 +1,8 @@
 #!/bin/bash
 # SPUMA simpleFoam on one GPU, or one rank per GPU, on a case initialised on the CPU.
 # Usage: spuma_run.sh <case-dir> <iters> <pool-GiB|dummy> [fvSolution-file] [function-objects 0|1] [writeInterval]
+# writeInterval = <iters> writes the final fields once, in binary: the counterpart of the state download a
+# Tenstorrent run is charged. The default (100000) writes nothing.
 # pool "dummy" = SPUMA's dummyMemoryPool (one cudaMallocManaged per allocation). The run starts from the latest time.
 # Expects a SPUMA runtime bundle under /opt (SPUMA env: spumaM = fp64, spumaS = SPDP mixed; plus /opt/nvrt) and its
 # bound() fix lib (BFX env, default libspumaBoundFix.so beside this script).
@@ -15,7 +17,7 @@ BF=${BFX:-$(cd $(dirname $0) && pwd)/libspumaBoundFix.so}  # boundfix/: SPUMA's 
 S=/opt/${SPUMA:-spumaM}
 cd $C
 [ -n "$FVS" ] && cp $FVS system/fvSolution
-sed -i -E "s/^endTime .*/endTime $IT;/; s/^writeInterval .*/writeInterval $WI;/" system/controlDict
+sed -i -E "s/^endTime .*/endTime $IT;/; s/^writeInterval .*/writeInterval $WI;/; s/^writeFormat .*/writeFormat binary;/" system/controlDict
 P=$(ls -d $S/platforms/linux64Nvidia*Int32Opt | head -1)
 set --  # OpenFOAM's bashrc reads positional arguments as config overrides
 set +u; export WM_COMPILER=Nvidia; source $S/etc/bashrc >/dev/null 2>&1; set -u
@@ -49,13 +51,15 @@ else
   LD_PRELOAD=$PRE simpleFoam $NOFO $POOLOPT > log.simpleFoam 2>&1 &
 fi
 SF=$!; trap 'kill -TERM $SF' TERM   # an outer timeout still gets the summary
-while kill -0 $SF 2>/dev/null; do
-  grep -qi "residual = -\?nan" log.simpleFoam && { echo "NaN at $(grep -c '^Time =' log.simpleFoam), stopping"; kill -TERM $SF; }
-  sleep 10
-done
-wait $SF; echo "simpleFoam rc=$?"
+( while sleep 10; do
+    grep -qi "residual = -\?nan" log.simpleFoam && { echo "NaN at $(grep -c '^Time =' log.simpleFoam), stopping"; kill -TERM $SF; break; }
+  done ) &
+NANW=$!
+# The wall ends when the solver exits, not at the next poll (the poll used to add up to 10 s to every makespan).
+wait $SF; rc=$?; while kill -0 $SF 2>/dev/null; do wait $SF; rc=$?; done   # a trapped TERM returns from wait early
+echo "simpleFoam rc=$rc"
 t1=$(date +%s.%N)
-kill $SMI
+kill $SMI $NANW 2>/dev/null
 awk '/^Time = /{t=$3} /^ExecutionTime/{print t"\t"$3}' log.simpleFoam > iters.tsv
 python3 - "$C" "$t0" "$t1" <<'EOF' | tee summary.txt
 import sys, statistics as st
