@@ -169,6 +169,17 @@ three iterations later the two drag values are 44 counts apart. A run that track
 else is graded on the window. Eleven iterations are enough for this check: given a run that short, the tool prints
 the tracking line alone.
 
+Runs that track each other are draws of one arithmetic, so their windows can be pooled into one grade, which is how
+a set of 800-iteration runs reaches the 12.5 bar. Each `--pool` adds a run; the tool refuses one that does not track
+the first, and it leaves out the first block of every added run because that block still follows the first run. The
+eight SPUMA SPDP runs on H100 and the one on B200 pool to +8.4 +- 4.6 counts over 5,400 iterations: a pass.
+
+```bash
+H=results/nvidia/dgx-h100
+python3 bench/cdgrade.py --run $H/A_SPDP_g0/coefficient.dat --pool results/nvidia/b200/A_SPDP_g0/coefficient.dat \
+    $(for g in 1 2 3 4 5 6 7; do echo --pool $H/A_SPDP_g$g/coefficient.dat; done)
+```
+
 What the runs in `results/` grade as:
 
 | run | window | Cd against OpenFOAM, counts | band | grade |

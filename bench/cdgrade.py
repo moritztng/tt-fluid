@@ -1,7 +1,8 @@
 """Grade the drag of an HPC_motorbike Small run against OpenFOAM v2412 fp64. One tool for device histories and
 OpenFOAM/SPUMA coefficient files.
 
-    python3 bench/cdgrade.py --run RUN [RUN ...] [--base RUN ...] [--ref coefficient.dat ...] [--from 201] [--to N]
+    python3 bench/cdgrade.py --run RUN [RUN ...] [--base RUN ...] [--pool RUN ...]... [--ref coefficient.dat ...]
+        [--from 201] [--to N]
 
 RUN is `X_state.npz:IT0` or `X.hist.json:IT0` (the history run_mesh --forces saves with the final state; row k holds
 Cd_in/Cl_in of the state iteration IT0 + k starts from, which is OpenFOAM's row for that iteration) or an OpenFOAM
@@ -25,6 +26,10 @@ A change that only reorders the same arithmetic has a much sharper check, also p
 start from the same state: such runs still track each other through iteration 10 (TRACK), long before the window.
 After that one linear solve taking one iteration more or fewer separates them for good. A run too short for a window
 (11 iterations are enough) gets this check alone, and the exit status is its result.
+
+Runs that track each other are draws of one arithmetic, so their windows can be pooled into one grade: each --pool
+adds such a run (the tool refuses one that does not track --run), and the pooled window counts every run's blocks
+except the first block of each added run, which still follows the first run.
 """
 import argparse
 import json
@@ -106,10 +111,25 @@ def grade(run, ref, base=None, lo=START, hi=None):
     return out
 
 
+def pooled(grades):
+    """One grade from the grades of several runs of the same arithmetic: the mean over all their window iterations."""
+    its = [g["window"][1] - g["window"][0] + 1 for g in grades]
+    n = sum(its) / BLOCK - (len(grades) - 1)
+    out = dict(runs=len(grades), its=sum(its))
+    for name in ("Cd", "Cl"):
+        diff = sum(g[name]["diff"] * k for g, k in zip(grades, its)) / sum(its)
+        sig = math.hypot(S100[name] / math.sqrt(n), grades[0][name]["ref_se"])
+        out[name] = dict(diff=diff, sigma=sig, band=max(BAND, 2 * sig), detects=max(BAND, 2 * sig) + 1.28 * sig,
+                         ok=abs(diff) <= max(BAND, 2 * sig))
+    out["grade"] = "PASS" if out["Cd"]["ok"] else "FAIL"
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--run", nargs="+", required=True)
     ap.add_argument("--base", nargs="+")
+    ap.add_argument("--pool", nargs="+", action="append", default=[], help="another run of the same arithmetic")
     ap.add_argument("--ref", nargs="+", default=REF)
     ap.add_argument("--from", dest="lo", type=int, default=START)
     ap.add_argument("--to", dest="hi", type=int)
@@ -124,7 +144,8 @@ def main():
     if base is not None and a.hi is None and max(run) < a.lo + BLOCK - 1 and (t := tracks(run, base)) is not None:
         track(t)
         sys.exit(not t <= TRACK)
-    g = grade(run, series(a.ref), base, a.lo, a.hi)
+    ref = series(a.ref)
+    g = grade(run, ref, base, a.lo, a.hi)
     lo, hi = g["window"]
     print(f"window {lo}-{hi} ({hi - lo + 1} its), reference OpenFOAM its {g['ref_its'][0]}-{g['ref_its'][1]}")
     for name in ("Cd", "Cl"):
@@ -144,6 +165,21 @@ def main():
     c = g["Cd"]
     print(f"GRADE: {g['grade']}  Cd {c['diff']:+.1f} counts against a band of {c['band']:.1f} on {lo}-{hi}; a bias of "
           f"{c['detects']:.0f} counts fails 9 times in 10")
+    if a.pool:
+        grades = [g]
+        for spec in a.pool:
+            r = series(spec)
+            if (t := tracks(r, run)) is None or not t <= TRACK:
+                raise SystemExit(f"not pooled: {spec[0]} does not track --run through iteration {TRACK_ITS} "
+                                 f"({'those iterations are missing' if t is None else f'{t:.2f} counts'})")
+            grades.append(grade(r, ref, None, a.lo, a.hi))
+            w, c = grades[-1]["window"], grades[-1]["Cd"]
+            print(f"pooled with {spec[0]}: window {w[0]}-{w[1]}, Cd {c['diff']:+.1f} counts, tracks to {t:.2f}")
+        g["pooled"] = q = pooled(grades)
+        g["grade"], c = q["grade"], q["Cd"]
+        print(f"POOLED GRADE: {q['grade']}  Cd {c['diff']:+.1f} +- {c['sigma']:.1f} counts (Cl {q['Cl']['diff']:+.1f}) "
+              f"against a band of {c['band']:.1f} on {q['its']} iterations of {q['runs']} runs; a bias of "
+              f"{c['detects']:.0f} counts fails 9 times in 10")
     if a.json:
         json.dump(g, open(a.json, "w"), indent=1)
     sys.exit(g["grade"] != "PASS")

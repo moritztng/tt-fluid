@@ -70,3 +70,15 @@ def test_a_short_run_gets_the_reorder_check_alone(tmp_path, monkeypatch, error, 
     with pytest.raises(SystemExit) as e:
         cdgrade.main()
     assert e.value.code == status
+
+
+def test_runs_of_one_arithmetic_pool_into_one_grade(monkeypatch, capsys):
+    """Eight SPUMA runs that differ only in reduction order grade as one 4,800-iteration window at the 12.5 bar."""
+    spdp = [str(H100 / f"A_SPDP_g{g}" / "coefficient.dat") for g in range(8)]
+    q = cdgrade.pooled([cdgrade.grade(cdgrade.series([f]), REF) for f in spdp])
+    assert q["its"] == 4800 and q["Cd"]["band"] == cdgrade.BAND and q["grade"] == "PASS"
+    assert abs(q["Cd"]["sigma"] - (20 ** 2 / (48 - 7) + 3.5 ** 2) ** 0.5) < 0.05
+    monkeypatch.setattr(sys, "argv", ["cdgrade.py", "--run", spdp[0], "--pool", str(H100 / "A_DP_g0" / "coefficient.dat")])
+    with pytest.raises(SystemExit) as e:   # fp64 is another arithmetic: it does not track, so it is not pooled
+        cdgrade.main()
+    assert "not pooled" in str(e.value.code)
