@@ -33,6 +33,7 @@ class Image:
     def __init__(self, shared, chips):
         self.shared = shared          # name -> array or JSON-able object
         self._chips = chips           # k -> dict, or k -> path (lazy)
+        self._members = {}            # (k, space) -> members(k, space)
         self.s = shared["scalars"]
 
     # ---- from a global lowering --------------------------------------------------------------------------------
@@ -186,16 +187,33 @@ class Image:
             out[name] = np.stack(arrs, -1).reshape(arrs[0].shape + tuple(shape)) if shape else arrs[0]
         return out
 
+    def members(self, k, spn):
+        """Chip k's elements of space spn in the order they lie on the chip: (core, tile, lane in the tile, global id),
+        so a register's values are written front to back (in global-id order every write lands on another page)."""
+        if (k, spn) not in self._members:
+            ch = self.chip(k)
+            core, lane, ids = (np.asarray(ch[f"{a}/{spn}"]) for a in ("core", "lane", "ids"))
+            o = np.argsort(core.astype(np.int64) << 32 | lane, kind="stable")
+            self._members[k, spn] = core[o], lane[o] // LANES, lane[o] % LANES, ids[o]
+        return self._members[k, spn]
+
     def put_state(self, k, arena, home, state):
         """The inverse of state() for chip k: write name -> global array (state()'s layout) into chip k's arena
         (P, ntiles, LANES) and DRAM homes (P, hpages, LANES), fp32 views, in place, so the next launch starts from it
         (a restart). Either array may be None to write only the other. A register the lowering kept as a constant
-        must already hold the value: a state that changes one cannot be loaded into these images."""
+        must already hold the value: a state that changes one cannot be loaded into these images. The components of
+        a name are gathered together, one row per element, and each register is written on its own thread (numpy
+        indexing releases the GIL): Small k2 lays 122 M values over a chip's homes."""
         from ttfluid.resident.machine import DBASE
+
+        def put(X, idx, col):
+            X[idx] = col
+        jobs = []
         for name, shape, regs in self.shared["state"]:
             v = np.asarray(state[name], np.float32)
             v = v.reshape(v.shape[0], -1) if shape else v[:, None]
             assert v.shape[1] == len(regs), (name, v.shape, len(regs))
+            g = None
             for i, (spn, t, n) in enumerate(regs):
                 if t is None:
                     c = np.asarray(self.shared["const_state"][f"{name}/{i}"], np.float32)
@@ -205,13 +223,16 @@ class Image:
                 X, tt = (home, t - DBASE) if t >= DBASE else (arena, t)
                 if X is None:
                     continue
-                ch = self.chip(k)
-                lane = np.asarray(ch["lane/" + spn])
-                X[np.asarray(ch["core/" + spn]), tt + lane // LANES, lane % LANES] = v[np.asarray(ch["ids/" + spn]), i]
+                core, tile, lane, ids = self.members(k, spn)
+                if g is None:
+                    g = v[ids]
+                jobs.append(_READERS.submit(put, X, (core, tt + tile, lane), g[:, i]))
+        for j in jobs:
+            j.result()
 
 
 GAP, CHUNK = 1 << 18, 1 << 26      # read_into: stored ranges closer than GAP are one read; a read is at most CHUNK
-_READERS = ThreadPoolExecutor(int(os.environ.get("CFD_IMG_THREADS", 8)))   # preadv releases the GIL
+_READERS = ThreadPoolExecutor(int(os.environ.get("CFD_IMG_THREADS", 8)))   # preadv and numpy indexing release the GIL
 
 
 class _ChipFiles(dict):
