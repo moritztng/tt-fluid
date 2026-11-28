@@ -115,17 +115,19 @@ def bpatch_auto(loc, bpatch_min):
 
 
 def stream(E, sort=False, dense=None, brk=0):
-    """dense: [(map, shift, min local entries a tile)]: twin j is map nm + j, the same entries as its map, stored
-    dense on a core when the local residue entries per tile reach the minimum (encode.py points the pages whose
-    window and residue come from one L1 vector at the twin). brk: the broken arm of the dense gate: on core 0 the
-    first brk pairs of residue lanes of every dense table read each other's source (the state compare must fail)."""
+    """dense: [(map, shift, min local entries a tile[, force_tm])]: twin j is map nm + j, the same entries as its map,
+    stored dense on a core when the local residue entries per tile reach the minimum (encode.py points the pages whose
+    window and residue come from one L1 vector at the twin). force_tm > 0: when dense, extend the dense table to at
+    least force_tm tiles so N_GATHER overwrites every tile of its destination vector without a preceding split-gather
+    lds pass. brk: the broken arm of the dense gate: on core 0 the first brk pairs of residue lanes of every dense
+    table read each other's source (the state compare must fail)."""
     m = E.m
     dense = list(dense or [])
     assert not (dense and _enc.WIDE), "dense tables index 16-bit lanes"
     ndense = 0
     P, T, nm = len(E.tab), m.T, len(m.maps.tab)      # E's rows: every core, or the cores of Encoded(cores=)
     nparts = [t["nparts"] for t in m.maps.tab]
-    nparts += [nparts[o] for o, _, _ in dense]
+    nparts += [nparts[de[0]] for de in dense]
     assert all(nparts[nm + j] == 1 for j in range(len(dense))), "a dense twin has one part"
     l1, blob, halo_off, staging, loc = [], [], [], 0, []
     for i in range(P):
@@ -133,15 +135,20 @@ def stream(E, sort=False, dense=None, brk=0):
         L = [len(nparts)] + [0] * len(nparts)
         B = []
         for mid in range(len(nparts)):
-            orig, dsh, dmin = (mid, 0, 0) if mid < nm else dense[mid - nm]
+            if mid < nm:
+                orig, dsh, dmin, ftm = mid, 0, 0, 0
+            else:
+                de = dense[mid - nm]
+                orig, dsh, dmin, ftm = de[0], de[1], de[2], de[3] if len(de) > 3 else 0
             secs, counts = _sections(tab, orig, nparts[mid])
-            tm = max([int(_lane(k, e.astype(np.int64)).max()) // 1024 + 1 for k, e in secs if len(e)] or [1])
+            tm_nat = max([int(_lane(k, e.astype(np.int64)).max()) // 1024 + 1 for k, e in secs if len(e)] or [1])
+            dn = mid >= nm and len(secs[0][1]) >= dmin * tm_nat
+            tm = max(tm_nat, ftm) if dn else tm_nat
             assert tm <= T and len(L) < 1 << 20
             L[1 + mid] = len(L) | tm << 20
             base, H = len(B), []
             per_tile = np.zeros(tm, np.int64)
             loc_tile = np.zeros(tm, np.int64)
-            dn = mid >= nm and len(secs[0][1]) >= dmin * tm
             for si, (kind, ent) in enumerate(secs):
                 lanes = _lane(kind, ent.astype(np.int64))
                 bounds = np.searchsorted(lanes, np.arange(tm + 1) * 1024)

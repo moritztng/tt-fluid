@@ -937,6 +937,16 @@ def gmax(x):
     return x
 
 
+def gmin(x):
+    """A count over the whole mesh (lower/spmd.py: the minimum over every chip's process)."""
+    return x
+
+
+def gall(x):
+    """A boolean over the whole mesh (lower/spmd.py: logical AND over every chip's process)."""
+    return bool(x)
+
+
 def slot_extents(code, space, cells, slotfold, L, T):
     """Tiles of each cells register the program reads (backward, flow-insensitive, to a fixed point).
 
@@ -972,7 +982,7 @@ def slot_extents(code, space, cells, slotfold, L, T):
 class Machine:
     def __init__(self, prog, mesh, P, nslot=NSLOT, log=print, layout="rcb", tiles=None, l1_vec=None, fuse=False, scratch_cap=32,
                  span_homes=False, hoist=False, cap_min=False, sched=False, amg_vec=False, ptiles=False, bcast_run=False, joint_red=False, fold1=False,
-                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0, lsplit=False, kfold=False):
+                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0, lsplit=False, kfold=False, deadpass=False, deadpass_broken=0):
         # two-stage reductions: fold the chip's partials, then the K chip sums; no joint reductions then. Needed when
         # K * P partials do not fit one fold tile, and the default from 8 chips (r13 2x4: 520.3 vs 546.9 ms/it)
         self.red2 = bool(chip_cores) and ((P > LANES or P >= 8 * chip_cores) if red2 is None else red2)
@@ -992,6 +1002,9 @@ class Machine:
         # kfold: a constant page holding one bit pattern is not streamed; the reader and compute read a per-core table
         # of 2-bit codes in kfold_tiles extra arena tiles from kfold_tile on (encode.py kfold_table, _kfold below)
         self.kfold, self.kfold_tile, self.kfold_tiles = kfold, None, 0
+        # deadpass: exact two-range cell_mask split + whole-pass live-tile bitmap in dp_tiles arena tiles from dp_tile on
+        self.deadpass, self.deadpass_broken = bool(deadpass), int(deadpass_broken)
+        self.dp_tile, self.dp_tiles, self.mask_split_n, self.mask_split_broke = None, 0, 0, None
         self.narrow_on, self.narrow, self.narrow_slot, self.pre_h, self.narrow_home = narrow, set(), {}, {}, set()   # narrow: bf16 DRAM pages for eligible constants (_narrow)
         self.coff, self.cpages, self.hpages, self.dslots = {}, 0, 0, []
         self.F = prog.dtype.type
@@ -1109,8 +1122,12 @@ class Machine:
         if self.narrow_on:
             self._narrow()
         self._sync()
+        if self.deadpass:
+            self._split_cell_masks()
         if self.kfold:
             self._kfold()
+        if self.deadpass:
+            self._dp_reserve()
         log(self.summary())
 
     def kfolds(self, u):
@@ -1124,6 +1141,188 @@ class Machine:
         self.kfold_tile = self.ntiles
         self.kfold_tiles = -(-(4 + -(-(self.cpages + self.T) // 16)) // LANES)
         self.ntiles += self.kfold_tiles
+
+    def _dp_reserve(self):
+        """Reserve arena tile(s) at the end of the arena for the --deadpass live-tile bitmap table (Encoded may grow
+        dp_tiles if a large program's palette table exceeds 1 tile)."""
+        self.dp_tile = self.ntiles
+        self.dp_tiles = 1
+        self.ntiles += self.dp_tiles
+
+    def _mask_full_tiles(self, sp_name):
+        """Number of leading tiles [0, t_full) of space sp_name where every lane of every core (across all chips)
+        belongs to a valid element (so cell_mask is identically 1.0 on all 1024 lanes)."""
+        mr = self.masks.get(sp_name)
+        if mr is None:
+            return 0
+        nt = self.Ts.get(sp_name, 1)
+        if nt <= 1:
+            return 0
+        lo, hi = self.maps.cores or (0, self.P)
+        own = self.lay.owner[sp_name]
+        lane = self.lay.lane[sp_name]
+        sel = (own >= lo) & (own < hi)
+        v = np.asarray(self.pre[mr], self.F)
+        all_one = bool(np.all(v[sel] == 1.0)) if sel.any() else True
+        if not gall(all_one):
+            return 0
+        occ = np.bincount((own[sel] - lo) * nt + (lane[sel] // LANES), minlength=(hi - lo) * nt).reshape(hi - lo, nt)
+        full = (occ == LANES).all(axis=0)
+        t_full = int(np.argmin(full)) if not full.all() else nt
+        return int(gmin(t_full))
+
+    @staticmethod
+    def _uop_rw(u):
+        k = u[0]
+        if k in ("ld", "lds", "ldr", "fill", "rvf"):
+            return (), (u[1],)
+        if k == "cpd":
+            return (u[1],), (u[2],)
+        if k == "op":
+            if u[1] in ("where", "mad", "msb"):
+                return (u[3], u[4], u[5]), (u[2],)
+            return (u[3], u[4]), (u[2],)
+        if k in ("un", "fold"):
+            return (u[2] if k == "un" else u[1],), (u[2] if k == "un" else u[1],)
+        return (), ()
+
+    def _strip_mask_blk(self, blk, mask_full):
+        """Remove cell_mask loads and where(mask, a, b) ops whose mask is identically 1.0 on full tiles.
+        Returns (new_blk, used_mask_spaces) where used_mask_spaces is empty if nothing changed."""
+        uops, stores = blk[1], blk[2]
+        store_slots = {s for s, _ in stores}
+        drop_idx = set()
+        replace = {}
+        used_spaces = set()
+        for i, u in enumerate(uops):
+            r = None
+            if u[0] == "ld" and u[2] in mask_full:
+                r = u[2]
+            elif u[0] == "ldr" and u[2] in mask_full and u[3] == 0 and u[4] is None and not u[5]:
+                r = u[2]
+            if r is None:
+                continue
+            ms = u[1]
+            wheres = []
+            ok = True
+            overwritten = False
+            for k in range(i + 1, len(uops)):
+                uk = uops[k]
+                rd, wr = self._uop_rw(uk)
+                if ms in rd:
+                    if uk[0] == "op" and uk[1] == "where" and uk[3] == ms and uk[4] != ms and uk[5] != ms:
+                        wheres.append(k)
+                    else:
+                        ok = False
+                        break
+                if ms in wr:
+                    overwritten = True
+                    break
+            if ok and not overwritten and ms in store_slots:
+                ok = False
+            if ok and wheres:
+                drop_idx.add(i)
+                used_spaces.add(mask_full[r])
+                for k in wheres:
+                    uk = uops[k]
+                    if uk[2] == uk[4]:
+                        drop_idx.add(k)
+                    else:
+                        replace[k] = ("cpd", uk[4], uk[2])
+        if not used_spaces:
+            return blk, set()
+        new_uops = []
+        for i, u in enumerate(uops):
+            if i in drop_idx:
+                continue
+            new_uops.append(replace.get(i, u))
+        # Drop dead fill uops (e.g. fill(false_slot, 0.0)) whose slot is no longer read
+        kept = []
+        for i, u in enumerate(new_uops):
+            if u[0] == "fill":
+                fs = u[1]
+                used = False
+                for k in range(i + 1, len(new_uops)):
+                    rd, wr = self._uop_rw(new_uops[k])
+                    if fs in rd:
+                        used = True
+                        break
+                    if fs in wr:
+                        break
+                else:
+                    if fs in store_slots:
+                        used = True
+                if not used:
+                    continue
+            kept.append(u)
+        return ("blk", kept, stores), used_spaces
+
+    def _split_cell_masks(self):
+        """Split tile loops that mask with cell_mask into two ranges: [0, t_full) with cell_mask + where(cell_mask, x, 0)
+        removed, and [t_full, bt) keeping the original masked body. Bitwise-exact because tiles 0..t_full-1 have
+        cell_mask == 1.0 on every lane of every core."""
+        full_by_sp = {nm: self._mask_full_tiles(nm) for nm in self.masks}
+        mask_full = {}
+        for nm, mr in self.masks.items():
+            if full_by_sp.get(nm, 0) > 0:
+                mask_full[mr] = nm
+        for r, src in getattr(self, "fetched_from", {}).items():
+            if src in mask_full:
+                mask_full[r] = mask_full[src]
+        if not mask_full:
+            return
+        # Find outer-loop range (for deadpass_broken == 2 so we break an outer reduction if present)
+        labels = {ins[1]: idx for idx, ins in enumerate(self.mir) if ins[0] == "label"}
+        outer_lo, outer_hi = 0, len(self.mir) - 1
+        for idx, ins in enumerate(self.mir):
+            if ins[0] in ("jump", "jumpif") and ins[-1] in labels and labels[ins[-1]] < idx:
+                if idx - labels[ins[-1]] > (outer_hi - outer_lo if outer_lo else -1):
+                    outer_lo, outer_hi = labels[ins[-1]], idx
+        out = []
+        self.mask_split_n = 0
+        self.mask_split_broke = None
+        for j, ins in enumerate(self.mir):
+            op = ins[0]
+            if op not in ("blk", "seg"):
+                out.append(ins)
+                continue
+            blks = [ins] if op == "blk" else [x for x in ins[1] if x[0] == "blk"]
+            bt = self.tiles(blks)
+            if bt <= 1 or bt >= 256:
+                out.append(ins)
+                continue
+            if op == "blk":
+                lean_ins, used_sp = self._strip_mask_blk(ins, mask_full)
+            else:
+                new_items, used_sp = [], set()
+                for x in ins[1]:
+                    if x[0] == "blk":
+                        lx, usp = self._strip_mask_blk(x, mask_full)
+                        new_items.append(lx)
+                        used_sp |= usp
+                    else:
+                        new_items.append(x)
+                lean_ins = ("seg", new_items)
+            if not used_sp:
+                out.append(ins)
+                continue
+            t_split = min(min(full_by_sp[nm] for nm in used_sp), bt)
+            if t_split <= 0:
+                out.append(ins)
+                continue
+            self.mask_split_n += 1
+            if t_split >= bt:
+                out.append(lean_ins)
+            elif (self.deadpass_broken == 2
+                  and (outer_lo <= j <= outer_hi or outer_lo == 0)):
+                # Broken arm 2: drop the masked tail tile(s) [t_split, bt)
+                out.append(lean_ins)
+                if self.mask_split_broke is None:
+                    self.mask_split_broke = f"mir {j}: dropped tail cell_mask on tiles {t_split}..{bt - 1}"
+            else:
+                out.append(("range", 0, t_split, lean_ins))
+                out.append(("range", t_split, bt, ins))
+        self.mir = out
 
     def _sliced(self, code, prog, mesh, P, tiles, chips, log):
         """--sliced: each core's cells sorted widest first, so ELL slot k is a lane prefix of L_k tiles; every cells
@@ -2795,6 +2994,8 @@ class Machine:
 # ---- MIR helpers
 def _mir_uses(ins):
     op = ins[0]
+    if op == "range":
+        return _mir_uses(ins[3])
     if op == "seg":       # the values the run reads before writing them
         out, d = [], set()
         for x in ins[1]:
@@ -2829,6 +3030,8 @@ def _mir_uses(ins):
 
 def _mir_defs(ins):
     op = ins[0]
+    if op == "range":
+        return _mir_defs(ins[3])
     if op == "seg":
         return [r for x in ins[1] for r in _mir_defs(x)]
     if op == "blk":

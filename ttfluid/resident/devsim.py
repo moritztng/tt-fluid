@@ -89,6 +89,11 @@ class DevSim:
         """--kfold: core i's fold table codes page coff + t (Encoded.kfold), so no ring page moves for it."""
         return bool(E.kfold_codes(self.e.kfold[i:i + 1], np.array([[coff + t]]))[0, 0])
 
+    def _dplive(self, i, dpid, t):
+        """--deadpass: whether core i executes tile t of loop dpid (1-based)."""
+        from .deadpass import dp_live_core
+        return dp_live_core(self.e.dp[i], dpid, t)
+
     def run(self, max_steps=10 ** 8):
         P, D = self.P, self.depth
         streams = {"c": self.e.c, "b": self.e.b, "n": self.e.n}
@@ -175,11 +180,17 @@ class DevSim:
         if a == "c" and self.e.page:
             PW, dl = E.PW, self.dlv[i]
             g = pc // PW
-            if g >= len(dl):
+            if g == 0 and not dl:
                 return None
-            if g and pc % PW == 0:
+            while self.seen[i] < g:
+                nx = self.seen[i] + 1
+                if nx >= len(dl):
+                    return None
+                if not self.jumped[i] and dl[nx] != dl[nx - 1] + 1:
+                    raise AssertionError(f"core {i}: code page {dl[nx]} follows {dl[nx - 1]} without a jump")
                 lp = self.tloop.get(ag)
-                self.rel[i] = max(self.rel[i], (lp[2] // PW) if lp and lp[0] < lp[1] else g)
+                self.rel[i] = max(self.rel[i], (lp[2] // PW) if lp and lp[0] < lp[1] else nx)
+                self.seen[i] = nx
             w = int(S[dl[g] * PW + pc % PW])
             op, f0 = w & 0x7f, (w >> 8) & 0xf
             if op in (E.C_JMP, E.C_BRT):
@@ -188,10 +199,6 @@ class DevSim:
                 pcs[ag] = (pc // PW + 1) * PW
                 self.jumped[i] = True
                 return "ok"
-            if g > self.seen[i]:        # first entry into virtual page g: sequential entry needs the next DRAM page
-                if not self.jumped[i] and dl[g] != dl[g - 1] + 1:
-                    raise AssertionError(f"core {i}: code page {dl[g]} follows {dl[g - 1]} without a jump")
-                self.seen[i] = g
             self.jumped[i] = False
             S = _Virt(S, dl, PW)
         if a == "c":
@@ -241,11 +248,28 @@ class DevSim:
                 q[(i, "rout")] += 1
                 pcs[ag] = pc + 1
             elif op == E.C_TBEG:
-                self.tloop[ag] = [0, w >> 16, pc + 1]
+                self.tloop[ag] = [(w >> 8) & 0xff, w >> 16, pc + 1, 0]
                 pcs[ag] = pc + 1
+            elif op == E.C_TBEGM:
+                dm = int(S[pc + 1])
+                t0, tn, dpid, bsz = (w >> 8) & 0xff, w >> 16, dm & 0xffff, dm >> 16
+                t = t0
+                while t < tn and not self._dplive(i, dpid, t):
+                    t += 1
+                if t >= tn:
+                    self.tloop[ag] = [tn, tn, pc + 2, 0]
+                    pcs[ag] = pc + 2 + bsz
+                else:
+                    self.tloop[ag] = [t, tn, pc + 2, dpid]
+                    pcs[ag] = pc + 2
             elif op == E.C_TEND:
                 lp = self.tloop[ag]
                 lp[0] += 1
+                if lp[3]:
+                    while lp[0] < lp[1] and not self._dplive(i, lp[3], lp[0]):
+                        lp[0] += 1
+                    if lp[0] >= lp[1]:
+                        lp[3] = 0
                 pcs[ag] = lp[2] if lp[0] < lp[1] else pc + 1
             elif op <= E.C_BRT or op == E.C_PH:     # C_PH: a phase marker, no effect
                 pcs[ag] = pc + 1
@@ -294,9 +318,11 @@ class DevSim:
             elif op == E.B_OUT:
                 pcs[ag] = pc + 3
             elif op == E.B_SINK:
+                t0, dpid = (w >> 8) & 0xff, w >> 16
                 n, tn = int(S[pc + 1]) & 0xFFFF, int(S[pc + 1]) >> 16 or self.e.m.T
+                nlive = sum(self._dplive(i, dpid, t) for t in range(t0, tn)) if dpid else (tn - t0)
                 k = self.prog.get(ag, 0)
-                if k < n * tn:
+                if k < n * nlive:
                     if q[(i, "rout")] == 0:
                         return None
                     q[(i, "rout")] -= 1
@@ -349,21 +375,37 @@ class DevSim:
                 q[(i, "nc")] += gt - 1
             pcs[ag] = pc + 3 + 2 * f0
         elif op == E.N_STREAM:
+            t0, dpid = (w >> 8) & 0xff, w >> 16
             n, tn = int(S[pc + 1]) & 0xFFFF, int(S[pc + 1]) >> 16 or self.e.m.T
-            k = self.prog.get(ag, 0)
             ents, p = [], pc + 2
             for _ in range(n):
                 x = int(S[p + 1])
                 mid1, npart = (x >> 4) & (0x3ff if E.WIDE else 0xfff), x & 0xf
                 ents.append((mid1, [int(y) for y in S[p + 3:p + 2 + 2 * npart:2]], int(S[p])))
                 p += 2 + 2 * npart
-            if k == 0:
+            k = self.prog.get(ag)
+            if k is None:
                 for mid1, slots, _ in ents:
                     if mid1 and not self._halo_ready(i, mid1 - 1, slots, data, hcntN):
                         return None
-            # --kfold: page k is tile k // n of entry k % n; the reader skips the ones the fold table codes
-            while k < n * tn and ents[k % n][2] & E.FOLD and self._kfolded(i, ents[k % n][2] & (E.FOLD - 1), k // n):
-                k += 1
+                t_first = t0
+                if dpid:
+                    while t_first < tn and not self._dplive(i, dpid, t_first):
+                        t_first += 1
+                if t_first >= tn:
+                    pcs[ag] = p
+                    return "ok"
+                k = n * t_first
+            # --deadpass + --kfold: skip dead tiles and fold-coded constant pages
+            while k < n * tn:
+                t = k // n
+                if dpid and not self._dplive(i, dpid, t):
+                    k = (t + 1) * n
+                    continue
+                if ents[k % n][2] & E.FOLD and self._kfolded(i, ents[k % n][2] & (E.FOLD - 1), t):
+                    k += 1
+                    continue
+                break
             self.prog[ag] = k
             if k < n * tn:
                 if q[(i, "rin")] >= self.ring:
@@ -371,7 +413,7 @@ class DevSim:
                 q[(i, "rin")] += 1
                 self.prog[ag] = k + 1
                 return "ok"
-            self.prog[ag] = 0
+            self.prog.pop(ag, None)
             pcs[ag] = p
         elif op == E.N_HALO:
             s = int(S[pc + 1])

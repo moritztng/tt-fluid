@@ -28,7 +28,7 @@ enum : uint32_t {
     C_END = 0, C_ACQ, C_COMMIT, C_REL, C_LD, C_ST, C_FILL, C_RVF,
     C_ADD, C_SUB, C_MUL, C_DIV, C_MAX, C_MIN, C_WHERE, C_CPD,
     C_NEG, C_ABS, C_SQRT, C_TANH, C_LOG, C_EXP, C_GTZ, C_GEZ, C_LTZ, C_LEZ, C_EQZ, C_NEZ,
-    C_FOLD, C_TOK, C_SIGB, C_SIGN, C_WAITB, C_WAITN, C_JMP, C_BRT, C_LDS, C_TBEG, C_TEND, C_LDR, C_STW, C_MAD, C_MSB, C_LDRH, C_STWH, C_PH, C_LDK
+    C_FOLD, C_TOK, C_SIGB, C_SIGN, C_WAITB, C_WAITN, C_JMP, C_BRT, C_LDS, C_TBEG, C_TEND, C_LDR, C_STW, C_MAD, C_MSB, C_LDRH, C_STWH, C_PH, C_LDK, C_TBEGM
 };
 constexpr uint32_t TILE = 0x80;   // op bit: the tile operand is offset by the tile loop counter
 
@@ -68,6 +68,20 @@ void kernel_main() {
     // run_mesh --kfold: the core's fold table in arena tile CFD_KFOLD (encode.kfold_words): three palette words, a
     // spare, then a 2-bit code per constant page. Static, so every thread reads it directly
     const uint32_t* KF = reinterpret_cast<const uint32_t*>(get_tile_address(cb_v, CFD_KFOLD));
+#endif
+#ifdef CFD_DP
+    // run_mesh --deadpass: whole-pass live-tile bitmap table in arena tile CFD_DP (deadpass.dp_pack_core)
+    const uint32_t* DP = reinterpret_cast<const uint32_t*>(get_tile_address(cb_v, CFD_DP));
+    const uint32_t dp_hdr = DP[0];
+    const uint32_t dp_np = dp_hdr & 0xffff, dp_nw = (dp_hdr >> 16) & 0x7fff, dp_u16 = dp_hdr >> 31;
+    const uint32_t dp_ib = 1 + dp_np * dp_nw;
+    auto dp_live = [&](uint32_t id, uint32_t t) -> bool {
+        const uint32_t k = id - 1;
+        const uint32_t pi = dp_u16
+            ? ((DP[dp_ib + (k >> 1)] >> ((k & 1) << 4)) & 0xffff)
+            : ((DP[dp_ib + (k >> 2)] >> ((k & 3) << 3)) & 0xff);
+        return (DP[1 + pi * dp_nw + (t >> 5)] >> (t & 31)) & 1;
+    };
 #endif
 #ifdef CFD_TGTS
     // T-gather mailbox (vm_ncrisc.cpp, the 256 B of cb_sync before the B-patch one): NCRISC posts the top CFD_TGTS / 8
@@ -122,6 +136,9 @@ void kernel_main() {
 #define TWAIT(cb)
 #endif
     uint32_t tl = 0, tn = 0, tpc = 0;   // tile loop: counter, count, first op of the body
+#ifdef CFD_DP
+    uint32_t dp_id = 0;
+#endif
     bool run = true;
 #ifdef CFD_PROF
     // census: per-op wall-clock cycles of this thread (time from one op's issue to the next's) and op counts
@@ -174,7 +191,7 @@ void kernel_main() {
 #endif
     while (run) {
         if constexpr (CR != 0) {
-            if (pc >= hi * PW) {   // entering page hi (pc is at its start: ops never straddle pages)
+            while (pc >= hi * PW) {   // entering page hi (or skipping past full pages on an all-dead C_TBEGM)
                 UNPACK(({
                     if (hi) cb_pop_front(cb_code, 1);
                     TWAIT(cb_code);
@@ -191,7 +208,7 @@ void kernel_main() {
                     }
                 }));
                 ++hi;
-                const uint32_t r = (tl < tn) ? tpc / PW : pc / PW;   // an open tile loop keeps its body
+                const uint32_t r = (tl < tn) ? tpc / PW : hi - 1;   // an open tile loop keeps its body
                 if (r > rel) {
                     rel = r;
                     PACK(({
@@ -291,8 +308,40 @@ void kernel_main() {
                 }));
 #endif
                 break;
-            case C_TBEG: tn = w >> 16; tl = 0; tpc = pc; break;
-            case C_TEND: if (++tl < tn) pc = tpc; break;
+            case C_TBEG:
+                tn = w >> 16;
+                tl = (w >> 8) & 0xff;
+                tpc = pc;
+#ifdef CFD_DP
+                dp_id = 0;
+#endif
+                break;
+#ifdef CFD_DP
+            case C_TBEGM: {
+                const uint32_t dm = CW(pc);
+                ++pc;
+                tn = w >> 16;
+                tl = (w >> 8) & 0xff;
+                tpc = pc;
+                dp_id = dm & 0xffff;
+                while (tl < tn && !dp_live(dp_id, tl)) ++tl;
+                if (tl >= tn) {
+                    dp_id = 0;
+                    pc = tpc + (dm >> 16);
+                }
+                break;
+            }
+#endif
+            case C_TEND:
+                ++tl;
+#ifdef CFD_DP
+                if (dp_id) {
+                    while (tl < tn && !dp_live(dp_id, tl)) ++tl;
+                    if (tl >= tn) dp_id = 0;
+                }
+#endif
+                if (tl < tn) pc = tpc;
+                break;
             case C_FILL: SFI(C_FILL, fill_tile_init()); fill_tile_bitcast(a, CW(pc)); ++pc; break;
             case C_RVF: {
                 const uint32_t v = read_tile_value(cb_v, w >> 16, 0);

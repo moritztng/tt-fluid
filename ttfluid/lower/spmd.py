@@ -211,7 +211,7 @@ def r_split(xs):
     return None if cover < xs[0][2] else best
 
 
-REDUCE = {"const": r_const, "any": any, "max": max, "space": r_space, "eq": lambda xs: all(x == xs[0] for x in xs),
+REDUCE = {"const": r_const, "any": any, "all": all, "max": max, "min": min, "space": r_space, "eq": lambda xs: all(x == xs[0] for x in xs),
           "inter": r_inter, "first": lambda xs: min(set(xs[0]).intersection(*xs[1:]), default=None), "split": r_split, "union": lambda xs: sorted(set().union(*xs)),
           "cat": lambda xs: [y for x in xs for y in x]}
 
@@ -234,6 +234,8 @@ def install_machine(C, sub, own_of, state):
     g = sub["g"]
     mach.rcb = lambda C_, P_, chips=None, faces=None: sub["owner"]
     mach.gmax = lambda x: C("max", x)
+    mach.gmin = lambda x: C("min", x)
+    mach.gall = lambda x: C("all", bool(x))
     lay0, fin0, nh0 = Layout.__init__, Maps.finish, Maps.needs_halo
 
     def lay_init(self, prog, cell_owner, P, cell_lane=None, **kw):
@@ -624,6 +626,18 @@ def run_mesh_worker(sub_path, argv, conn, out, replay=None, ckpt=None):
         E0 = encode.Encoded
 
         class ChipEncoded(E0):
+            def _all_chips_and(self, v):
+                return C("all", bool(v))
+
+            def _all_chips_or(self, v):
+                return C("any", bool(v))
+
+            def _all_chips_max(self, v):
+                return C("max", int(v))
+
+            def _all_chips_union(self, s):
+                return set(C("union", sorted(s)))
+
             def _tables(self):
                 super()._tables()       # the cursor tables at the mesh's width: tabstream's L1 rows end in their zeros
                 W = C("max", int(self.tab.shape[1]))

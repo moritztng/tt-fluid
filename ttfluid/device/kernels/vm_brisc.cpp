@@ -524,6 +524,20 @@ void kernel_main() {
     uint32_t nxg = 0;   // chip all-gathers (mesh)
     uint32_t nred = 0, nrow = 0, nfetch = 0, nhalo = 0, nops = 0, nsink = 0;
     volatile tt_l1_ptr uint32_t* row = hdr + 992;   // history row staging, 16 words
+#ifdef CFD_DP
+    // run_mesh --deadpass: whole-pass live-tile bitmap table in arena tile CFD_DP (deadpass.dp_pack_core)
+    const uint32_t* DP = reinterpret_cast<const uint32_t*>(arena + CFD_DP * 4096);
+    const uint32_t dp_hdr = DP[0];
+    const uint32_t dp_np = dp_hdr & 0xffff, dp_nw = (dp_hdr >> 16) & 0x7fff, dp_u16 = dp_hdr >> 31;
+    const uint32_t dp_ib = 1 + dp_np * dp_nw;
+    auto dp_live = [&](uint32_t id, uint32_t t) -> bool {
+        const uint32_t k = id - 1;
+        const uint32_t pi = dp_u16
+            ? ((DP[dp_ib + (k >> 1)] >> ((k & 1) << 4)) & 0xffff)
+            : ((DP[dp_ib + (k >> 2)] >> ((k & 3) << 3)) & 0xff);
+        return (DP[1 + pi * dp_nw + (t >> 5)] >> (t & 31)) & 1;
+    };
+#endif
 #ifdef CFD_PHASE
     // run_mesh --phase: per SIMPLE phase (B_PH opens phase id = w bits 8-11; id 15 = before the first marker), 64-bit
     // (low word at the even hdr word, high at the next): BRISC wall cycles at hdr 544 + 2 id, inside B_RED at 576 + 2 id,
@@ -942,30 +956,59 @@ void kernel_main() {
                 break;
             }
             case B_SINK: {
-                // drain compute's stores of this block into their DRAM homes: per tile, per store
-                const uint32_t n = B[pc] & 0xffff, tn = B[pc] >> 16 ? B[pc] >> 16 : NT;   // tn: tiles per store
+                // drain compute's stores of this block into their DRAM homes: per live tile, per store
+                const uint32_t t0 = (w >> 8) & 0xff;
+#ifdef CFD_DP
+                const uint32_t dpid = w >> 16;
+#endif
+                const uint32_t n = B[pc] & 0xffff, tn = B[pc] >> 16 ? B[pc] >> 16 : NT;   // tn: end tile
                 const uint32_t* dsc = B + pc + 1;
                 pc += 1 + n;
+                uint32_t rem = 0;
+#ifdef CFD_DP
+                if (dpid) {
+                    for (uint32_t ti = t0; ti < tn; ++ti) rem += dp_live(dpid, ti);
+                    rem *= n;
+                } else
+#endif
+                {
+                    rem = (tn - t0) * n;
+                }
+                uint32_t t = t0, s = 0;
+#ifdef CFD_DP
+                if (dpid) {
+                    while (t < tn && !dp_live(dpid, t)) ++t;
+                }
+#endif
                 // every page compute has ready, up to the fifo's end (a pop may land on it but not cross it), goes out
-                // before one flush (store i is tile i / n, store i % n)
-                for (uint32_t i = 0, ns = tn * n; i < ns && run;) {
+                // before one flush (store s of live tile t)
+                for (uint32_t i = 0; i < rem && run;) {
                     if (!WAIT_UNTIL(cb_pages_available_at_front(cb_out, 1), 28)) { run = false; break; }
                     uint32_t rp = get_read_ptr(cb_out), k = 1;
                     const uint32_t km = (out1 - rp) / 4096;
-                    while (k < km && i + k < ns && cb_pages_available_at_front(cb_out, k + 1)) ++k;
+                    while (k < km && i + k < rem && cb_pages_available_at_front(cb_out, k + 1)) ++k;
                     cb_wait_front(cb_out, k);
                     for (uint32_t j = 0; j < k; ++j, ++i) {
                         // bit 27 (encode.NARROW): compute packed a bf16 page (C_STWH), its first 2048 B are the page
-                        const uint32_t dd = dsc[i % n];
-                        noc_async_write(rp, t_home.get_noc_addr(core * HP + (dd & 0x7ffffff) + i / n, 0),
+                        const uint32_t dd = dsc[s];
+                        noc_async_write(rp, t_home.get_noc_addr(core * HP + (dd & 0x7ffffff) + t, 0),
                                         (dd >> 27) & 1 ? 2048 : 4096);
                         rp += 4096;
+                        if (++s == n) {
+                            s = 0;
+                            ++t;
+#ifdef CFD_DP
+                            if (dpid) {
+                                while (t < tn && !dp_live(dpid, t)) ++t;
+                            }
+#endif
+                        }
                     }
                     noc_async_writes_flushed();
                     cb_pop_front(cb_out, k);
                     nsink += k;
                 }
-                if (run && !wbar(29)) run = false;
+                if (rem && run && !wbar(29)) run = false;
                 break;
             }
 #if !defined(CFD_MESH) || defined(CFD_BSCAL)   // a mesh build carries the soft-float only with --bscal 1 (kernel config buffer)

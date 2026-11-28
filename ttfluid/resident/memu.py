@@ -63,6 +63,11 @@ class MachineEmu:
         self.m = m
         self._bsc_seen = set()
         self.kfold = None   # --kfold: Encoded.kfold, the fold tables (P, words); None: every constant page is streamed
+        self.kfold_regs = None
+        self.dp = None      # --deadpass: Encoded.dp, per-core live-tile bitmap tables (P, words)
+        self.dp_map = {}    # --deadpass: MIR index -> 1-based dpid
+        self.dp_skipped = np.zeros(m.P, np.int64)
+        self.dp_total = np.zeros(m.P, np.int64)
         self.F = np.dtype(dtype or m.prog.dtype).type
         P = m.P
         T = m.T
@@ -160,9 +165,14 @@ class MachineEmu:
                 pt = self.phtiles[self.phase]
                 if op in ("gather", "red", "red2", "sync", "halo"):
                     pt[op] += 1
-                if op in ("blk", "seg"):
+                if op in ("blk", "seg", "range"):
                     # a fused segment runs all its blocks tile by tile; ownership is checked in program order
-                    blks = [ins] if op == "blk" else [x for x in ins[1] if x[0] == "blk"]
+                    if op == "range":
+                        t0, t1, inner = ins[1], ins[2], ins[3]
+                        blks = [inner] if inner[0] == "blk" else [x for x in inner[1] if x[0] == "blk"]
+                    else:
+                        t0, t1 = 0, None
+                        blks = [ins] if op == "blk" else [x for x in ins[1] if x[0] == "blk"]
                     vec = False
                     for x in blks:
                         regs = [u[2] for u in x[1] if u[0] in ("ld", "lds", "rvf")] + [r for _, r in x[2]]
@@ -177,22 +187,40 @@ class MachineEmu:
                         for _, r in x[2]:
                             self.owner[phys[r]] = r
                     self._bt = m.tiles(blks)
-                    nt = self._bt if vec else 1
+                    if t1 is None:
+                        t1 = self._bt if vec else 1
+                    nt = t1 - t0
                     if self.check and vec and self._ovt:
                         self._ovl_loop(blks, pc)
+                    dpid = self.dp_map.get(pc - 1, 0) if self.dp is not None else 0
+                    if dpid:
+                        from .deadpass import dp_live_vec
+                        nt_eff = 0.0
+                    else:
+                        nt_eff = float(nt)
+                    for t in range(t0, t1):
+                        mask = None
+                        if dpid:
+                            live = dp_live_vec(self.dp, dpid, t)
+                            self.dp_total += 1
+                            self.dp_skipped += ~live
+                            nt_eff += float(live.mean())
+                            if not live.any():
+                                continue
+                            if not live.all():
+                                mask = live
+                        for x in blks:
+                            self._block(x, t, mask=mask)
                     for x in blks:
                         for u in x[1]:
-                            self.optiles["ld" if u[0] in ("ld", "lds", "rvf", "ldr") else "op"] += nt
-                            pt["ld" if u[0] in ("ld", "lds", "rvf", "ldr") else "op"] += nt
+                            self.optiles["ld" if u[0] in ("ld", "lds", "rvf", "ldr") else "op"] += nt_eff
+                            pt["ld" if u[0] in ("ld", "lds", "rvf", "ldr") else "op"] += nt_eff
                             if u[0] == "ldr":   # by source: a constant, a gather page the reader builds, a vector home
-                                pt["ldr"] += nt
-                                pt["ldr:" + ("gather" if u[2] is None else "const" if u[2] in m.const_regs else "vec")] += nt
-                        pt["st"] += nt * sum(1 for _, r in x[2] if r != "__anchor__" and phys[r] >= DBASE)
+                                pt["ldr"] += nt_eff
+                                pt["ldr:" + ("gather" if u[2] is None else "const" if u[2] in m.const_regs else "vec")] += nt_eff
+                        pt["st"] += nt_eff * sum(1 for _, r in x[2] if r != "__anchor__" and phys[r] >= DBASE)
                     pt["blk"] += len(blks)
-                    for t in range(self._bt if vec else 1):
-                        for x in blks:
-                            self._block(x, t)
-                    self._page.clear()      # ldr pages are rebuilt at t == 0 of each run; kept, they grew to GBs
+                    self._page.clear()      # ldr pages are rebuilt at first tile of each run; kept, they grew to GBs
                     for x in blks:
                         for _, r in x[2]:
                             if self.record is not None and len(self.history) >= self.record_from and \
@@ -382,7 +410,7 @@ class MachineEmu:
         out[t["zc"], t["zl"]] = 0
         self.counts["g:values"] += (len(t["core"]) + len(t["zc"])) / m.P
 
-    def _block(self, ins, t):
+    def _block(self, ins, t, mask=None):
         m, F = self.m, self.F
         D = [None] * m.nslot
         for u in ins[1]:
@@ -392,19 +420,19 @@ class MachineEmu:
             if k == "ld":
                 D[u[1]] = self._tile(u[2], t).copy()
             elif k == "ldr":
-                if t == 0:
+                if id(u) not in self._page:
                     self._page[id(u)] = self._ldr_vector(u)
                 D[u[1]] = self._page[id(u)][:, t * LANES:(t + 1) * LANES].copy()
                 if u[2] is not None and m.phys[u[2]] >= KBASE:
-                    self.counts["ldr:const"] += 1      # ring pages built from a DRAM constant, per core
-                if self.kfold is not None and m.kfolds(u):
+                    self.counts["ldr:const"] += 1 if mask is None else float(mask.mean())   # ring pages built from a DRAM constant, per core
+                if self.kfold is not None and m.kfolds(u) and (self.kfold_regs is None or u[2] in self.kfold_regs):
                     # --kfold: where the fold table codes page coff + t the device fills the slot from the palette and
                     # no page comes. Read from the table words the device gets, so a wrong table shows here
                     from .encode import kfold_codes
                     code = kfold_codes(self.kfold, np.full((m.P, 1), m.phys[u[2]] - KBASE + t))[:, 0]
                     sel = code > 0
                     D[u[1]][sel] = self.kfold[sel, code[sel] - 1].view(np.float32).astype(F)[:, None]
-                    self.kcoded += sel                    # of those, the pages this core never streams
+                    self.kcoded += sel if mask is None else (sel & mask)   # of those, the pages this core never streams
             elif k == "lds":
                 D[u[1]] = self._shifted(u[2], t, u[3])
             elif k == "fill":
@@ -432,7 +460,11 @@ class MachineEmu:
             else:
                 raise NotImplementedError(k)
         for s_, r in ins[2]:
-            self._tile(r, t)[...] = bf16_rne(D[s_]) if r in m.narrow_home else D[s_]
+            v = bf16_rne(D[s_]) if r in m.narrow_home else D[s_]
+            if mask is None:
+                self._tile(r, t)[...] = v
+            else:
+                self._tile(r, t)[mask] = v[mask]
 
     def _ovl_loop(self, blks, pc):
         """wplace 2: a tile loop runs pass t over tile t of every vector, so an overlaid register and a one-tile value

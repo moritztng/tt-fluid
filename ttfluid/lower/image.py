@@ -63,6 +63,8 @@ class Image:
             sc.update(nplans=len(m.maps.plans), hwords=int(m.hwords))
         if getattr(m, "kfold_tile", None) is not None:      # --kfold: the fold table's arena tile (kernel define CFD_KFOLD)
             sc.update(kfold_tile=int(m.kfold_tile))
+        if getattr(m, "dp_tile", None) is not None:         # --deadpass: live-tile bitmap table arena tile (kernel define CFD_DP)
+            sc.update(dp_tile=int(m.dp_tile))
         # the state: per name the registers' (phys, tiles, space) or a constant (prog_pre) value
         state, spaces = [], {}
         for name, cr in m.prog.state:

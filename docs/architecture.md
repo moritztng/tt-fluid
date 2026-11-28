@@ -90,20 +90,25 @@ stays bit-identical. Both are off by default.
   vector. The gather is then served by the dense tables, with no window read and no gather-cache miss. `--span 2`
   also turns such a gather into a single reader page when its destination is in SRAM.
 
-<<<<<<< HEAD
-The fields a run never changes (geometry, coefficients, masks) are DRAM constants, streamed like any DRAM-homed vector.
-Many of their 4 KB pages hold one value in every lane: zero where a stencil slot has no neighbour, one or a half
-elsewhere. `--kfold 1` never streams such a page. Each core gets a fold table in one SRAM tile: a 2-bit code per
-constant page and a palette of the three uniform values that cover the most pages on that core. The reader sends
-nothing for a coded page and the compute kernel fills the register from the palette, the same bits the page holds.
-Off by default; the state stays bit-identical.
-=======
 Two more options, also value-preserving and off by default, keep work out of DRAM. `--lsplit 1` parks a vector that
 holds an SRAM slot across a solver loop that does not use it in DRAM for the duration of the loop, so the loop's own
 vectors get the slot. `--lsplit 2` does the same for the solution of the solve, which the loop touches once a pass.
 `--cse 2` recognises gathers whose index arrays have the same content, so an interpolation or a gradient that several
 callers ask for is computed and gathered once.
->>>>>>> origin/main
+
+The fields a run never changes (geometry, coefficients, masks) are DRAM constants, streamed like any DRAM-homed vector.
+Many of their 4 KB pages hold one value in every lane: zero where a stencil slot has no neighbour, one or a half
+elsewhere. `--kfold 1` never streams such a page. Each core gets a fold table in one SRAM tile: a 2-bit code per
+constant page and a palette of the three uniform values that cover the most pages on that core. The reader sends
+nothing for a coded page and the compute kernel fills the register from the palette, the same bits the page holds,
+emitting the table check only on constants that have at least one coded page. Off by default; the state stays
+bit-identical.
+
+`--deadpass 1` skips whole tile-passes that cannot change any live state on a given core. It splits `cell_mask` loops
+into full leading tiles (with the mask load and `where` removed) and the masked tail tile, and packs a per-core
+live-tile bitmap into one reserved SRAM tile that compute (`C_TBEGM`), NCRISC (`N_STREAM`), and BRISC (`B_SINK`) read
+together to jump over dead tiles. Under `--tabdense`, split-gather shifted loads that a dense gather overwrites on every
+core are omitted as well. Off by default; the state stays bit-identical.
 
 `ttfluid.resident.encode` packs the result into three uint32 streams per core, one for each kernel:
 

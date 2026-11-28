@@ -570,6 +570,20 @@ void kernel_main() {
 #ifdef CFD_TRID
     hdr[48] = tdirty;   // BRISC zeroed the header before `go`
 #endif
+#ifdef CFD_DP
+    // run_mesh --deadpass: whole-pass live-tile bitmap table in arena tile CFD_DP (deadpass.dp_pack_core)
+    const uint32_t* DP = reinterpret_cast<const uint32_t*>(arena + CFD_DP * 4096);
+    const uint32_t dp_hdr = DP[0];
+    const uint32_t dp_np = dp_hdr & 0xffff, dp_nw = (dp_hdr >> 16) & 0x7fff, dp_u16 = dp_hdr >> 31;
+    const uint32_t dp_ib = 1 + dp_np * dp_nw;
+    auto dp_live = [&](uint32_t id, uint32_t t) -> bool {
+        const uint32_t k = id - 1;
+        const uint32_t pi = dp_u16
+            ? ((DP[dp_ib + (k >> 1)] >> ((k & 1) << 4)) & 0xffff)
+            : ((DP[dp_ib + (k >> 2)] >> ((k & 3) << 3)) & 0xff);
+        return (DP[1 + pi * dp_nw + (t >> 5)] >> (t & 31)) & 1;
+    };
+#endif
     // per halo slot its plan's senders (ttres/encode.py: plan 0 at tab_halo, a directory below tab_halo if hdir)
     // and its receive buffer's word offset in the halo CB (slots sized per plan; one plan: s * hmax)
     uint32_t hcnt[NH], nsend[NH], hoff[NH];
@@ -876,6 +890,10 @@ void kernel_main() {
                 ginv();
                 // entries: src, shift << SS | (map + 1) << 4 | nparts (map + 1 = 0: no patch), then (part src, halo
                 // slot) per part
+                const uint32_t t0 = (w >> 8) & 0xff;
+#ifdef CFD_DP
+                const uint32_t dpid = w >> 16;
+#endif
                 const uint32_t ne = N[pc] & 0xffff, tn = N[pc] >> 16 ? N[pc] >> 16 : NT;   // tn: pages per entry
                 const uint32_t e0 = pc + 1;
                 // pe: the last patched entry's word offset. CFD_TABSTREAM without CFD_TRID patches any number of
@@ -886,7 +904,14 @@ void kernel_main() {
                     p += 2 + 2 * (N[p + 1] & 0xf);
                 }
                 pc = p;
-                // the patched entry: table sections and halo readiness, once per stream
+                uint32_t t_first = t0;
+#ifdef CFD_DP
+                if (dpid) {
+                    while (t_first < tn && !dp_live(dpid, t_first)) ++t_first;
+                }
+#endif
+                // the patched entry: wait for incoming halo arrivals even if all tiles are dead on this core
+                // (so the next N_HALO on the same slot cannot credit a new round while the old round is in flight)
                 uint32_t np_ = 0, qz = 0, nz = 0;
                 uint32_t ql[8], nl[8], qh[8], nh[8], cl[8], ch[8], cz = 0;   // up to 8 gather parts (encode.py)
 #ifdef CFD_TABSTREAM
@@ -904,15 +929,16 @@ void kernel_main() {
                         }
                 }
                 (void)pe, (void)qz, (void)nz, (void)ql, (void)nl, (void)qh, (void)nh, (void)cl, (void)ch, (void)cz;
+                if (!run || t_first >= tn) break;
 #ifdef CFD_TRID
-                // tile 0's tables go out now, tile t + 1's once tile t is patched (two staging buffers, as in GATHER),
-                // so the patched page rarely waits for its tables
-                if (pe && run) load_tile(qi, 2 * np_ + 1, 0, 0, tm);
+                // tile t_first's tables go out now, next live tile's once tile t is patched (two staging buffers)
+                if (pe) load_tile(qi, 2 * np_ + 1, t_first, 0, tm);
 #endif
 #else
                 if (pe) {
                     np_ = N[pe + 1] & 0xf;
                     uint32_t q = T[(N[pe + 1] >> 4) & SM];   // T[1 + map]
+                    const uint32_t lo0 = t_first * 1024;
                     for (uint32_t k = 0; k < np_; ++k) {
                         nl[k] = T[q];
                         nh[k] = T[q + 1];
@@ -920,6 +946,8 @@ void kernel_main() {
                         qh[k] = q + 2 + nl[k];
                         q = qh[k] + nh[k];
                         cl[k] = ch[k] = 0;
+                        while (cl[k] < nl[k] && (T[ql[k] + cl[k]] >> 16) < lo0) ++cl[k];
+                        while (ch[k] < nh[k] && (T[qh[k] + ch[k]] >> 16) < lo0) ++ch[k];
                         if (nh[k]) {
                             const uint32_t s = N[pe + 3 + 2 * k];
                             if (!WAIT_UNTIL(S[4 * s] >= hcnt[s] * nsend[s], 16)) { run = false; break; }
@@ -927,9 +955,10 @@ void kernel_main() {
                     }
                     nz = T[q];
                     qz = q + 1;
+                    while (cz < nz && T[qz + cz] < lo0) ++cz;
                 }
+                if (!run || t_first >= tn) break;
 #endif
-                if (!run) break;
                 uint32_t pend = 0;
 #ifdef CFD_TRID
                 // up to RING pages in flight, slot k's reads under id 1 + k: after every issue the slots whose reads
@@ -990,7 +1019,21 @@ void kernel_main() {
                     pend = 0;
                 };
 #endif
-                for (uint32_t t = 0; t < tn && run; ++t) {
+#ifdef CFD_TRID
+                uint32_t slot = 0;
+#endif
+                for (uint32_t t = t_first; t < tn && run; ++t) {
+#ifdef CFD_DP
+                    if (dpid && !dp_live(dpid, t)) continue;
+#endif
+#ifdef CFD_TRID
+                    uint32_t t_next = t + 1;
+#ifdef CFD_DP
+                    if (dpid) {
+                        while (t_next < tn && !dp_live(dpid, t_next)) ++t_next;
+                    }
+#endif
+#endif
                     const uint32_t lo = t * 1024, hi = lo + 1024;
                     p = e0;
                     for (uint32_t e = 0; e < ne && run; ++e) {
@@ -1044,8 +1087,8 @@ void kernel_main() {
 #ifdef CFD_TRID
                             // the page's own reads and tile t's tables (prefetched): earlier slots stay in flight
 #ifdef CFD_TABSTREAM
-                            PSUB(16, tbar(id); tbar(TID_TAB + (t & 1)));
-                            sp = sp_[t & 1], sn = sn_[t & 1];
+                            PSUB(16, tbar(id); tbar(TID_TAB + slot));
+                            sp = sp_[slot], sn = sn_[slot];
 #else
                             PSUB(16, tbar(id));
 #endif
@@ -1176,7 +1219,8 @@ void kernel_main() {
                             }
 #endif
 #ifdef CFD_TRID
-                            if (t + 1 < tn) load_tile(qi, 2 * np_ + 1, t + 1, (t + 1) & 1, tm);
+                            if (t_next < tn) load_tile(qi, 2 * np_ + 1, t_next, slot ^ 1, tm);
+                            slot ^= 1;
 #endif
 #else
                             for (uint32_t k = 0; k < np_; ++k) {

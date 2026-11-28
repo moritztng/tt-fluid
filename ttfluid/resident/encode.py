@@ -35,6 +35,7 @@ C_PH = 45               # phase marker (Encoded(phase=...)): phase id in the top
 NARROW = 1 << 27        # desc bit: a bf16 constant page (vm_ncrisc window)
 C_LDK = 46              # C_LDR of a constant page the fold table may serve (Machine kfold): bits 12 up = the
 #                         constant's page offset; a non-zero code of page offset + tile fills the slot, no page comes
+C_TBEGM = 47            # masked tile loop (--deadpass): bits 8..15 = t0, bits 16..31 = t1; next word = dpid | body_words << 16
 FOLD = 1 << 26          # desc bit: the reader skips the pages of this constant that the fold table codes (vm_ncrisc)
 TILE = 0x80     # op bit: tile operand += loop counter
 # BRISC
@@ -188,6 +189,18 @@ def hrun_words(lane, idx, rmin=8):
 
 
 class Encoded:
+    def _all_chips_and(self, v):
+        return bool(v)
+
+    def _all_chips_or(self, v):
+        return bool(v)
+
+    def _all_chips_max(self, v):
+        return int(v)
+
+    def _all_chips_union(self, s):
+        return set(s)
+
     def __init__(self, m, page=False, pdev=None, tab_stream=False, look=False, cores=None, tab_sort=False, phase=None,
                  gtile=False, tab_dense=0, tab_break=0, kfold_broken=0):
         """page: the compute stream is paged from DRAM through a ring NCRISC fills (vm_ncrisc N_CODE): every basic
@@ -214,6 +227,9 @@ class Encoded:
         phase = phase or {}
         self.m, self.page, self.look = m, page, look
         self.kfold, self.kfold_broken, self.kfold_broke = None, kfold_broken, None   # --kfold: the tables (P, words), see _arena
+        self.kfold_regs = None
+        self.dp, self.dp_map, self.dp_broke, self.dp_stats = None, {}, None, None
+        self.lds_skipped = 0
         self.cores = np.arange(m.P) if cores is None else np.asarray(cores)
         assert not (tab_stream and getattr(m, "hrun", False)), "hrun marks the L1 gather tables"
         assert not (tab_dense and (not tab_stream or WIDE)), "dense index tables: streamed, 16-bit lanes"
@@ -240,9 +256,28 @@ class Encoded:
         vec = lambda r: m.T > 1 and r != "__anchor__" and (phys[r] >= m.nsmall or r in getattr(m, "ovl", ()))
         tf = lambda r: TILE if vec(r) and phys[r] < DBASE else 0
 
+        def unwrap_blks(x):
+            if x[0] == "range":
+                x = x[3]
+            return [bk for bk in x[1] if bk[0] == "blk"] if x[0] == "seg" else [x] if x[0] == "blk" else []
+
         def blk_rw(x):
             uops = x[1]
             return uops, [u[2] for u in uops if u[0] in ("ld", "lds", "rvf")], [u for u in uops if u[0] == "ldr"], [r for _, r in x[2]]
+
+        # Build tables and arena up front (independent of streams) so dense-gather lds skipping, --kfold coded-only
+        # C_LDK, and --deadpass whole-pass live-tile bitmaps can guide stream emission.
+        self._tables()
+        self._arena()
+        if self.kfold is not None:
+            coded_orig = set()
+            for r, o in m.coff.items():
+                sz = m.size(r)
+                if sz > 0 and (kfold_codes(self.kfold, np.arange(o, o + sz)[None].repeat(len(self.kfold), 0)) > 0).any():
+                    coded_orig.add(r)
+            coded_orig = self._all_chips_union(coded_orig)
+            self.kfold_regs = {r for r in phys if phys[r] >= KBASE and (r in coded_orig or m.fetched_from.get(r) in coded_orig)}
+        kfolds = lambda u: m.kfolds(u) and (self.kfold_regs is None or u[2] in self.kfold_regs)
 
         gt = {}     # gtile: MIR index of a gather -> its consumer loop's tile count
         if gtile:
@@ -261,36 +296,151 @@ class Encoded:
                     continue
                 gt[j] = m.tiles([x])
             self.gtile_n = len(gt)
+
+        # Item 1 (--tabdense): skip split-gather lds pass when the following dense N_GATHER is dense on every core
+        # across all chips and extended to overwrite every tile of its destination vector.
+        mir = m.mir
+        skip = set()
+        dense_gather_j = set()
+        dense_ftm = {}   # (orig_mid, shift) -> max force_tm required for skipped split-gather lds
+        if tab_stream and tab_dense:
+            from .tabstream import _sections as _ts_sections, _lane as _ts_lane
+            _dense_cache = {}
+
+            def _all_dense(orig_mid):
+                if orig_mid not in _dense_cache:
+                    ok = m.maps.tab[orig_mid]["nparts"] == 1
+                    if ok:
+                        for ci in range(len(self.tab)):
+                            secs, _ = _ts_sections(self.tab[ci], orig_mid, 1)
+                            tm_nat = max([int(_ts_lane(k, e.astype(np.int64)).max()) // 1024 + 1 for k, e in secs if len(e)] or [1])
+                            if len(secs[0][1]) < tab_dense * tm_nat:
+                                ok = False
+                                break
+                    _dense_cache[orig_mid] = self._all_chips_and(ok)
+                return _dense_cache[orig_mid]
+
+            for j, ins in enumerate(mir):
+                if ins[0] != "gather" or (len(ins) > 4 and ins[4]):
+                    continue
+                jb = j - 1
+                while jb >= 0 and mir[jb][0] in ("sync", "tok"):
+                    jb -= 1
+                xb = mir[jb] if jb >= 0 else ("",)
+                split = (len(ins[3]) == 1 and xb[0] == "blk"
+                         and [r for _, r in xb[2]] == [ins[1]] and xb[1][-1][0] == "lds"
+                         and xb[1][-1][2] == ins[3][0][0] and all(u[2] == "__anchor__" for u in xb[1][:-1]))
+                if split and phys[ins[3][0][0]] < DBASE and _all_dense(ins[2]):
+                    key = (ins[2], xb[1][-1][3])
+                    dense_ftm[key] = max(dense_ftm.get(key, 0), m.tiles([xb]))
+                    skip.add(jb)
+                    dense_gather_j.add(j)
+                    self.lds_skipped += 1
+
+        # Item 3 (--deadpass): exact whole-pass live-tile bitmap packed into arena tile(s) m.dp_tile
+        if getattr(m, "deadpass", False):
+            from .deadpass import analyze_deadpass, dp_pack_core
+            skip_gtile = {gj + 2 for gj in gt}
+            eligible_j, per_core_masks, any_dead, dp_ranges = analyze_deadpass(
+                m, self.cores, self.consts, self.arena, self.home,
+                skip_mir=skip, skip_gtile=skip_gtile, tab_stream=bool(tab_stream),
+                dense_gather_j=dense_gather_j)
+            dp_loops_local = {eligible_j[k] for k in range(len(eligible_j)) if any_dead[k]}
+            dp_loops = sorted(self._all_chips_union(dp_loops_local))
+            self.dp_map = {j: idx + 1 for idx, j in enumerate(dp_loops)}   # 1-based dpid
+            bt_max = max((dp_ranges[j][1] for j in dp_loops if j in dp_ranges), default=m.T)
+            bt_max = max(bt_max, m.T)
+            nw = max(1, (bt_max + 31) // 32)
+            dead_passes = 0
+            total_passes = 0
+            for ci in range(len(self.cores)):
+                cm = per_core_masks[ci]
+                for j in eligible_j:
+                    t0_j, t1_j = dp_ranges[j]
+                    n_j = t1_j - t0_j
+                    total_passes += n_j
+                    dead_passes += n_j - int(cm[j]).bit_count()
+            dp_rows = []
+            for ci, gcore in enumerate(self.cores.tolist()):
+                cm = dict(per_core_masks[ci])
+                if getattr(m, "deadpass_broken", 0) == 1 and gcore == 0 and dp_loops:
+                    # Broken arm 1: clear the lowest live tile bit on core 0 across dp_loops (proves the DP bitmap
+                    # table in CFD_DP is actively decoded and obeyed by compute, NCRISC, and BRISC)
+                    flipped = []
+                    for j in dp_loops:
+                        ins_j = mir[j]
+                        t0_j, t1_j = dp_ranges.get(j, (ins_j[1], ins_j[2]) if ins_j[0] == "range" else (0, m.tiles(unwrap_blks(ins_j))))
+                        mb = cm.get(j, (1 << t1_j) - (1 << t0_j))
+                        for t in range(t0_j, t1_j):
+                            if (mb >> t) & 1:
+                                cm[j] = mb & ~(1 << t)
+                                flipped.append((j, t))
+                                break
+                    assert flipped, "no live tile in any dp_loop on core 0 for --deadpass-broken 1"
+                    self.dp_broke = f"core 0: cleared 1 live tile bit in {len(flipped)} dp_loops (first mir {flipped[0][0]} tile {flipped[0][1]})"
+                mlist = []
+                for j in dp_loops:
+                    if j in cm:
+                        mlist.append(cm[j])
+                    else:
+                        ins_j = mir[j]
+                        t0_j, t1_j = (ins_j[1], ins_j[2]) if ins_j[0] == "range" else (0, m.tiles(unwrap_blks(ins_j)))
+                        mlist.append((1 << t1_j) - (1 << t0_j))
+                dp_rows.append(dp_pack_core(mlist, bt_max))
+            max_w = self._all_chips_max(max((len(w) for w in dp_rows), default=1))
+            need_tiles = max(1, -(-max_w // LANES))
+            if need_tiles > m.dp_tiles:
+                extra = need_tiles - m.dp_tiles
+                self.arena = np.concatenate([self.arena, np.zeros((len(self.cores), extra, LANES), np.float32)], axis=1)
+                m.dp_tiles = need_tiles
+                m.ntiles = m.dp_tile + m.dp_tiles
+            for ci, w in enumerate(dp_rows):
+                self.arena[ci, m.dp_tile:m.dp_tile + m.dp_tiles].view(np.uint32).reshape(-1)[:len(w)] = w
+            self.dp = self.arena[:, m.dp_tile:m.dp_tile + m.dp_tiles].view(np.uint32).reshape(len(self.cores), -1)
+            self.dp_stats = dict(n_loops=len(dp_loops), max_words=max_w, tiles=m.dp_tiles, nw=nw,
+                                 dead_passes=dead_passes, total_passes=total_passes,
+                                 mask_splits=getattr(m, "mask_split_n", 0))
+
         waitn = [False, None]   # gtile: a C_WAITN owed after the next C_TBEG; where it went
         # gather census (tabstream.gcensus): one row per patched reader page and per gather op in program order:
         # (class, map, dense twin or None, parts, phase id or None)
         self.gops, cur_ph = [], [None]
         gsrc = lambda xs: "dram" if all(phys[x] >= DBASE for x in xs) else "mixed" if any(phys[x] >= DBASE for x in xs) else "l1"
 
-        def head(blks):
-            """Open the tile loop of one block or of a fused segment's blocks: TBEG, the reader's one stream of every
-            ldr page in program order, the writer's one sink of every DRAM store."""
+        def head(blks, t0=0, t1=None, dpid=0, force_loop=False):
+            """Open the tile loop of one block or of a fused segment's blocks: TBEG/TBEGM, the reader's one stream of
+            every ldr page in program order, the writer's one sink of every DRAM store."""
             uops = [u for x in blks for u in x[1]]
             lds = [u[2] for u in uops if u[0] in ("ld", "lds", "rvf")]
             ldr = [u for u in uops if u[0] == "ldr"]
             sts = [r for x in blks for _, r in x[2]]
-            loop = any(vec(r) for r in lds + sts) or bool(ldr)
+            bt = m.tiles(blks)
+            if t1 is None:
+                t1 = bt
+            assert 0 <= t0 < t1 <= bt and t0 < 256 and t1 < 65536 and dpid < 65536
+            loop = any(vec(r) for r in lds + sts) or bool(ldr) or t0 > 0 or force_loop
+            dm_pos = None
             if loop:
                 assert not any(u[0] == "rvf" and vec(u[2]) for u in uops)
                 # a shifted load reads the neighbouring tiles: never of a vector this loop overwrites
                 assert not {u[2] for u in uops if u[0] == "lds"} & set(sts)
                 assert not {x for u in ldr if u[3] or u[4] is not None
                             for x in [u[2]] + [y for y, _ in u[5]]} & set(sts)
-                c(W(C_TBEG) | m.tiles(blks) << 16)
+                if dpid:
+                    assert not waitn[0], "gtile consumer cannot carry a deadpass bitmap"
+                    c(W(C_TBEGM) | t0 << 8 | t1 << 16, 0)
+                    dm_pos = len(c.w) - 1
+                else:
+                    c(W(C_TBEG) | t0 << 8 | t1 << 16)
                 if waitn[0]:
                     waitn[:] = [False, len(c.w)]
                     c(W(C_WAITN))
             # pages per stream / sink: a vector's tile count, 0 = T (the multigrid levels have fewer)
-            tn = 0 if m.tiles(blks) == m.T else m.tiles(blks)
+            tn = 0 if t1 == m.T else t1
             if ldr:
                 # one patched entry per stream, or any number with pseg >= 3 (vm_ncrisc: CFD_TABSTREAM without CFD_TRID)
                 assert sum(u[4] is not None for u in ldr) <= 1 or getattr(m, "pseg", 0) >= 3
-                n(W(N_STREAM), len(ldr) | tn << 16)
+                n(W(N_STREAM) | t0 << 8 | dpid << 16, len(ldr) | tn << 16)
                 for u in ldr:
                     assert len(u[5]) <= 8      # the reader keeps 8 part cursors (vm_ncrisc.cpp)
                     ss = 14 if WIDE else 16     # WIDE: 18-bit shift, 10-bit map (vm_ncrisc SS, SM)
@@ -305,16 +455,16 @@ class Encoded:
                                           "dram" if phys[u[2]] >= DBASE else "same l1" if xs == [u[2]] else "other l1"),
                                           u[4], mid if mid != u[4] else None, len(xs), cur_ph[0]))
                     assert -(1 << 31 - ss) <= u[3] < 1 << 31 - ss and (mid or 0) < (1 << 28 - ss) - 1, (u[3], mid)
-                    n(desc(u[2]) | (FOLD if m.kfolds(u) else 0), (u[3] & (1 << 32 - ss) - 1) << ss | (0 if mid is None else mid + 1) << 4 | len(u[5]))
+                    n(desc(u[2]) | (FOLD if kfolds(u) else 0), (u[3] & (1 << 32 - ss) - 1) << ss | (0 if mid is None else mid + 1) << 4 | len(u[5]))
                     for x, h in u[5]:
                         n(desc(x), NONE16 if h is None else halo_slot(h))
             sink = [r for r in sts if phys[r] >= DBASE]
             if sink:
                 assert all(phys[r] < KBASE for r in sink)
-                b(W(B_SINK), len(sink) | tn << 16)
+                b(W(B_SINK) | t0 << 8 | dpid << 16, len(sink) | tn << 16)
                 for r in sink:
                     b(desc(r))
-            return loop, lds, sts
+            return loop, lds, sts, dm_pos
 
         def body(ins):
             c(W(C_ACQ))
@@ -325,7 +475,7 @@ class Encoded:
                 elif k == "lds":      # offset load: lane l reads lane l + u[3] (a multiple of 4 = 16 B)
                     assert u[3] % 4 == 0
                     c(W(C_LDS, u[1]) | tf(u[2]) | phys[u[2]] << 16, u[3] // 4)
-                elif k == "ldr" and m.kfolds(u):
+                elif k == "ldr" and kfolds(u):
                     assert phys[u[2]] - KBASE < 1 << 20 and page_phase(0) == 0
                     c(W(C_LDK, u[1]) | phys[u[2]] - KBASE << 12)
                 elif k == "ldr":
@@ -379,8 +529,6 @@ class Encoded:
         # while NCRISC pushes the next instruction's pages: the ring must hold both
         rel, tpc = 0, None
         gwant = {}
-        mir = m.mir
-        skip = set()
         for j, ins in enumerate(mir):
             if j in skip:
                 continue
@@ -398,9 +546,16 @@ class Encoded:
                     n(W(N_CODE), -(-len(c.w) // PW), -(-len(c.w) // PW))     # falling into the label: the code before it is pushed first
                 seal(-(-len(c.w) // PW))    # N_CODEAT at the label rewinds the cursor: no push may pass it
                 pad()
-            if op in ("blk", "seg"):
-                items = [ins] if op == "blk" else ins[1]
-                loop, lds, sts = head([x for x in items if x[0] == "blk"])
+            if op in ("blk", "seg", "range"):
+                if op == "range":
+                    t0, t1, inner = ins[1], ins[2], ins[3]
+                    iop = inner[0]
+                    items = [inner] if iop == "blk" else inner[1]
+                else:
+                    t0, t1, iop = 0, None, op
+                    items = [ins] if op == "blk" else ins[1]
+                dpid = self.dp_map.get(j, 0)
+                loop, lds, sts, dm_pos = head([x for x in items if x[0] == "blk"], t0=t0, t1=t1, dpid=dpid, force_loop=(op == "range"))
                 tpc = (len(c.w) if waitn[1] is None else waitn[1]) if loop else None
                 assert not waitn[0], "gtile: the consumer loop did not open"
                 waitn[1] = None
@@ -411,9 +566,13 @@ class Encoded:
                         c(W(C_TOK))
                 if loop:
                     # one tile carried to the next pass (a partial); a segment's sync pass places its own tokens
-                    if op == "blk" and {r for r in lds if not vec(r)} & set(sts):
+                    if iop == "blk" and {r for r in lds if not vec(r)} & set(sts):
                         c(W(C_TOK))
                     c(W(C_TEND))
+                    if dm_pos is not None:
+                        bsz = len(c.w) - tpc
+                        assert 0 < bsz < (1 << 16), f"C_TBEGM body too large: {bsz} words"
+                        c.w[dm_pos] = dpid | bsz << 16
             elif op == "tok":
                 c(W(C_TOK))
             elif op == "sync":
@@ -549,17 +708,17 @@ class Encoded:
         b(W(B_END)), n(W(N_END))
         assert m.ntiles < 1 << 16
         self.c, self.b, self.n = c.done(), b.done(), n.done()
-        self._tables()
         if tab_stream:      # residue tables in DRAM, a tile-offset index in L1 (tabstream.py)
             from .tabstream import stream
             self.tab_cursor, self.tab_halo_cursor = self.tab, self.tab_halo
-            self.tab_stream = S = stream(self, sort=tab_sort, dense=[(o, sh, tab_dense) for o, sh in twin], brk=tab_break)
+            self.tab_stream = S = stream(self, sort=tab_sort,
+                                         dense=[(o, sh, tab_dense, dense_ftm.get((o, sh), 0)) for o, sh in twin],
+                                         brk=tab_break)
             self.tab = _pad(S["l1"])
             self.tab_blob = _pad(S["blob"])
             self.tab_halo = np.array(S["halo_off"], np.uint32)
         else:
             self.tab_stream = None
-        self._arena()
 
     # ---- per-core tables (uint32 words), same layout on every core, padded to one length
     def _tables(self):
@@ -572,7 +731,10 @@ class Encoded:
             tabs[i] += [nm] + [0] * nm
         # hrun: halo entries of maps no stream patches carry runs (lane and position consecutive, agreeing mod 4) as a
         # head word with bit 15 set and the run's length after it (vm_ncrisc hscatter moves each with one NoC copy)
-        blks = lambda x: x[1] if x[0] == "seg" else [x] if x[0] == "blk" else []
+        def blks(x):
+            if x[0] == "range":
+                x = x[3]
+            return x[1] if x[0] == "seg" else [x] if x[0] == "blk" else []
         smaps = {u[4] for x in m.mir for bk in blks(x) if bk[0] == "blk" for u in bk[1] if u[0] == "ldr"}
         hrun = getattr(m, "hrun", False)
         self.hrun_stat = [0, 0]     # halo entries in marked maps, entries a run copy replaces (minus its two words)
@@ -719,6 +881,8 @@ class Encoded:
             return
         read = np.zeros(len(code), bool)     # pages some FOLD stream reads
         for x in m.mir:
+            if x[0] == "range":
+                x = x[3]
             for bk in (x[1] if x[0] == "seg" else [x] if x[0] == "blk" else []):
                 if bk[0] != "blk":
                     continue
