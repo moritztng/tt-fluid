@@ -90,6 +90,12 @@ stays bit-identical. Both are off by default.
   vector. The gather is then served by the dense tables, with no window read and no gather-cache miss. `--span 2`
   also turns such a gather into a single reader page when its destination is in SRAM.
 
+Two more options, also value-preserving and off by default, keep work out of DRAM. `--lsplit 1` parks a vector that
+holds an SRAM slot across a solver loop that does not use it in DRAM for the duration of the loop, so the loop's own
+vectors get the slot. `--lsplit 2` does the same for the solution of the solve, which the loop touches once a pass.
+`--cse 2` recognises gathers whose index arrays have the same content, so an interpolation or a gradient that several
+callers ask for is computed and gathered once.
+
 `ttfluid.resident.encode` packs the result into three uint32 streams per core, one for each kernel:
 
 - `vm_brisc.cpp` (BRISC) loads the core's arena and code, then runs the B stream: signals and waits, halo pushes with

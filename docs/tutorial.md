@@ -77,7 +77,7 @@ The case is `incompressible/simpleFoam/HPC_motorbike/Small` of the OpenFOAM HPC 
 
 ```bash
 FLAGS="--arch bh --mesh 1,2 --layout rcb --wplace 2 --gw 1 --nsh 1 --page 16 --tabstream --lsched --phase --sliced \
-  --fuse --cse 1 --hlate 1 --strips --tsort 1 --l1 2 --l1-bytes 1461760 --lsplit 1 \
+  --fuse --cse 2 --hlate 1 --strips --tsort 1 --l1 1 --l1-bytes 1461760 --lsplit 2 --tabdense 530 --span 2 \
   --forces motorbike/system/controlDict:forceCoeffsAll"
 PYTHONHASHSEED=0 python -m ttfluid.device.run_mesh case 800 --case motorbike $FLAGS --nwin 8192 --images img_k2
 ```
@@ -90,10 +90,14 @@ reductions, so two lowerings give the same images.
 The pressure solve is Jacobi-preconditioned CG, the default when `--amg` is not given. On Blackhole that is faster
 than an aggregation V-cycle: it needs about six times as many iterations, but each costs a twentieth.
 
-`--l1 2` keeps two solver vectors in each core's L1 memory and `--lsplit 1` moves a vector out to DRAM for the
-duration of a solver loop that does not use it. With the cache and patch settings the run now chooses itself
-(step 4), that is 1.18 times faster on the device than the line before it (`--l1 1 --gcache 14`), and the state
-after 100 iterations is bit for bit the same. The raw logs of these legs are in
+Four of these options are what makes this line faster than v0.1.0's, and none of them changes a value.
+`--tabdense 530` stores the larger gather maps as dense index tables. `--span 2` gives a gather from a vector that
+lives in DRAM a copy in L1 memory to read. `--lsplit 2` moves a vector out of L1 for the duration of a solver loop
+that needs the room for its own vectors. `--cse 2` computes an interpolation or a gradient of a field once when
+several terms ask for it. With the settings the run chooses itself (step 4), the first 100 iterations take 108 s on
+the device. The line this one replaces (`--l1 2 --lsplit 1`) took 136 s and v0.1.0's (`--l1 1 --gcache 14`) 161 s,
+so this one is 1.26 and 1.49 times faster, and the state after those 100 iterations is bit for bit the same with all
+three. [architecture.md](architecture.md) describes the options, and the raw logs of these legs are in
 `results/tenstorrent/galaxy-blackhole-pair/`.
 
 ### 3. Starting state from potentialFoam
@@ -109,13 +113,15 @@ export TT_VISIBLE_DEVICES=0,1
 export TT_MESH_GRAPH_DESC_PATH=$(python -c "import ttnn, pathlib; print(pathlib.Path(ttnn.__file__).parent / \
   'tt_metal/fabric/mesh_graph_descriptors/p300_mesh_graph_descriptor.textproto')")
 python -m ttfluid.device.run_mesh case 800 --case motorbike $FLAGS --from-images img_k2 --state-in state0.npz \
-  --noemu --runs 1 --nwin 1024 --links 0 --rlink 1 --os 1 --bgts 5 --tgts 2 --out motorbike.jsonl
+  --noemu --runs 1 --nwin 1024 --links 0 --rlink 1 --os 1 --bgts 6 --tgts 3 --out motorbike.jsonl
 ```
 
-On two Blackhole chips at 1350 MHz this takes about 1030 s of device time for 800 iterations (measured on two chips
-of a Blackhole Galaxy). A QuietBox 2 runs two such cases at once, one per board (`TT_VISIBLE_DEVICES=2,3` for the
-second). The run sizes its gather cache to the L1 memory that is left and chooses `--bpatch` from counts stored in
-the images, and prints both choices.
+On two Blackhole chips at 1350 MHz the first 100 iterations take about 108 s of device time (measured on two
+chips of a Blackhole Galaxy). 800 iterations have not been timed with this line yet; with the line it replaces they
+took 1030 s, at 136 s for the first 100. A QuietBox 2 runs two such cases at once, one per board
+(`TT_VISIBLE_DEVICES=2,3` for the second). The run sizes its gather cache to the L1 memory that is left and chooses
+`--bpatch` from counts stored in the images, and prints both choices. `--bgts 6 --tgts 3` shares the copies of a
+gather among the three processors of a core.
 
 `--forces` evaluates the case's `forceCoeffs` function object on the state each iteration starts from and stores Cd
 and Cl in the history, which is saved with the final state in `motorbike_case_1x2_state.npz`.
