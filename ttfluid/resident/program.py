@@ -71,10 +71,14 @@ class TracedOps(EllOps):
             return perf
         return run
 
-    def krylov_fused(self, As, xs, bs, c):
-        """The components of one vector solve in one lockstep loop (krylov.UFUSE); None: solve them one by one."""
-        if not krylov.UFUSE:
-            return None
+    @property
+    def krylov_fused(self):
+        """The components of one vector solve in one lockstep loop (krylov.UFUSE). None when it is off, so that the
+        caller (ops.EllMatrix.solve) builds no operands for it: the default trace is the one-by-one trace, register
+        for register."""
+        return self._krylov_fused if krylov.UFUSE else None
+
+    def _krylov_fused(self, As, xs, bs, c):
         perfs = krylov.pbicgstab_fused(As, xs, bs, c)
         self.perfs.extend(("pbicgstab", p) for p in perfs)
         return perfs
