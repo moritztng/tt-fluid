@@ -1,6 +1,5 @@
 """flx-kernel: which planned bodies does blockgen turn down, and why. rejects.py MCACHE.pkl[.zst]  (CPU only)"""
-import collections, io, pickle, sys
-import numpy as np
+import collections, pickle, sys
 from ttfluid.resident import blklower, blockgen
 
 def load(p):

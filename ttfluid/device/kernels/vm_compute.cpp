@@ -111,6 +111,64 @@ void kernel_main() {
     for (uint32_t i = 0; i < 40; ++i) cyc[i] = cnt[i] = 0;
     uint32_t tprev = static_cast<uint32_t>(ckernel::read_wall_clock());
 #endif
+#ifdef CFD_PROFW
+    // run_mesh --prof 2: who MATH waits for. UNPACK and PACK publish what they wait in (hdr 300 / 301: 0 at work; UNPACK
+    // 1 a reader page, 2 NCRISC's token, 3 BRISC's token, 4 PACK's token, 5 a code page; PACK 1 a free writer page, 2 a
+    // code page, 3 / 4 a free token page to BRISC / NCRISC), NCRISC its op and part (hdr 302, vm_ncrisc.cpp). MATH drains
+    // its Tensix pipeline before a load or an acquire (its own queued work), issues it, and drains again: the post of
+    // that drain lands when the unpacker (the packer) has let the instruction through, and each poll's cycles go to the
+    // state published at that poll: loads to hdr 700 + 2 (16 unpack state + reader class), acquires to 960 + 2 pack
+    // state, own work to 976, the last poll of each kind to 980 + 2 kind (two words each: low, high); counts at 988..990
+#define USTATE(s) UNPACK((hw[300] = (s)))
+#define PSTATE(s) PACK((hw[301] = (s)))
+#ifdef TRISC_MATH
+    for (uint32_t i = 700; i < 992; ++i) hw[i] = 0;
+    auto wadd = [&](uint32_t i, uint32_t dt) {
+        const uint32_t lo = hw[i], nl = lo + dt;
+        hw[i] = nl;
+        if (nl < lo) hw[i + 1] = hw[i + 1] + 1;
+    };
+    auto ncls = [&]() -> uint32_t {   // the reader's class: the part it is in, else its op (32 + op)
+        const uint32_t q = hw[302];
+        switch (q) {
+            case 10: return 9;        // STREAM waits for a free cb_in slot
+            case 11: return 8;        // STREAM's DRAM read barrier
+            case 16: return 4;        // the patch's barrier (entries read from DRAM)
+            case 18: return 5;        // GATHER waits for the halo
+            case 19: return 6;        // GATHER's scatters
+            case 32 + 2: return 1;    // WAITC
+            case 32 + 4: return 2;    // WAITB
+            case 32 + 5: return 3;    // GATHER outside its parts
+            case 32 + 9: return 7;    // STREAM outside its parts
+            case 32 + 6: return 10;   // HALO
+            default: return q ? (q < 32 ? 12 : 11) : 0;
+        }
+    };
+    // kind 0: after a load (cause: UNPACK's state x the reader's class), 1: after an acquire (PACK's state), 2: own work
+    auto mdrain = [&](uint32_t kind) {
+        uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
+        ckernel::t6_semaphore_wait_on_max<ckernel::p_stall::STALL_SYNC>(ckernel::semaphore::MATH_DONE);
+        ckernel::t6_semaphore_post<ckernel::p_stall::MATH | ckernel::p_stall::WAIT_SFPU>(ckernel::semaphore::MATH_DONE);
+        while (ckernel::semaphore_read(ckernel::semaphore::MATH_DONE) == 0) {
+            const uint32_t i = kind == 0 ? 700 + 2 * (16 * (hw[300] & 7) + ncls()) : kind == 1 ? 960 + 2 * (hw[301] & 7) : 976;
+            const uint32_t t = static_cast<uint32_t>(ckernel::read_wall_clock());
+            wadd(i, t - tp);
+            tp = t;
+        }
+        ckernel::semaphore_get(ckernel::semaphore::MATH_DONE);
+        wadd(980 + 2 * kind, static_cast<uint32_t>(ckernel::read_wall_clock()) - tp);
+        hw[988 + kind] = hw[988 + kind] + 1;
+    };
+#define MDRAIN(k) MATH((mdrain(k)))
+#else
+#define MDRAIN(k)
+#endif
+#else
+#define USTATE(s)
+#define PSTATE(s)
+#define MDRAIN(k)
+#endif
+#define COPY_TILE(cb, i, d) do { MDRAIN(2); copy_tile(cb, i, d); MDRAIN(0); } while (0)
 #ifdef CFD_PHASE
     // run_mesh --phase: wall-clock cycles of this thread per SIMPLE phase (C_PH opens phase id = w >> 16; id 15 = before
     // the first marker), 64-bit, kept by MATH only and written to hdr 512 + 2 id (low word) / 513 + 2 id (high word)
@@ -158,8 +216,10 @@ void kernel_main() {
             if (pc >= hi * PW) {   // entering page hi (pc is at its start: ops never straddle pages)
                 UNPACK(({
                     if (hi) cb_pop_front(cb_code, 1);
+                    USTATE(5);
                     TWAIT(cb_code);
                     cb_wait_front(cb_code, 1);
+                    USTATE(0);
                     sw[W_CUNP] = hi + 1;
                 }));
                 MATH(({
@@ -168,8 +228,10 @@ void kernel_main() {
                     sw[W_CMATH] = hi + 1;
                 }));
                 PACK(({
+                    PSTATE(2);
                     while (sw[W_CUNP] <= hi) {
                     }
+                    PSTATE(0);
                 }));
                 ++hi;
                 const uint32_t r = (tl < tn) ? tpc / PW : pc / PW;   // an open tile loop keeps its body
@@ -195,36 +257,40 @@ void kernel_main() {
 #endif
         switch (op) {
             case C_END: run = false; break;
-            case C_ACQ: tile_regs_acquire(); break;
+            case C_ACQ: MDRAIN(2); tile_regs_acquire(); MDRAIN(1); break;
             case C_COMMIT: tile_regs_commit(); tile_regs_wait(); break;
             case C_REL: tile_regs_release(); break;
-            case C_LD: LDI(cb_v); copy_tile(cb_v, (w >> 16) + to, a); break;
+            case C_LD: LDI(cb_v); COPY_TILE(cb_v, (w >> 16) + to, a); break;
             case C_LDS: {   // offset load: the unpacker reads the tile from a 16-byte-unit shifted L1 address
                 const int32_t units = static_cast<int32_t>(CW(pc));
                 ++pc;
                 LDI(cb_v);
                 UNPACK((get_local_cb_interface(cb_v).fifo_rd_ptr += units));
-                copy_tile(cb_v, (w >> 16) + to, a);
+                COPY_TILE(cb_v, (w >> 16) + to, a);
                 UNPACK((get_local_cb_interface(cb_v).fifo_rd_ptr -= units));
                 break;
             }
             case C_ST: pack_tile<true>(a, cb_v, (w >> 16) + to); break;
             case C_LDR:   // next reader page; the tile starts b 16-B units in (the DRAM source's 32-B phase)
+                USTATE(1);
                 TWAIT(cb_in);
                 cb_wait_front(cb_in, 1);
+                USTATE(0);
                 LDI(cb_in);
                 UNPACK((get_local_cb_interface(cb_in).fifo_rd_ptr += b));
-                copy_tile(cb_in, 0, a);
+                COPY_TILE(cb_in, 0, a);
                 UNPACK((get_local_cb_interface(cb_in).fifo_rd_ptr -= b));
                 cb_pop_front(cb_in, 1);
                 break;
 #ifdef CFD_NARROW
             case C_LDRH:   // C_LDR of a bf16 page: CB CFD_NARROW (bfloat16) views cb_in's front page, srcA widens it to fp32
+                USTATE(1);
                 TWAIT(cb_in);
                 cb_wait_front(cb_in, 1);
+                USTATE(0);
                 copy_tile_to_dst_init_short_with_dt(cb_in, CFD_NARROW);
                 UNPACK((get_local_cb_interface(CFD_NARROW).fifo_rd_ptr = get_local_cb_interface(cb_in).fifo_rd_ptr + b));
-                copy_tile(CFD_NARROW, 0, a);
+                COPY_TILE(CFD_NARROW, 0, a);
                 copy_tile_to_dst_init_short_with_dt(CFD_NARROW, cb_in);
                 LDX();
                 cb_pop_front(cb_in, 1);
@@ -232,7 +298,9 @@ void kernel_main() {
 #endif
 #ifdef CFD_NARROW_OUT
             case C_STWH:   // C_STW packed to bf16: CB CFD_NARROW_OUT (bfloat16) views cb_out's back page
+                PSTATE(1);
                 cb_reserve_back(cb_out, 1);
+                PSTATE(0);
                 PACK((get_local_cb_interface(CFD_NARROW_OUT).fifo_wr_ptr = get_local_cb_interface(cb_out).fifo_wr_ptr));
                 pack_reconfig_data_format(cb_out, CFD_NARROW_OUT);
                 pack_tile<true>(a, CFD_NARROW_OUT, 0);
@@ -241,7 +309,9 @@ void kernel_main() {
                 break;
 #endif
             case C_STW:
+                PSTATE(1);
                 cb_reserve_back(cb_out, 1);
+                PSTATE(0);
                 pack_tile(a, cb_out);
                 cb_push_back(cb_out, 1);
                 break;
@@ -320,14 +390,16 @@ void kernel_main() {
             case C_TOK:
                 cb_reserve_back(cb_tok, 1);   // PACK
                 cb_push_back(cb_tok, 1);
+                USTATE(4);
                 TWAIT(cb_tok);
                 cb_wait_front(cb_tok, 1);     // UNPACK
+                USTATE(0);
                 cb_pop_front(cb_tok, 1);
                 break;
-            case C_SIGB: cb_reserve_back(cb_cb, 1); cb_push_back(cb_cb, 1); break;
-            case C_SIGN: cb_reserve_back(cb_cn, 1); cb_push_back(cb_cn, 1); break;
-            case C_WAITB: TWAIT(cb_bc); cb_wait_front(cb_bc, 1); cb_pop_front(cb_bc, 1); break;
-            case C_WAITN: TWAIT(cb_nc); cb_wait_front(cb_nc, 1); cb_pop_front(cb_nc, 1); break;
+            case C_SIGB: PSTATE(3); cb_reserve_back(cb_cb, 1); PSTATE(0); cb_push_back(cb_cb, 1); break;
+            case C_SIGN: PSTATE(4); cb_reserve_back(cb_cn, 1); PSTATE(0); cb_push_back(cb_cn, 1); break;
+            case C_WAITB: USTATE(3); TWAIT(cb_bc); cb_wait_front(cb_bc, 1); USTATE(0); cb_pop_front(cb_bc, 1); break;
+            case C_WAITN: USTATE(2); TWAIT(cb_nc); cb_wait_front(cb_nc, 1); USTATE(0); cb_pop_front(cb_nc, 1); break;
             case C_JMP: pc = CR ? (pc + PW - 1) / PW * PW : CW(pc); break;
             case C_BRT: {
                 const uint32_t v = read_tile_value(cb_v, CW(pc), 0);
