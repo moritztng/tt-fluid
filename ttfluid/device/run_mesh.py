@@ -90,10 +90,12 @@ ap.add_argument("--tsort", type=int, default=None, help="as run_vm.py: tabstream
                 "Default on with --tabstream; with --from-images as the images were lowered")
 ap.add_argument("--bpatch", type=int, default=None, help="as run_vm.py: -1 / unset auto (4 when --tabstream and >= --bpatch-min local residue entries per patched map tile), K in 1..7 BRISC scatters (8 - K) / 8 of a patched page's L1 residue (CFD_BPATCH; mailbox in the last 256 B of cb_sync)")
 ap.add_argument("--bpatch-min", type=float, default=64.0)
-ap.add_argument("--bgts", type=int, default=0, help="K in 1..7: BRISC scatters the upper (8 - K) / 8 of every L1-source and halo section of a "
-                "--tabstream GATHER tile, NCRISC the rest (CFD_BGTS, the --bpatch mailbox); 0 off. Data movement only: bit-exact")
-ap.add_argument("--tgts", type=int, default=0, help="J in 1..7: compute's UNPACK copies the top J / 8 of every L1-source and halo section of a "
-                "--tabstream GATHER tile (of what --bgts leaves NCRISC) from inside its waits (CFD_TGTS, a second mailbox); 0 off. Bit-exact")
+ap.add_argument("--bgts", type=int, default=None, help="K in 1..7: BRISC scatters the upper (8 - K) / 8 of every L1-source and halo section of a "
+                "--tabstream GATHER tile, NCRISC the rest (CFD_BGTS, the --bpatch mailbox); 0 off. Data movement only: bit-exact. "
+                "Both shares unset: 6 with --tgts 3 on --arch bh with streamed 16-bit tables (reader 3/8, UNPACK 3/8, BRISC 2/8), else 0")
+ap.add_argument("--tgts", type=int, default=None, help="J in 1..7: compute's UNPACK copies the top J / 8 of every L1-source and halo section of a "
+                "--tabstream GATHER tile (of what --bgts leaves NCRISC) from inside its waits (CFD_TGTS, a second mailbox); 0 off. Bit-exact. "
+                "Unset: see --bgts")
 ap.add_argument("--amg", action="store_true", help="p PCG preconditioned by smoothed aggregation (ttfluid.resident.sa), aggregates on the K x 72 global cores; "
                 "the coarse levels are chip-local (sa.setup chip_cores): only the fine level exchanges between chips")
 ap.add_argument("--amg-kind", default="sa", choices=["sa"])
@@ -187,6 +189,14 @@ if a.owner:
 from ttfluid.resident.memu import MachineEmu  # noqa: E402
 from ttfluid.resident.encode import Encoded  # noqa: E402
 from ttfluid.resident.tabstream import bpatch_auto  # noqa: E402
+
+
+def gshare():
+    """(--bgts, --tgts) as given (one alone leaves the other off), or the default when both are unset: the measured
+    share of a GATHER tile on Blackhole with streamed 16-bit tables, 6 / 3; 0 / 0 everywhere else. Needs encode.WIDE set."""
+    if a.bgts is None and a.tgts is None:
+        return (6, 3) if a.arch == "bh" and a.tabstream and not ttfluid.resident.encode.WIDE else (0, 0)
+    return a.bgts or 0, a.tgts or 0
 from ttfluid.resident.program import build  # noqa: E402
 import ttfluid.resident.krylov  # noqa: E402
 
@@ -339,7 +349,7 @@ else:
         mesh = 8192 + 512 + 2 * K * (16 if mm.red2 else 12 * PP) + NSH * SHS * 4 + 512
         code = (a.page * 1024 if a.page else pad(len(E.c))) + pad(len(E.b)) + (a.nwin * 4 if a.nwin else pad(len(E.n)))
         ts = 2 * (4096 + 64 * 32) if E.tab_stream else 0
-        ts += 4096 if E.tab_stream and a.bpatch != 0 else 0      # cb_sync may grow a page for the B-patch mailbox
+        ts += 4096 if E.tab_stream and (a.bpatch != 0 or any(gshare())) else 0      # cb_sync may grow a page for the mailboxes
         return mm.ntiles * 4096 + code + pad(E.tab.shape[1] + 64) + fixed + rings + mesh + max(a.gcache, 6 if a.gcache < 0 else 0) * 4096 + ts + (0 if mm.ndram else 2048 * min(a.narrow, 2))
 
 
@@ -557,6 +567,9 @@ if a.bpatch is None or a.bpatch < 0:
     a.bpatch, lm = bpatch_auto(loc, a.bpatch_min)
     print("--bpatch auto: %.1f local residue entries per patched map tile (min %.0f) -> %d" % (lm, a.bpatch_min, a.bpatch)
           + (" (these images do not record the entries: lower again, or pass --bpatch 4)" if E.tab_stream and not loc else ""), flush=True)
+if a.bgts is None and a.tgts is None:
+    print("--bgts / --tgts auto: %d / %d" % gshare(), flush=True)
+a.bgts, a.tgts = gshare()
 assert 0 <= a.bpatch < 8 and not (a.bpatch and not a.tabstream), "--bpatch K: 1..7 with --tabstream"
 assert 0 <= a.bgts < 8 and not (a.bgts and not a.tabstream), "--bgts K: 1..7 with --tabstream"
 assert not a.tsort or a.tabstream, "--tsort 1 needs --tabstream"
