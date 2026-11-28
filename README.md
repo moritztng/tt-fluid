@@ -10,12 +10,20 @@ OpenFOAM is not needed at run time. The same program also runs on a CPU emulator
 device closely but not bit for bit.
 
 On the OpenFOAM HPC benchmark's motorbike case (HPC_motorbike Small: 8.66 M cells, 800 SIMPLE iterations), a $9,999 Tenstorrent QuietBox 2
-costs **$0.115 per case, 2.34x less than an 8x H100 SXM server** running the GPU port of OpenFOAM (SPUMA) at its
-cheapest documented price, and 3.19x less than 8x B200. The drag coefficient lands 10 drag counts (0.2 %) below OpenFOAM's
-fp64 CPU result, inside the reference's own uncertainty, while the eight H100 runs scatter from -4 to +30. Every number in this README is printed by a script in this repository from raw
-data in this repository.
+costs **$0.115 per case**. An 8x H100 SXM server running the GPU port of OpenFOAM (SPUMA) at its cheapest documented
+price costs $0.270 per case with one case per GPU (2.34x more) and **$0.119 per case with four cases per GPU under
+NVIDIA MPS (1.03x more): against a GPU packed with cases the two are at parity today.** The drag coefficient lands 10 drag counts (0.2 %) below OpenFOAM's
+fp64 CPU result, inside the reference's own uncertainty, while the eight H100 runs scatter from -4 to +30.
+
+> **Status, 2026-11-28.** The packed-GPU numbers are new. They were measured on one H100 SXM, priced as one eighth of
+> the server: two cases per GPU $0.158 per case, four $0.119. Eight per GPU and a whole 8-GPU server are being
+> measured. They are not yet in the table, the figure and the scripts below, which still compare against one case per
+> GPU; their raw data and the updated table follow. Every other number in this README is printed by a script in this
+> repository from raw data in this repository.
 
 ![Cost per case and drag coefficient vs OpenFOAM](docs/figures/headline.svg)
+
+*The figure shows one case per GPU on the NVIDIA side (see the status note above).*
 
 ## Why it matters
 
@@ -23,7 +31,8 @@ Steady RANS is still most of the CFD that engineering teams run, and GPU ports o
 bandwidth. A Tenstorrent chip is a grid of more than a hundred small cores, each with its own SRAM, linked by a network on chip,
 and chips link to each other over Ethernet. tt-fluid keeps the whole iteration resident on that grid: each core owns a
 block of cells, exchanges halos with its neighbours directly, and never returns to the host inside a run. The result is
-a cheaper box doing the same job, with its accuracy checked against OpenFOAM.
+a $9,999 box doing the same job at about the cost per case of a packed GPU server, with its accuracy checked against
+OpenFOAM.
 
 ## Results
 
@@ -40,8 +49,8 @@ potentialFoam start on both sides. Cost per case uses one formula for every syst
 
 Reproduce the table: `python3 bench/per_dollar.py`.
 
-A single H100 finishes a case faster than a p300c board (771.5 s vs 1310 s). The advantage is per dollar: a QuietBox 2
-costs 4 % of the H100 server. GPU power is the measured board power while busy, plus a host share. The QuietBox 2 is
+A single H100 finishes a case faster than a p300c board (771.5 s vs 1310 s). With one case per GPU the QuietBox 2 wins
+per dollar because it costs 4 % of the H100 server; four cases on each GPU close that gap to 1.03x (status note above). GPU power is the measured board power while busy, plus a host share. The QuietBox 2 is
 charged its full 1.3 kW system rating (not a measurement). NVIDIA gets its cheapest documented price and its
 fastest measured precision mode (SPDP: fp32 fields with fp64 solver sums).
 
