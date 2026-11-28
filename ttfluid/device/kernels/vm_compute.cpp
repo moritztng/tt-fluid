@@ -256,6 +256,16 @@ void kernel_main() {
 #endif
                 break;
 #ifdef CFD_BLK
+#ifdef CFD_BLKTAB
+            case C_BLK:     // a generated body, table form: w >> 16 is the word offset of its program (header, config
+                // words, row program; blk_exec.h) in BLK_TAB, the table of this lowering's distinct programs that
+                // run_mesh --blktab compiles into the MATH kernel (blk_tab.h, included ahead of this file)
+                MATH(({
+                    SFI(C_BLK, blk_init());
+                    blk_run(&BLK_TAB[w >> 16]);
+                }));
+                break;
+#else
             case C_BLK: {   // a generated body: the n words after this one are its program (header, config words, row
                 // program; blk_exec.h). MATH pushes them, UNPACK and PACK step over them. An op never straddles a page
                 const uint32_t n = w >> 16;
@@ -266,6 +276,7 @@ void kernel_main() {
                 pc += n;
                 break;
             }
+#endif
 #endif
             case C_TBEG: tn = w >> 16; tl = 0; tpc = pc; break;
             case C_TEND: if (++tl < tn) pc = tpc; break;

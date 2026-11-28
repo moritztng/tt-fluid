@@ -85,6 +85,9 @@ ap.add_argument("--gcache", type=int, default=-1, help="as run_vm.py: N gather t
 ap.add_argument("--icache", type=int, default=1, help="as run_vm.py: compute skips a repeated op _init (CFD_ICACHE)")
 ap.add_argument("--blocks", type=int, default=0, help="1: the fusable ops of every block run as generated SFPU bodies, one program a row (C_BLK: resident/blklower.py, blockgen.py, kernels/blk_exec.h; define CFD_BLK). 0: one stock tile op per op word. "
                 "2: the A/B's broken arm, the first add of every body subtracts: the state digest must differ")
+ap.add_argument("--blktab", type=int, default=0, help="with --blocks: 1 = the distinct body programs sit in a table compiled into the MATH kernel "
+                "(a generated blk_tab.h ahead of vm_compute.cpp; define CFD_BLKTAB) and a body is one op word; 0 = every body's program inline "
+                "in the compute stream (about 11 words a body, the code ring has to hold a tile loop of them)")
 ap.add_argument("--sched", type=int, default=3, help="as run_vm.py: 1 greedy reorder of each fused run's blocks so values die early, 2 greedy or depth-first, 3 (default) the same at min-store cut points (Machine(sched=K))")
 ap.add_argument("--dedup", type=int, default=0, help="as run_vm.py: a fused run streams each DRAM page once (Machine(dedup=True))")
 ap.add_argument("--tsort", type=int, default=None, help="as run_vm.py: tabstream residue entries sorted by source tile (CFD_TSORT). "
@@ -205,7 +208,7 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "blocks") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "blocks", "blktab") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
@@ -231,6 +234,9 @@ if a.from_images:   # the device run from per-chip images (lower/image_dev.py): 
     if IMG.shared["flags"].get("blocks") and not a.blocks:   # images encoded with bodies carry C_BLK words: run with CFD_BLK
         a.blocks = int(IMG.shared["flags"]["blocks"])
         print("images lowered with --blocks %d: CFD_BLK on" % a.blocks, flush=True)
+    if IMG.shared["flags"].get("blktab") and not a.blktab:   # their bodies are table offsets: the table is the image's blk_tab.json
+        a.blktab = int(IMG.shared["flags"]["blktab"])
+        print("images lowered with --blktab %d: CFD_BLKTAB on" % a.blktab, flush=True)
     if a.tsort is None:   # CFD_TSORT reads four entries per cached tile: only right on tables lowered sorted
         a.tsort = int(IMG.shared["flags"].get("tsort", 0))
     mp = m.maps
@@ -258,7 +264,7 @@ else:
     elif a.mcache and os.path.exists(a.mcache):
         with mcache_open("rb") as f:
             saved, prog, m = pickle.load(f)
-        saved, low = ({k: v for k, v in d.items() if k not in ("tsort", "blocks")} for d in (saved, LOWER))   # tsort and blocks are in the encoding, not the Machine
+        saved, low = ({k: v for k, v in d.items() if k not in ("tsort", "blocks", "blktab")} for d in (saved, LOWER))   # tsort and blocks are in the encoding, not the Machine
         assert saved == low, ("--mcache: lowering flags differ", {k: (saved.get(k), low[k]) for k in low if saved.get(k) != low[k]})
         print("machine from %s in %.1f s" % (a.mcache, time.time() - t0), flush=True)
     else:
@@ -345,7 +351,7 @@ else:
     assert not (ttfluid.resident.encode.WIDE and (a.tgts or a.gtile)), "--tgts / --gtile hand over 16-bit gather entries (vm_compute tsvc): not with wide ones"
     if a.blocks:   # body() lowers each block's fusable ops into generated bodies (every Encoded() below)
         assert not a.load, "--blocks: a --load file is already encoded"
-        ttfluid.resident.encode.BLOCKS = dict(plan={}, gen={}, brk=int(a.blocks == 2))
+        ttfluid.resident.encode.BLOCKS = dict(plan={}, gen={}, brk=int(a.blocks == 2), **({"tab": {}} if a.blktab else {}))
     if not a.load:
         E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
         if a.tscheck:   # as run_vm.py: NCRISC's streamed walk replayed against the cursor tables, every core
@@ -403,6 +409,8 @@ else:
         t1 = time.time()
         img = Image.from_lowering(m, E, tab, gtab, info, K, P, LOWER)
         img.write(a.images, a.min_free_gb)
+        if a.blocks and a.blktab:   # the kernel of the device run is built around this table
+            Path(a.images, "blk_tab.json").write_text(json.dumps([w for p in ttfluid.resident.encode.BLOCKS["tab"] for w in p]))
         dig = {k: img.digest(k) for k in range(K)}
         Path(a.images, "digests.json").write_text(json.dumps(dig, indent=1))
         print("images %s written in %.1f s, digests %s" % (a.images, time.time() - t1, json.dumps(dig)), flush=True)
@@ -642,8 +650,31 @@ defs = [("CFD_PROF", "1")] * a.prof + [("CFD_STOP", str(a.stop))] * bool(a.stop)
 BLKREV = zlib.crc32((DEV / "blk_exec.h").read_bytes()) | 1   # CFD_BLK's value: an edited header is a new kernel for the JIT cache
 
 
+def blk_source():
+    """--blktab: (the MATH kernel's source, its revision). The source is two lines, the generated table of this lowering's
+    body programs and then vm_compute.cpp, under a directory named by the crc of all it is built from."""
+    words = json.loads(Path(a.from_images, "blk_tab.json").read_text()) if IMG is not None else [w for p in ttfluid.resident.encode.BLOCKS["tab"] for w in p]
+    assert words, "--blktab: no body programs"
+    h = "// generated by run_mesh --blktab: %d words of body programs (resident/blockgen.py), read by vm_compute.cpp's C_BLK\n" % len(words) + \
+        "#include <cstdint>\n#ifdef TRISC_MATH\nstatic const uint32_t BLK_TAB[%d] = {\n%s\n};\n#endif\n" % (
+            len(words), "\n".join(", ".join("0x%08x" % w for w in words[i:i + 8]) + "," for i in range(0, len(words), 8)))
+    rev = zlib.crc32(h.encode() + (DEV / "blk_exec.h").read_bytes() + (DEV / "vm_compute.cpp").read_bytes()) | 1
+    d = Path(os.environ.get("TTFLUID_BLK_DIR", str(Path.home() / ".cache/ttfluid/blk")), "%08x" % rev)
+    d.mkdir(parents=True, exist_ok=True)
+    for name, text in (("blk_tab.h", h), ("vm_compute_blk.cpp", '#include "%s"\n#include "%s"\n' % (d / "blk_tab.h", DEV / "vm_compute.cpp"))):
+        if not (d / name).exists():
+            tmp = d / ("%s.%d" % (name, os.getpid()))
+            tmp.write_text(text)
+            os.replace(tmp, d / name)
+    print("blktab: %d words in %s" % (len(words), d), flush=True)
+    return str(d / "vm_compute_blk.cpp"), rev
+
+
+BLKSRC = blk_source() if a.blocks and a.blktab else None
+
+
 def kd(src, ct, cfg, rt=None, crt=None):
-    k = ttnn.KernelDescriptor(kernel_source=str(DEV / src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+    k = ttnn.KernelDescriptor(kernel_source=BLKSRC[0] if BLKSRC and src == "vm_compute.cpp" else str(DEV / src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                               core_ranges=grid, compile_time_args=list(ct), config=cfg)
     if rt is not None:
         k.runtime_args = rt
@@ -651,6 +682,7 @@ def kd(src, ct, cfg, rt=None, crt=None):
         k.common_runtime_args = list(crt)
     k.defines = defs + ([("CFD_ICACHE", "1")] if a.icache and src == "vm_compute.cpp" else []) + \
         ([("CFD_BLK", str(BLKREV))] if a.blocks and src == "vm_compute.cpp" else []) + \
+        ([("CFD_BLKTAB", str(BLKSRC[1]))] if BLKSRC and src == "vm_compute.cpp" else []) + \
         ([("CFD_PHASE", "1")] if a.phase and src in ("vm_compute.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_TSORT", "1")] if a.tsort and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_BPATCH", str(a.bpatch))] if a.bpatch and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
