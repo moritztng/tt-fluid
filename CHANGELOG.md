@@ -28,7 +28,7 @@ All notable changes to this project are documented here. The format follows
   (`--l1 2 --lsplit 1`) took 136 s, and 1030 s for 800 iterations.
 - On Blackhole with streamed tables a run shares the copies of a gather tile among the three processors of a core by
   default (`--bgts 6 --tgts 3`). The tutorial's line gave `--bgts 5 --tgts 2` before, which is 2 % slower on the
-  device on the case above, and gives the new values now. `--bgts 0 --tgts 0` turns the sharing off.
+  device on the case above, and gives neither option now. `--bgts 0 --tgts 0` turns the sharing off.
 - Image upload and the state transfer read only the bytes an image stores. Host time around a Small run fell from
   65 s to 18 s and its peak host memory from 29 GB to 11 GB.
 - Lowering HPC_motorbike Small needs about 90 GB of host RAM (the docs said 220 GB).

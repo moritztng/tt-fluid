@@ -113,15 +113,15 @@ export TT_VISIBLE_DEVICES=0,1
 export TT_MESH_GRAPH_DESC_PATH=$(python -c "import ttnn, pathlib; print(pathlib.Path(ttnn.__file__).parent / \
   'tt_metal/fabric/mesh_graph_descriptors/p300_mesh_graph_descriptor.textproto')")
 python -m ttfluid.device.run_mesh case 800 --case motorbike $FLAGS --from-images img_k2 --state-in state0.npz \
-  --noemu --runs 1 --nwin 1024 --links 0 --rlink 1 --os 1 --bgts 6 --tgts 3 --out motorbike.jsonl
+  --noemu --runs 1 --nwin 1024 --links 0 --rlink 1 --os 1 --out motorbike.jsonl
 ```
 
 On two Blackhole chips at 1350 MHz the first 100 iterations take about 108 s of device time (measured on two
 chips of a Blackhole Galaxy). 800 iterations have not been timed with this line yet; with the line it replaces they
 took 1030 s, at 136 s for the first 100. A QuietBox 2 runs two such cases at once, one per board
-(`TT_VISIBLE_DEVICES=2,3` for the second). The run sizes its gather cache to the L1 memory that is left and chooses
-`--bpatch` from counts stored in the images, and prints both choices. `--bgts 6 --tgts 3` shares the copies of a
-gather among the three processors of a core.
+(`TT_VISIBLE_DEVICES=2,3` for the second). The run sizes its gather cache to the L1 memory that is left, chooses
+`--bpatch` from counts stored in the images and shares the copies of a gather among the three processors of a core
+(`--bgts 6 --tgts 3` on Blackhole). It prints each choice.
 
 `--forces` evaluates the case's `forceCoeffs` function object on the state each iteration starts from and stores Cd
 and Cl in the history, which is saved with the final state in `motorbike_case_1x2_state.npz`.
