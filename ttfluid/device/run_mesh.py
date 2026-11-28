@@ -440,10 +440,10 @@ elif not a.noemu:
 # snake or permuted placement (2D) the blocks are not in that order, so every per-chip array is permuted on the way in
 # and back on the way out (a 2x4 --strips run gave row 1's chips other blocks' tables and aborted on every core)
 DEVBLK = [pid_at[cells[d]] for d in range(K)]
-STATE, early_buf = None, {}
+STATE = None
 if IMG is not None and not a.l1_check:
-    # A launch from images reads its start state and builds the host side of the three large arrays while torch and
-    # ttnn load and the mesh opens: numpy and file reads on two threads, the constants (which need no state) on one.
+    # A launch from images reads its start state and builds the host side of the large arrays while torch and ttnn
+    # load and the mesh opens: numpy and file reads on threads of their own.
     filled = lambda name: (image_dev.chip_shape(IMG, P, name),
                            lambda k, out, row=None: image_dev.chip_fill(IMG, k, P, name, out, STATE, row))
     # constants and homes are mostly zero pages: the host writes the pages that hold a value, the chips lay the array.
@@ -451,26 +451,17 @@ if IMG is not None and not a.l1_check:
     staged = {name: image_dev.Staged(DEVBLK, *filled(name), lambda k, name=name: image_dev.chip_pages(IMG, k, P, name, STATE),
                                      int(os.environ.get("CFD_IMG_STAGE_MB", 1024)) << 20)
               for name in ("consts", "home")}
-    src = lambda name: staged[name].src() if name in staged else filled(name)
 
-    def with_state():
+    def with_state():   # the arena and the homes carry the start state
         global STATE
         if a.state_in:
             with np.load(a.state_in) as z:     # read once: a key of an npz is re-read from the file on every access
                 STATE = {k: z[k] for k in z.files if k != "hist"}
             print("state from %s" % a.state_in, flush=True)
             stamp("state read")
-        out = {name: image_dev.host_buffer(K, DEVBLK, *src(name)) for name in ("arena", "home")}
-        stamp("arena and homes built on the host")
-        return out
-
-    def no_state():
-        out = {"consts": image_dev.host_buffer(K, DEVBLK, *src("consts"))}
-        stamp("constants built on the host")
-        return out
-    early = ThreadPoolExecutor(2)
-    early_buf = dict(arena=early.submit(with_state), consts=early.submit(no_state))
-    early_buf["home"] = early_buf["arena"]
+        return dict(home=image_dev.Ahead(staged["home"]), arena=image_dev.host_buffer(K, DEVBLK, *filled("arena")))
+    early = ThreadPoolExecutor(1)
+    ahead = dict(consts=image_dev.Ahead(staged["consts"]), state=early.submit(with_state))
     early.shutdown(wait=False)
 stamp("host tables built")
 import torch  # noqa: E402
@@ -630,19 +621,16 @@ if a.l1_check:   # no upload: one-row DRAM tensors (an interleaved accessor's co
     TBP, a.limit = 1, 0
 elif IMG is not None:   # chip by chip: chip k's arrays are built from its image files only while it is uploaded
     TBP = IMG.s["TBP"]
-    # the host tensors borrow the buffers built since the start (pop: a future keeps its result, and the buffer has
-    # to go when its array is on the chips); the blob's is built while the constants are written
-    ahead = ThreadPoolExecutor(1)
-    def pre(name):
-        def job():   # the early buffer first: its thread marked the array's pages, with the state in hand
-            buf = early_buf[name].result().pop(name) if name in early_buf else None
-            return image_dev.host_shards(md, K, DEVBLK, *src(name), buf)
-        return ahead.submit(job)
-    up = lambda name, host: (image_dev.upload_placed(md, cells, grid, cores, DEVBLK, staged[name], name, host) if name in staged
-                             else image_dev.upload(md, K, DEVBLK, *filled(name), name, host))
-    hosts = [pre(name) for name in ("arena", "consts", "home", "blob")]
-    t_arena, t_const, t_home, t_blob = (up(name, hosts.pop(0)) for name in ("arena", "consts", "home", "blob"))
-    ahead.shutdown()
+    # the host tensors borrow the buffers built since the start; the blob's is built while the constants are written
+    ahead.update(ahead.pop("state").result())
+    host = lambda name, buf=None: image_dev.host_shards(md, K, DEVBLK, *filled(name), buf)
+    blob = ThreadPoolExecutor(1)
+    ahead["blob"] = blob.submit(host, "blob")
+    blob.shutdown(wait=False)
+    t_arena = image_dev.upload(md, K, DEVBLK, *filled("arena"), "arena", lambda: host("arena", ahead.pop("arena")))
+    t_const, t_home = (image_dev.upload_placed(md, cells, grid, cores, DEVBLK, staged[name], name, ahead.pop(name))
+                       for name in ("consts", "home"))
+    t_blob = image_dev.upload(md, K, DEVBLK, *filled("blob"), "blob", ahead.pop("blob").result)
     t_tab = image_dev.upload(md, K, DEVBLK, (P, L), lambda k, out: np.copyto(out, chip_tab(k)), "tab")
     stamp("images uploaded (arena, consts, home, blob, tab)")
     t_c, t_b, t_n = (to_dev(np.tile(code[k], (K, 1))) for k in "cbn")
