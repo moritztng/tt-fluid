@@ -227,26 +227,11 @@ def core(c):
     return out
 
 
-def pct(h, p):
-    c = np.cumsum(h)
-    return int(np.searchsorted(c, p / 100 * c[-1]))
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("mesh")
-    ap.add_argument("--own", default="own_cut")
-    ap.add_argument("--orders", default="sliced+index,sliced+rcm,sliced+hilbert,cls+index,cls+rcm,cls+hilbert,cls+axis,cls+bfs,rcm,hilbert")
-    ap.add_argument("--cores", default="all")
-    ap.add_argument("--ngc", default="4,8,14")
-    ap.add_argument("--bylane", type=int, default=0, help="1: also walk each slot in destination-lane order (no --tsort)")
-    ap.add_argument("--jobs", type=int, default=6)
-    ap.add_argument("--json")
-    a = ap.parse_args()
-    t0 = time.time()
-    log = lambda *x: print("[%6.1f s]" % (time.time() - t0), *x, flush=True)
-    D = np.load(a.mesh)
-    own = D[a.own].astype(np.int64)
+def load(mesh, own_key, log=lambda *x: None):
+    """The mesh cache as slot entries sorted by (core, cell, face id), into G: R the cell, O its neighbour (-1 on a
+    patch face), FID the face, DC the face direction 2 * axis + sign seen from R. Returns (P, cells, widest face count)."""
+    D = np.load(mesh)
+    own = D[own_key].astype(np.int64)
     P, nC = int(own.max()) + 1, len(own)
     o, nb = D["owner"].astype(np.int64), D["neighbour"].astype(np.int64)
     nI = len(nb)
@@ -268,10 +253,33 @@ def main():
     L = -(-nk // LANES)
     log("mesh %d cells, %d parts, %d entries, face counts %s" % (nC, P, len(R), dict(zip(*map(lambda v: v.tolist(), np.unique(fc, return_counts=True))))))
     log("slot tiles L_k", L.tolist())
+    G.update(own=own, R=R, O=O, FID=FID, DC=DC, C=D["C"], L=L, start=start)
+    return P, nC, S
+
+
+def pct(h, p):
+    c = np.cumsum(h)
+    return int(np.searchsorted(c, p / 100 * c[-1]))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mesh")
+    ap.add_argument("--own", default="own_cut")
+    ap.add_argument("--orders", default="sliced+index,sliced+rcm,sliced+hilbert,cls+index,cls+rcm,cls+hilbert,cls+axis,cls+bfs,rcm,hilbert")
+    ap.add_argument("--cores", default="all")
+    ap.add_argument("--ngc", default="4,8,14")
+    ap.add_argument("--bylane", type=int, default=0, help="1: also walk each slot in destination-lane order (no --tsort)")
+    ap.add_argument("--jobs", type=int, default=6)
+    ap.add_argument("--json")
+    a = ap.parse_args()
+    t0 = time.time()
+    log = lambda *x: print("[%6.1f s]" % (time.time() - t0), *x, flush=True)
+    P, nC, S = load(a.mesh, a.own, log)
+    L = G["L"]
     cores = list(range(P)) if a.cores == "all" else [int(x) for x in a.cores.split(",")]
     orders = a.orders.split(",")
-    G.update(own=own, R=R, O=O, FID=FID, DC=DC, C=D["C"], L=L, start=start, ngc=[int(x) for x in a.ngc.split(",")],
-             orders=orders, bylane=a.bylane)
+    G.update(ngc=[int(x) for x in a.ngc.split(",")], orders=orders, bylane=a.bylane)
     res = []
     with Pool(a.jobs) as pool:
         for r in pool.imap_unordered(core, cores):
