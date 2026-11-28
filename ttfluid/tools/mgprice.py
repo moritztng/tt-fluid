@@ -21,7 +21,9 @@ A multigrid iteration adds, per core:
   * the coarse smoother's vector work, 3 ops and 2 moves per coarse tile per step, and the transfers between coarse
     levels as gathers.
 Levels whose operator does not fit L1 next to the fine vectors stream it: counted as DRAM pages (coefficients as
-fp32, sources as 16 bit) and reported as reader load, the share of the iteration the page reader is busy.
+fp32, sources as 16 bit) and reported as reader load, the share of the iteration the page reader is busy. The coarse
+operators are rebuilt once per SIMPLE iteration (the p matrix changes): every entry of every level but the last is
+gathered once into the next level's sums, and the run weighting charges that.
 
 Unit costs (--set name=value; --pre picks a set):
   target  the fused loop at today's kernels with the gather on four threads, t0 1.5 ms
@@ -76,7 +78,7 @@ def solve_ms(row, u):
     red = u["red_us"] * 1e-3
     if "mode=jac" in row["cfg"]:
         return dict(total=spmv0 + upd + wait + red, fine=spmv0 + upd + wait, rp=0.0, coarse=0.0, halo=0.0, red=red,
-                    sync=2.0, pages=0.0, l1=4 * u["tiles"] * 4.096, stream=[])
+                    sync=2.0, pages=0.0, l1=4 * u["tiles"] * 4.096, stream=[], setup=0.0)
     f0 = row["spmv"][0] / its
     steps0 = c["k"] * (2 if c["mode"] == "sym" else 1)
     fine = f0 * (spmv0 + wait) + upd + (2 * u["move_cyc"] + (2 + 3 * (steps0 - 1)) * u["op_cyc"]) * u["tiles"] * cyc
@@ -111,8 +113,9 @@ def solve_ms(row, u):
         else:                                                           # the operator of this level is streamed
             stream.append(l)
             pages += s * off * 6 / 4096
+    setup = sum(st["nnz_core_max"] for st in row["levels"][:-1]) * g     # the Galerkin products, once per SIMPLE iteration
     return dict(total=fine + rp + coarse + halo + red, fine=fine, rp=rp, coarse=coarse, halo=halo, red=red, sync=sync,
-                pages=pages, l1=l1, stream=stream)
+                pages=pages, l1=l1, stream=stream, setup=setup)
 
 
 def main():
@@ -175,13 +178,13 @@ def main():
             n_mg = np.interp(hist, js[o], np.array([d[s]["its"] for s in gains], float)[o])
             cost = np.interp(hist, js[o], np.array([solve_ms(d[s], u)["total"] for s in gains])[o])
             fpi = np.interp(hist, js[o], np.array([d[s]["spmv"][0] / max(d[s]["its"], 1) for s in gains])[o])
-            gain = (hist * t_j).sum() / (n_mg * cost).sum()
+            gain = (hist * t_j).sum() / (n_mg * cost + t["setup"]).sum()
             w = f"{(n_mg * fpi).mean():.1f}, {gain:.2f}x"
             out.append((gain, cfg))
         print(f"{bar}{cfg:52s} | " + " | ".join(cells) + f" | {w} | {t['total']:.2f} ms = fine {t['fine']:.2f} + transfers "
               f"{t['rp']:.2f} + coarse {t['coarse']:.2f} + coarse halo {t['halo']:.2f} + reduction {t['red']:.2f} | "
               f"{t['sync']:.0f} | {t['l1']:.0f}, levels {t['stream']} at {t['pages']:.0f} pages = reader "
-              f"{100 * (527 + t['pages']) * u['page_us'] * 1e-3 / t['total']:.0f} %" + (" |" if a.md else ""))
+              f"{100 * (527 + t['pages']) * u['page_us'] * 1e-3 / t['total']:.0f} %, setup {t['setup']:.2f} ms per SIMPLE it" + (" |" if a.md else ""))
     if out:
         g, cfg = max(out)
         print(f"best weighted: {g:.2f}x [{cfg}]")
