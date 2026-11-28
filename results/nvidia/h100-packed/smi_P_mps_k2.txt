@@ -1,0 +1,32 @@
+Fri Nov 27 23:59:44 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 615.71.09              KMD Version: 615.71.09     CUDA UMD Version: 13.4     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:86:00.0 Off |                    0 |
+| N/A   38C    P0            301W /  700W |   12272MiB /  81559MiB |     88%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A            3952    M+C   simpleFoam                              532MiB |
+|    0   N/A  N/A            3957    M+C   simpleFoam                              532MiB |
+|    0   N/A  N/A            3962      C   nvidia-cuda-mps-server                   60MiB |
++-----------------------------------------------------------------------------------------+
+pid, process_name, used_gpu_memory [MiB]
+3962, nvidia-cuda-mps-server, 60 MiB
+3952, simpleFoam, 532 MiB
+3957, simpleFoam, 532 MiB
+3378 nvidia-cuda-mps-control -d
+3962 nvidia-cuda-mps-server
+3962
+               total        used        free      shared  buff/cache   available
+Mem:             850         356         131           0         368         493
+ 23:59:44 up 8 days, 11:17,  0 user,  load average: 9.80, 7.78, 6.31

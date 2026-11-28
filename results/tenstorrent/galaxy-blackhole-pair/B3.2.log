@@ -1,0 +1,113 @@
+[t     0.1 s] python imports done
+outer-iteration cap 1000 -> 100 (compute word 113168)
+images ~/flx/gather/img/small_k2_s3: {"K": 2, "mesh": [1, 2], "place": {"0": [0, 0], "1": [0, 1]}, "T": 39, "hmax": 7380, "nhalo": 9, "shs": 20432, "nsh": 1, "cross_pairs": {"1->0": 85, "0->1": 85}, "gateways": {"0->1": 50, "1->0": 111}, "shadow_kb": 79.8125, "gw_load": {"50": [85, 85, 31], "111": [85, 85, 29]}, "cells_per_chip": [4331154, 4331155], "loc": [58321898, 89116]}
+[t     0.1 s] images set up
+[t     0.1 s] host tables built
+2026-11-28 12:22:47.671 +00:00 | DEBUG    | ttnn:<module>:77 - Initial ttnn.CONFIG:
+Config{cache_path=~/.cache/ttnn,model_cache_path=~/.cache/ttnn/models,tmp_dir=/tmp/ttnn,enable_model_cache=false,enable_fast_runtime_mode=true,throw_exception_on_fallback=false,enable_logging=false,enable_graph_report=false,enable_detailed_buffer_report=false,enable_detailed_tensor_report=false,enable_comparison_mode=false,comparison_mode_should_raise_exception=false,comparison_mode_pcc=0.9999,root_report_path=generated/ttnn/reports,report_name=std::nullopt,std::nullopt}
+2026-11-28 12:22:47.822 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:69)
+2026-11-28 12:22:47.878 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:471)
+2026-11-28 12:22:47.878 | info     |             UMD | Firmware bundle version 19.13.1 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:503)
+2026-11-28 12:22:47.887 | warning  |             UMD | Board 0x47331831011 has 2 chips, but expected 32 chips for board type ubb_blackhole. (cluster_descriptor.cpp:1229)
+2026-11-28 12:22:47.918 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:224)
+2026-11-28 12:22:47.945 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:69)
+2026-11-28 12:22:47.975 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:471)
+2026-11-28 12:22:47.975 | info     |             UMD | Firmware bundle version 19.13.1 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:503)
+2026-11-28 12:22:47.985 | warning  |             UMD | Board 0x47331831011 has 2 chips, but expected 32 chips for board type ubb_blackhole. (cluster_descriptor.cpp:1229)
+2026-11-28 12:22:48.015 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:69)
+2026-11-28 12:22:48.045 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:471)
+2026-11-28 12:22:48.045 | info     |             UMD | Firmware bundle version 19.13.1 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:503)
+2026-11-28 12:22:48.076 | warning  |             UMD | Board 0x47331831011 has 2 chips, but expected 32 chips for board type ubb_blackhole. (cluster_descriptor.cpp:1229)
+2026-11-28 12:22:48.078 | info     |             UMD | Harvesting masks for chip 1 tensix: 0x10 dram: 0x0 eth: 0x120 pcie: 0x1 l2cpu: 0x0 (cluster.cpp:325)
+2026-11-28 12:22:48.147 | info     |             UMD | Harvesting masks for chip 0 tensix: 0x800 dram: 0x0 eth: 0x120 pcie: 0x1 l2cpu: 0x0 (cluster.cpp:325)
+2026-11-28 12:22:48.166 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1}/[4, 5] and remote chip ids {} (cluster.cpp:180)
+2026-11-28 12:22:48.166 | info     |             UMD | IOMMU: disabled (cluster.cpp:155)
+2026-11-28 12:22:48.166 | info     |             UMD | KMD version: 2.10.0 (cluster.cpp:158)
+2026-11-28 12:22:48.169 | info     |             UMD | Starting devices in cluster (cluster.cpp:951)
+2026-11-28 12:22:48.170 | info     |             UMD | Mapped hugepage 0x680000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:215)
+2026-11-28 12:22:48.171 | info     |             UMD | Mapped hugepage 0x700000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:215)
+[t     2.7 s] python up, opening the mesh
+2026-11-28 12:22:48.659 +00:00 | DEBUG    | ttnn.device:__init__:149 - Using default dispatch core type for this system: DispatchCoreType.WORKER
+2026-11-28 12:22:48.659 +00:00 | DEBUG    | ttnn.device:__init__:151 - Using default dispatch core axis for this system: DispatchCoreAxis.COL
+2026-11-28 12:22:48.659 | info     |     Distributed | Using custom mesh graph descriptor: ~/flx/land/bh_glx_1x2.textproto (metal_env.cpp:326)
+2026-11-28 12:22:48.686 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:69)
+2026-11-28 12:22:48.712 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:471)
+2026-11-28 12:22:48.712 | info     |             UMD | Firmware bundle version 19.13.1 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:503)
+2026-11-28 12:22:48.718 | warning  |             UMD | Board 0x47331831011 has 2 chips, but expected 32 chips for board type ubb_blackhole. (cluster_descriptor.cpp:1229)
+2026-11-28 12:22:48.720 | info     |          Fabric | TopologyMapper: Logical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1474)
+2026-11-28 12:22:48.720 | info     |          Fabric | 
+=== Logical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:91)
+2026-11-28 12:22:48.720 | info     |          Fabric | 
+=== Logical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 2
+Degree histogram: {1:2}
+ (topology_solver.tpp:91)
+2026-11-28 12:22:48.720 | info     |          Fabric | TopologyMapper: Physical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1485)
+2026-11-28 12:22:48.720 | info     |          Fabric | 
+=== Physical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:91)
+2026-11-28 12:22:48.720 | info     |          Fabric | 
+=== Physical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 2
+Degree histogram: {1:2}
+ (topology_solver.tpp:91)
+2026-11-28 12:22:48.720 | info     |          Fabric | Starting multi-mesh mapping: 1 logical mesh(es) to 1 physical mesh(es) (topology_mapper_utils.cpp:1117)
+2026-11-28 12:22:48.720 | info     |          Fabric | Multi-mesh mapping attempt 1/2: Trying inter-mesh mapping (topology_mapper_utils.cpp:1158)
+2026-11-28 12:22:48.720 | info     |          Fabric | Attempt 1: Inter-mesh mapping succeeded, found 1 mesh pair(s) (topology_mapper_utils.cpp:1187)
+2026-11-28 12:22:48.720 | info     |          Fabric | Multi-mesh mapping succeeded after 1 attempt(s): 1 mesh pair(s) mapped (topology_mapper_utils.cpp:1326)
+2026-11-28 12:22:48.728 | info     |    BuildKernels | Using pre-compiled firmware from: ~/fleet/env/lib/python3.10/site-packages/ttnn/tt_metal/pre-compiled/13811537282831396106/ (build_env_manager.cpp:259)
+2026-11-28 12:22:48.730 | info     |    BuildKernels | Using pre-compiled firmware from: ~/fleet/env/lib/python3.10/site-packages/ttnn/tt_metal/pre-compiled/13811537282831396106/ (build_env_manager.cpp:259)
+2026-11-28 12:22:48.777 | info     |           Metal | Initializing Fabric (fabric_firmware_initializer.cpp:45)
+2026-11-28 12:22:48.800 | info     |           Metal | Fabric initialized on Device 0 (device.cpp:400)
+2026-11-28 12:22:48.801 | info     |           Metal | Fabric initialized on Device 1 (device.cpp:400)
+2026-11-28 12:22:48.801 | info     |           Metal | Fabric initialized on 2 devices (fabric_firmware_initializer.cpp:173)
+2026-11-28 12:22:48.801 | info     |           Metal | Fabric Initialized with config FabricConfig::FABRIC_1D (fabric_firmware_initializer.cpp:48)
+[t     2.9 s] mesh + fabric up
+--bpatch auto: 654.4 local residue entries per patched map tile (min 64) -> 4
+gcache 31 slots (T 39)
+L1 bytes per core 1457696 of 1461760 (sync 16384, shadow 81728)
+state from ~/flx/sol/case/st_small_pf_k4_n.npz
+[t     3.8 s] state read
+[t    14.7 s] images uploaded (arena, consts, home, blob, tab)
+run 0: program built, launching
+run 0: enqueued after 0.0 s (compile included), waiting for the device
+run 0 wall 108.287 s core0 ticks [146079616488, 146067251519] aiclk {'min': 1350, 'max': 1350, 'n': 2}
+[t   123.6 s] run 0 done, dump read
+2026-11-28 12:24:49.609 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:49.729 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:49.802 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:49.838 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:49.961 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:49.999 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:51.097 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:51.136 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:51.886 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:51.965 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:51.995 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:52.015 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:52.094 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:52.108 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:53.032 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+2026-11-28 12:24:53.046 | warning  |              Op | Tensors that are distributed across mesh device unevenly negatively affect Op dispatch performance. (device_operation.hpp:301)
+state: 1599 of 15840 home pages read, ranges [(39, 156), (741, 819), (1053, 1092), (1716, 1833), (2223, 2262), (3081, 4134), (8073, 8112), (8619, 8736)]
+[t   127.9 s] state downloaded
+phase mom          math s min 18.4120 med 19.4147 max 19.6625 share  17.9% | brisc red med 0.2439 halo med 3.1945 waitc med 0.0037
+phase U_solve      math s min 23.1007 med 23.3893 max 24.4343 share  21.6% | brisc red med 1.8509 halo med 3.6681 waitc med 0.6239
+phase p_asm        math s min 9.5760 med 10.6275 max 11.0188 share   9.8% | brisc red med 0.0000 halo med 1.2995 waitc med 0.0000
+phase p_solve      math s min 35.6078 med 35.9940 max 37.0317 share  33.3% | brisc red med 3.8027 halo med 1.6576 waitc med 2.3545
+phase flux         math s min 1.1728 med 1.4833 max 1.5687 share   1.4% | brisc red med 0.0000 halo med 0.1112 waitc med 0.0546
+phase turb_asm     math s min 12.7142 med 13.7434 max 13.9022 share  12.7% | brisc red med 0.0000 halo med 1.8064 waitc med 0.0322
+phase omega_solve  math s min 1.7319 med 1.7837 max 2.5203 share   1.6% | brisc red med 0.2393 halo med 0.2367 waitc med 0.0386
+phase k_solve      math s min 1.6165 med 1.7776 max 2.2569 share   1.6% | brisc red med 0.2205 halo med 0.2344 waitc med 0.0416
+phase tail         math s min 0.0003 med 0.0004 max 0.0005 share   0.0% | brisc red med 0.0000 halo med 0.0000 waitc med 0.0001
+phase init         math s min 0.0000 med 0.0002 max 0.0004 share   0.0% | brisc red med 0.0000 halo med 0.0000 waitc med 0.0000
+[t   129.1 s] state saved
+{"jointred": 0, "cg1": 0, "fold1": 0, "fusepart": 0, "gsplit": 0, "wplace": 2, "bcast": 0, "ring": 4, "page": 16, "nwin": 1024, "sched": 3, "dedup": 0, "tsort": 1, "bpatch": 4, "bgts": 6, "tgts": 3, "gtile": 0, "amg": false, "amg_depth": null, "amg_min_core": 0, "hoist": 0, "tabstream": true, "state_in": "~/flx/sol/case/st_small_pf_k4_n.npz", "gcache": 31, "icache": 1, "red2": false, "redm": true, "fuse": true, "what": "case", "n": 100, "chips": [4, 5], "mesh": [1, 2], "K": 2, "layout": "rcb", "T": 39, "l1_vec": "1", "ndram": 704, "narrow": 0, "case": "~/flx/sol/case/small_tt", "plan": {"K": 2, "mesh": [1, 2], "place": {"0": [0, 0], "1": [0, 1]}, "T": 39, "hmax": 7380, "nhalo": 9, "shs": 20432, "nsh": 1, "cross_pairs": {"1->0": 85, "0->1": 85}, "gateways": {"0->1": 50, "1->0": 111}, "shadow_kb": 79.8125, "gw_load": {"50": [85, 85, 31], "111": [85, 85, 29]}, "cells_per_chip": [4331154, 4331155], "loc": [58321898, 89116]}, "sizes": {"page": true, "loop_pages": 5, "c_words": 113664, "b_words": 14971, "n_words": 59979, "tab_words": 9799, "arena_kb": 736, "home_mb": 13612.5, "const_mb": 12359.53125, "halo": [9, 7380, 66420], "consts": 518}, "l1": 1457696, "rows": 100, "walls": [108.2867386341095], "ticks": [[146079616488, 146067251519]], "ms_device": [108207.12332444444], "aiclk": [{"min": 1350, "max": 1350, "n": 2}], "same_history_all_chips": true, "all_cores_done": true, "abort": {"cores": 0, "brisc": [], "ncrisc": [], "chips": {"0": [{}, {}], "1": [{}, {}]}, "gw": {"50": 0, "111": 0}}, "counts": {"red": 71302, "halo": 29844, "rows": 100}, "stage": {"root": [7, 7], "gw": {"50": 5, "111": 5}}, "mesh_cyc": {"barrier": [821, 813], "xred": [872713455, 1892850579], "xred_n": [71302, 71302], "halo_all_max": 24978353119, "halo_all_med": 16763366456.0, "gw": {"50": {"relay": 1090094217, "members": 3321278278, "rcred": 3322765073, "send": 3920802925}, "111": {"relay": 4988544606, "members": 7701223337, "rcred": 8824633120, "send": 9392295987}}}, "last": {"Cd_in": 0.42352554202079773, "Cl_in": 0.07095946371555328, "U": 0.02532438561320305, "p": 0.010047259740531445, "omega": 8.552851795684546e-05, "k": 0.002208598656579852, "its0": 9.0, "its1": 11.0, "its2": 10.0, "its3": 124.0, "its4": 2.0, "its5": 2.0, "outer": 100.0}, "phase": {"mom": {"min": 18.412034626666667, "med": 19.414693292962962, "max": 19.66251283851852, "share": 0.17943645512475653, "brisc": {"min": 18.412180354074074, "med": 19.41485032851852, "max": 19.66271612074074}, "red": {"min": 0.0010905844444444445, "med": 0.24386713925925924, "max": 1.0292600044444444}, "halo": {"min": 1.7047302933333333, "med": 3.194530559259259, "max": 5.770829631851852}, "waitc": {"min": 0.0033673962962962965, "med": 0.003698414074074074, "max": 0.01385291111111111}}, "U_solve": {"min": 23.10073951851852, "med": 23.389276262962966, "max": 24.434322282222222, "share": 0.21616407173573754, "brisc": {"min": 23.09956120888889, "med": 23.38804833, "max": 24.433107114074073}, "red": {"min": 0.7106707837037037, "med": 1.8508777533333334, "max": 5.606736960740741}, "halo": {"min": 1.9864895274074075, "med": 3.668118036666667, "max": 5.597139553333333}, "waitc": {"min": 0.4255757637037037, "med": 0.6238680540740741, "max": 0.6924284814814815}}, "p_asm": {"min": 9.576021457037037, "med": 10.627540033703703, "max": 11.018845655555555, "share": 0.09822247291929792, "brisc": {"min": 9.57876894962963, "med": 10.62862732037037, "max": 11.020008638518519}, "red": {"min": 0.0, "med": 0.0, "max": 0.0}, "halo": {"min": 0.7394873207407408, "med": 1.2995150240740743, "max": 2.151117711851852}, "waitc": {"min": 1.58e-05, "med": 1.5935555555555555e-05, "max": 1.610888888888889e-05}}, "p_solve": {"min": 35.607840412592594, "med": 35.99403421592592, "max": 37.03172229185185, "share": 0.33266506873740187, "brisc": {"min": 35.60796593259259, "med": 35.99408062481481, "max": 37.031798824444444}, "red": {"min": 1.1742363229629629, "med": 3.80267010962963, "max": 7.721739118518519}, "halo": {"min": 0.9070339540740741, "med": 1.6576034040740741, "max": 2.7617181955555554}, "waitc": {"min": 2.0304772325925926, "med": 2.3544802874074073, "max": 2.5855739940740743}}, "flux": {"min": 1.17283434, "med": 1.4833411285185185, "max": 1.568719528148148, "share": 0.013708848945532169, "brisc": {"min": 1.171982588148148, "med": 1.4822432377777779, "max": 1.567870291851852}, "red": {"min": 0.0, "med": 0.0, "max": 0.0}, "halo": {"min": 0.06550707185185185, "med": 0.1111972862962963, "max": 0.17971156814814815}, "waitc": {"min": 0.03461463111111111, "med": 0.054598572962962964, "max": 0.08090888962962962}}, "turb_asm": {"min": 12.714185093333333, "med": 13.743351481851853, "max": 13.902244662222222, "share": 0.12701549014258567, "brisc": {"min": 12.721536191851852, "med": 13.744364754074073, "max": 13.90245807037037}, "red": {"min": 0.0, "med": 0.0, "max": 0.0}, "halo": {"min": 1.1302281703703703, "med": 1.8063789448148149, "max": 3.202197811851852}, "waitc": {"min": 0.02825031925925926, "med": 0.032215577777777775, "max": 0.058879895555555554}}, "omega_solve": {"min": 1.7318804681481481, "med": 1.7836614548148149, "max": 2.5202504296296295, "share": 0.01648363997575946, "brisc": {"min": 1.7319286503703704, "med": 1.783348448148148, "max": 2.5188545437037035}, "red": {"min": 0.05463299555555556, "med": 0.23925282925925928, "max": 1.2013021918518518}, "halo": {"min": 0.12815771037037038, "med": 0.23668200222222224, "max": 0.3606250177777778}, "waitc": {"min": 0.030320645185185187, "med": 0.03858870666666667, "max": 0.047312194074074075}}, "k_solve": {"min": 1.6164863911111111, "med": 1.7776133444444446, "max": 2.256927496296296, "share": 0.016428483154286473, "brisc": {"min": 1.6165022362962962, "med": 1.7779407677777779, "max": 2.2574474674074074}, "red": {"min": 0.056507395555555555, "med": 0.22045089037037038, "max": 0.8425071977777778}, "halo": {"min": 0.1275969785185185, "med": 0.2343580462962963, "max": 0.36007394592592595}, "waitc": {"min": 0.03176013185185185, "med": 0.041636024074074074, "max": 0.046666026666666666}}, "tail": {"min": 0.00033724592592592595, "med": 0.0003556825925925926, "max": 0.0004861562962962963, "share": 3.2870402435869875e-06, "brisc": {"min": 0.00022252074074074075, "med": 0.00022494851851851853, "max": 0.0002661385185185185}, "red": {"min": 0.0, "med": 0.0, "max": 0.0}, "halo": {"min": 0.0, "med": 0.0, "max": 0.0}, "waitc": {"min": 0.00010443333333333333, "med": 0.00010583962962962963, "max": 0.00010629925925925926}}, "init": {"min": 1.3425925925925926e-05, "med": 0.0001658285185185185, "max": 0.0004293614814814815, "share": 1.532634438973927e-06, "brisc": {"min": 3.1407407407407405e-07, "med": 3.1555555555555554e-07, "max": 3.207407407407407e-07}, "red": {"min": 0.0, "med": 0.0, "max": 0.0}, "halo": {"min": 0.0, "med": 0.0, "max": 0.0}, "waitc": {"min": 0.0, "med": 0.0, "max": 0.0}}}}
+2026-11-28 12:24:55.819 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:478)
+2026-11-28 12:24:55.819 | info     |             UMD | Closing devices in cluster (cluster.cpp:962)
+process wall 130.71 s maxrss 14430072 KB

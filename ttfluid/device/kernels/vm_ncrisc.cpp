@@ -32,6 +32,10 @@ constexpr uint32_t SS = 14, SM = 0x3ff;
 constexpr uint32_t SS = 16, SM = 0xfff;
 #endif
 
+#if defined(CFD_DENSE) && (!defined(CFD_TABSTREAM) || defined(CFD_WIDE) || defined(CFD_DEFER) || defined(CFD_TRID))
+#error "CFD_DENSE: streamed 16-bit tables, the plain ring (no CFD_DEFER, no CFD_TRID)"
+#endif
+
 #if defined(CFD_OS) && CFD_OS >= 2   // run_mesh --os 2: the reader built for size too (see vm_brisc.cpp)
 #pragma GCC optimize("Os")
 #endif
@@ -346,6 +350,23 @@ void kernel_main() {
         }
         asm volatile("" ::: "memory");   // the page is pushed (or the tile used) after this
     };
+#ifdef CFD_DENSE
+    // a dense tile (tabstream.py dense): lane e of the page from source word ix[e], destination order, eight loads
+    // before eight stores (6.4 cycles a lane on BH against 12.1 for a residue entry: tools/gbench.py)
+    auto gather16 = [](const uint32_t* src, const uint16_t* ix, uint32_t n, uint32_t* out) {
+        uint32_t e = 0;
+        for (; e + 8 <= n; e += 8) {
+            const uint32_t i0 = ix[e], i1 = ix[e + 1], i2 = ix[e + 2], i3 = ix[e + 3];
+            const uint32_t i4 = ix[e + 4], i5 = ix[e + 5], i6 = ix[e + 6], i7 = ix[e + 7];
+            const uint32_t v0 = src[i0], v1 = src[i1], v2 = src[i2], v3 = src[i3];
+            const uint32_t v4 = src[i4], v5 = src[i5], v6 = src[i6], v7 = src[i7];
+            out[e] = v0, out[e + 1] = v1, out[e + 2] = v2, out[e + 3] = v3;
+            out[e + 4] = v4, out[e + 5] = v5, out[e + 6] = v6, out[e + 7] = v7;
+        }
+        for (; e < n; ++e) out[e] = src[ix[e]];
+        asm volatile("" ::: "memory");
+    };
+#endif
 #ifdef CFD_HRUN
     // hrun: a halo entry with bit 15 set heads a run (its length in the next word) that agrees with its destination
     // mod 16 B, moved by one NoC copy out of the halo slot instead of word by word (encode.py hrun_words)
@@ -564,8 +585,8 @@ void kernel_main() {
     // inside STREAM (hdr 96 + 10..12): waiting for a free cb_in slot, read barriers, the patch; parts 16..17: the
     // patch's barrier and residue entries; inside GATHER (parts 18..19): waiting for the halo, the local and halo scatters
 #ifdef CFD_PROFW
-    uint32_t nst_ = 0;   // run_mesh --prof 2: this reader's op (32 + op) or the part it is in, at hdr 302 for MATH (vm_compute.cpp)
-#define NSTATE(s) (hdr[302] = (s))
+    uint32_t nst_ = 0;   // run_mesh --prof 2: this reader's op (32 + op) or the part it is in, at hdr 306 for MATH (vm_compute.cpp)
+#define NSTATE(s) (hdr[306] = (s))
 #else
 #define NSTATE(s)
 #endif
@@ -655,6 +676,9 @@ void kernel_main() {
                     const uint32_t* parts = N + pc + 2;
                     pc += 2 + 2 * nparts;
                     ++ngather;
+#ifdef CFD_DENSE
+                    const bool dn = (T[q0 + 1] >> 31) != 0;   // this core's table of the map is a dense twin: one part
+#endif
                     // tile 0's table reads go out before the halo wait, tile t + 1's before tile t is applied
                     load_tile(q0, 2 * nparts + 1, 0, 0, tm);
                     for (uint32_t k = 0; k < nparts && run; ++k)
@@ -677,6 +701,51 @@ void kernel_main() {
                         sp = sp_[t & 1], sn = sn_[t & 1];
                         if (t + 1 < tm) load_tile(q0, 2 * nparts + 1, t + 1, (t + 1) & 1, tm);
                         uint32_t* const dt = dst + WT * t;   // CFD_WIDE: entries carry the lane within tile t
+#ifdef CFD_DENSE
+                        if (dn) {
+                            // dense twin (tabstream.py): section 0 is this tile's 1,024 source lanes as uint16 in lane
+                            // order, so every lane is gathered once with a sequential store. The lanes are split over
+                            // this core, UNPACK and BRISC as --bgts/--tgts split entries; halo values and zero lanes
+                            // go on top once both have answered (their lanes got a dense value first)
+                            const uint32_t* const gs = A + parts[0] * 1024;
+                            const uint16_t* const ix = reinterpret_cast<const uint16_t*>(sp[0]);
+                            uint32_t* const o = dst + 1024 * t;
+                            uint32_t lo = 1024;
+#ifdef CFD_BGTS
+                            lo = 1024 * CFD_BGTS / 8;
+                            S[M_JOB] = reinterpret_cast<uint32_t>(gs);
+                            S[M_JOB + 1] = reinterpret_cast<uint32_t>(ix + lo);
+                            S[M_JOB + 2] = (1024 - lo) | 1u << 31;
+                            S[M_JOB + 3] = reinterpret_cast<uint32_t>(o + lo);
+                            S[M_N] = 1;
+                            asm volatile("" ::: "memory");
+                            S[M_SEQ] = ++bseq;
+#endif
+#ifdef CFD_TGTS
+                            const uint32_t dq = 1024 * CFD_TGTS / 8 < lo ? 1024 * CFD_TGTS / 8 : 0;
+                            if (dq) {
+                                lo -= dq;
+                                S[T_JOB] = reinterpret_cast<uint32_t>(gs);
+                                S[T_JOB + 1] = reinterpret_cast<uint32_t>(ix + lo);
+                                S[T_JOB + 2] = dq | 1u << 31;
+                                S[T_JOB + 3] = reinterpret_cast<uint32_t>(o + lo);
+                                S[T_N] = 1;
+                                asm volatile("" ::: "memory");
+                                S[T_SEQ] = ++tseq;
+                            }
+#endif
+                            gather16(gs, ix, lo, o);
+#ifdef CFD_BGTS
+                            if (!WAIT_UNTIL(S[M_DONE] == bseq, 21)) { run = false; break; }
+#endif
+#ifdef CFD_TGTS
+                            if (dq && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
+#endif
+                            scatter(hbuf(parts[1]), sp[1], sn[1], dt);
+                            for (uint32_t e = 0; e < sn[2]; ++e) dt[sp[2][e]] = 0;
+                        } else
+#endif
+                        {
 #ifdef CFD_BGTS
                         // BRISC scatters the upper (8 - CFD_BGTS) / 8 of every L1-source local and every halo section
                         // of this tile (vm_brisc.cpp bsvc, from inside its waits); this core does the rest and the
@@ -742,6 +811,7 @@ void kernel_main() {
 #ifdef CFD_TGTS
                         if (nt && !WAIT_UNTIL(S[T_DONE] == tseq, 22)) { run = false; break; }
 #endif
+                        }
 #ifdef CFD_GTILE
                         if (gowe + t + 1 >= gt && gowe && cb_pages_reservable_at_back(cb_nc, 1)) {
                             cb_reserve_back(cb_nc, 1);
@@ -944,7 +1014,14 @@ void kernel_main() {
                         noc_async_read_set_trid(0);
 #else
                         const uint32_t pg = get_write_ptr(cb_in) + pend * PS;
+#ifdef CFD_DENSE
+                        // a dense twin's tile (header word 1 bit 31, tabstream.py): gathered below, no window read
+                        const uint32_t mq_ = (N[p + 1] >> 4) & SM ? T[(N[p + 1] >> 4) & SM] : 0;
+                        const bool dn = mq_ && (T[(mq_ & 0xfffff) + 1] >> 31) && t < (mq_ >> 20);
+                        if (!dn) window(d, t, sh, pg);
+#else
                         window(d, t, sh, pg);
+#endif
 #endif
                         ++pend;
 #if defined(CFD_DEFER) && defined(CFD_TABSTREAM)
@@ -995,11 +1072,29 @@ void kernel_main() {
 #ifdef CFD_PROF
                             for (uint32_t k = 0; k <= 2 * np_; ++k) cyc[17] += sn[k];
 #endif
+#ifdef CFD_DENSE
+                            uint32_t* const pd = const_cast<uint32_t*>(pl) + lo;   // the page's lane 0
+                            uint32_t dkeep = 1024;                                   // dense lanes this core gathers
+#else
+                            constexpr bool dn = false;
+                            (void)dn;
+#endif
 #ifdef CFD_BPATCH
                             // BRISC scatters the upper (8 - CFD_BPATCH) / 8 of every L1-source local section (vm_brisc.cpp
                             // bsvc); this core does the rest, then waits for its DONE before the page is pushed
                             uint32_t nj = 0, nkeep[8];
-                            for (uint32_t k = 0; k < np_; ++k) {
+#ifdef CFD_DENSE
+                            if (dn) {   // BRISC gathers the upper (8 - CFD_BPATCH) / 8 of the tile's lanes (bit 31: dense)
+                                dkeep = 1024 * CFD_BPATCH / 8;
+                                nkeep[0] = 0;   // (unused on a dense tile)
+                                S[M_JOB] = reinterpret_cast<uint32_t>(A + N[p + 2] * 1024);
+                                S[M_JOB + 1] = reinterpret_cast<uint32_t>(reinterpret_cast<const uint16_t*>(sp[0]) + dkeep);
+                                S[M_JOB + 2] = (1024 - dkeep) | 1u << 31;
+                                S[M_JOB + 3] = reinterpret_cast<uint32_t>(pd + dkeep);
+                                nj = 1;
+                            }
+#endif
+                            for (uint32_t k = 0; k < np_ && !dn; ++k) {
                                 const uint32_t sd = N[p + 2 + 2 * k], n = sn[2 * k];
                                 nkeep[k] = n;
                                 if ((sd >> 28) == 0 && n >= 32) {
@@ -1025,6 +1120,20 @@ void kernel_main() {
                                 uint32_t t0_ = get_timestamp_32b();
                                 const uint32_t kk_ = (sd >> 28) == 0 ? 20 : 21;
 #endif
+#ifdef CFD_DENSE
+                                if (dn) {
+                                    gather16(A + sd * 1024, reinterpret_cast<const uint16_t*>(sp[0]), dkeep, pd);
+#ifdef CFD_BPATCH
+                                    // BRISC's lanes include halo and zero lanes: those are written after its DONE
+                                    if (nj) {
+                                        bool okb = true;
+                                        PSUB(18, okb = WAIT_UNTIL(S[M_DONE] == bseq, 21));
+                                        if (!okb) { run = false; break; }
+                                        nj = 0;
+                                    }
+#endif
+                                } else
+#endif
 #ifdef CFD_BPATCH
                                 patch(sd, sp[2 * k], nkeep[k], const_cast<uint32_t*>(pl));
 #else
@@ -1040,6 +1149,9 @@ void kernel_main() {
                                 cyc[22] += get_timestamp_32b() - t1_, cnt[22] += sn[2 * k + 1];
 #endif
                             }
+#ifdef CFD_DENSE
+                            if (!run) break;   // the dense wait failed
+#endif
 #ifdef CFD_PROF
                             const uint32_t tz_ = get_timestamp_32b();
 #endif

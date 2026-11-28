@@ -38,7 +38,8 @@ ap.add_argument("--legs", type=int, default=0, help="with --from-images: chain t
                 "come back from the last run's dump): a whole case per process, the same answer as a --state-in chain")
 ap.add_argument("--cases", type=int, default=0, help="with --from-images: this many whole cases back to back in one process "
                 "(sweep mode), each from the images' start (or --state-in), each with its own state npz and result row; the mesh "
-                "opens once and the next case's DRAM homes are built on the host while the device runs this one")
+                "opens once and the next case's DRAM homes are built on the host while the device runs this one; a case that "
+                "diverges does not stop the cases after it, and the process then exits with status 4")
 ap.add_argument("--overlap", type=int, default=1, help="--cases: 1 = case k's outputs are copied on the device, case k+1 is "
                 "launched, and case k is read and saved over a second command queue while k+1 runs (the next homes are "
                 "written there too); 0 = the serial path (read, save, write, launch)")
@@ -50,8 +51,9 @@ ap.add_argument("--tiles", type=int, default=None)
 ap.add_argument("--solve-census", help="CPU: after lowering, write tools/solve_census.py's per-core pages of every Krylov loop pass "
                 "and outer phase to this JSON (cores from --sc-cores) and exit")
 ap.add_argument("--sc-cores", default="0", help="--solve-census: comma list of global cores")
-ap.add_argument("--cores", type=int, default=None, help="CPU only (--plan / --emuonly): lower for this many cores per chip instead of "
-                "the --arch grid's, so a small case reaches a big case's cells per core (and its T)")
+ap.add_argument("--cores", type=int, default=None, help="lower for this many cores per chip instead of the --arch grid's, so a small "
+                "case reaches a big case's cells per core (and its T). On a device: one chip only, and the count must fill a "
+                "sub-rectangle of the grid (15 on Blackhole runs on its 5 x 3 corner)")
 ap.add_argument("--l1", default=None)
 ap.add_argument("--ring", type=int, default=4, help="as run_vm.py: pages in the DRAM reader and writer rings")
 ap.add_argument("--l1-bytes", type=int, default=None, help="CB bytes per core the auto placement may use (default: per --arch)")
@@ -90,14 +92,26 @@ ap.add_argument("--blktab", type=int, default=0, help="with --blocks: 1 = the di
                 "in the compute stream (about 11 words a body, the code ring has to hold a tile loop of them)")
 ap.add_argument("--sched", type=int, default=3, help="as run_vm.py: 1 greedy reorder of each fused run's blocks so values die early, 2 greedy or depth-first, 3 (default) the same at min-store cut points (Machine(sched=K))")
 ap.add_argument("--dedup", type=int, default=0, help="as run_vm.py: a fused run streams each DRAM page once (Machine(dedup=True))")
+ap.add_argument("--span", type=int, default=0, help="1 with --l1 N: a split gather whose window and whole residue read one "
+                "DRAM-homed vector reads an L1 copy of it (one reserved L1 slot of T tiles, filled by a copy block when the vector "
+                "changes), which --tabdense then serves like any L1 vector (Machine(span=1)); 2: a served gather with an L1 destination is "
+                "one reader page too, not a block and a gather op; values unchanged")
+ap.add_argument("--tabdense", type=int, default=0, help="N > 0 with --tabstream: a reader-patched map with at least N local residue entries "
+                "per tile on a core is streamed as a dense destination-ordered uint16 index table (512 words a tile) and the reader "
+                "gathers the page in one pass with no window read (CFD_DENSE; encode.py tab_dense). The same page values. "
+                "530 is the measured break-even on BH (6.45 cycles a dense lane against 12.1 a residue entry)")
+ap.add_argument("--tabdense-break", type=int, default=0, help="the broken arm of the --tabdense gate: N pairs of lanes of every dense table of "
+                "core 0 read each other's source, so the state must differ from the control's")
 ap.add_argument("--tsort", type=int, default=None, help="as run_vm.py: tabstream residue entries sorted by source tile (CFD_TSORT). "
                 "Default on with --tabstream; with --from-images as the images were lowered")
 ap.add_argument("--bpatch", type=int, default=None, help="as run_vm.py: -1 / unset auto (4 when --tabstream and >= --bpatch-min local residue entries per patched map tile), K in 1..7 BRISC scatters (8 - K) / 8 of a patched page's L1 residue (CFD_BPATCH; mailbox in the last 256 B of cb_sync)")
 ap.add_argument("--bpatch-min", type=float, default=64.0)
-ap.add_argument("--bgts", type=int, default=0, help="K in 1..7: BRISC scatters the upper (8 - K) / 8 of every L1-source and halo section of a "
-                "--tabstream GATHER tile, NCRISC the rest (CFD_BGTS, the --bpatch mailbox); 0 off. Data movement only: bit-exact")
-ap.add_argument("--tgts", type=int, default=0, help="J in 1..7: compute's UNPACK copies the top J / 8 of every L1-source and halo section of a "
-                "--tabstream GATHER tile (of what --bgts leaves NCRISC) from inside its waits (CFD_TGTS, a second mailbox); 0 off. Bit-exact")
+ap.add_argument("--bgts", type=int, default=None, help="K in 1..7: BRISC scatters the upper (8 - K) / 8 of every L1-source and halo section of a "
+                "--tabstream GATHER tile, NCRISC the rest (CFD_BGTS, the --bpatch mailbox); 0 off. Data movement only: bit-exact. "
+                "Both shares unset: 6 with --tgts 3 on --arch bh with streamed 16-bit tables (reader 3/8, UNPACK 3/8, BRISC 2/8), else 0")
+ap.add_argument("--tgts", type=int, default=None, help="J in 1..7: compute's UNPACK copies the top J / 8 of every L1-source and halo section of a "
+                "--tabstream GATHER tile (of what --bgts leaves NCRISC) from inside its waits (CFD_TGTS, a second mailbox); 0 off. Bit-exact. "
+                "Unset: see --bgts")
 ap.add_argument("--amg", action="store_true", help="p PCG preconditioned by smoothed aggregation (ttfluid.resident.sa), aggregates on the K x 72 global cores; "
                 "the coarse levels are chip-local (sa.setup chip_cores): only the fine level exchanges between chips")
 ap.add_argument("--amg-kind", default="sa", choices=["sa"])
@@ -136,6 +150,9 @@ ap.add_argument("--hre", type=int, default=0, help="G > 0: a halo whose last gat
 ap.add_argument("--forces", default=None, metavar="FUNC", help="Cd/Cl of each outer iteration's incoming state in the history (result keys Cd_in, Cl_in), from the controlDict function FUNC (ttfluid.solver.forces.coeff_hook)")
 ap.add_argument("--phase", action="store_true", help="per-SIMPLE-phase device cycles (program.PHASES markers, CFD_PHASE): result key phase")
 ap.add_argument("--cap", type=int, default=32, help="as run_vm.py: scratch cap, live one-tile values per fused run")
+ap.add_argument("--lsplit", type=int, default=0, help="1: a vector that holds an L1 colour across a Krylov loop it is not used in is parked in DRAM "
+                "for the loop, so the loop's own vectors take the colour (Machine(lsplit)); 2: also a colour holder the loop touches less often than "
+                "a vector it left in DRAM (the solve's own solution register). Data movement only: same values. Needs a lowering")
 ap.add_argument("--pseg", type=int, default=0, help="as run_vm.py: a split gather joins its fused run as one reader-patched page (Machine(pseg)); 3, 4 need --tabstream (mesh has no trid). Default 0 keeps the built images unchanged")
 ap.add_argument("--os", type=int, default=0, help="1: BRISC built for size (#pragma GCC optimize Os), 2: NCRISC too, for a program over the kernel config buffer")
 ap.add_argument("--prof", type=int, nargs="?", const=1, default=0, help="census build: per-op cycles of every interpreter (CFD_PROF), means over all K x 72 cores; 2 (CFD_PROFW): MATH also drains after every load and acquire and books the wait to what UNPACK, PACK and the reader are in (census.mwait)")
@@ -169,7 +186,12 @@ assert min(R, C) == 1 or a.block2d or a.plan or a.emuonly, "2D mesh %dx%d needs 
 GRID, l1_default, NCB, DA = ARCH[a.arch]
 a.l1_bytes = a.l1_bytes or l1_default
 K, P = R * C, GRID[0] * GRID[1]
-assert not a.cores or a.plan or a.emuonly or a.solve_census, "--cores: a CPU lowering only (the device grid is --arch's)"
+if a.cores:
+    # the widest sub-rectangle of the arch grid that holds exactly --cores: the device launches its kernels on that corner
+    w = max((w for w in range(1, GRID[0] + 1) if a.cores % w == 0 and a.cores // w <= GRID[1]), default=0)
+    assert (w and K == 1) or a.plan or a.emuonly or a.solve_census or a.images, \
+        "--cores %d on a device: one chip, and a sub-rectangle of its %dx%d grid" % (a.cores, GRID[0], GRID[1])
+    GRID = (w, a.cores // w) if w else GRID
 P = a.cores or P
 PP = -(-P // 4) * 4   # one chip's partials padded to 16 B (vm_brisc.cpp PP): P = 110 on BH, 72 on WH (unchanged)
 import ttfluid.resident.encode  # noqa: E402
@@ -183,6 +205,15 @@ if a.owner:
     ttfluid.resident.machine.rcb = lambda xyz, P, chips=None: _parts
 from ttfluid.resident.memu import MachineEmu  # noqa: E402
 from ttfluid.resident.encode import Encoded  # noqa: E402
+from ttfluid.resident.tabstream import bpatch_auto  # noqa: E402
+
+
+def gshare():
+    """(--bgts, --tgts) as given (one alone leaves the other off), or the default when both are unset: the measured
+    share of a GATHER tile on Blackhole with streamed 16-bit tables, 6 / 3; 0 / 0 everywhere else. Needs encode.WIDE set."""
+    if a.bgts is None and a.tgts is None:
+        return (6, 3) if a.arch == "bh" and a.tabstream and not ttfluid.resident.encode.WIDE else (0, 0)
+    return a.bgts or 0, a.tgts or 0
 from ttfluid.resident.program import build  # noqa: E402
 import ttfluid.resident.krylov  # noqa: E402
 
@@ -198,7 +229,7 @@ stamp("python imports done")
 
 t0 = time.time()
 # the flags that shape the lowering and the encoding: a --load must carry the ones its --save had
-LOWER = {k: getattr(a, k) for k in ("what", "n", "case", "mesh", "layout", "tiles", "l1", "red2", "strips", "fuse", "redm", "sched",
+LOWER = {k: getattr(a, k) for k in ("what", "n", "case", "mesh", "layout", "tiles", "l1", "span", "red2", "strips", "fuse", "redm", "sched",
                                     "hoist", "jointred", "fold1", "fusepart", "gsplit", "wplace", "bcast", "cg1", "page", "tabstream",
                                     "bgather", "bscal", "bjoint", "cap")}
 if a.phase:
@@ -207,10 +238,25 @@ if a.tsort:   # images and --save files from before the flag have unsorted table
     LOWER["tsort"] = 1
 # flags added since: in LOWER only when not at their default, so an image or --save without them still matches
 LOWER.update({k: getattr(a, k) for k in ("cse", "dedup", "narrow", "amg", "amg_kind", "amg_stack", "amg_vec", "ptiles", "lsched", "sliced", "amg_smoothed", "amg_lag",
-                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "blocks", "blktab") if getattr(a, k) != ap.get_default(k)})
+                                         "amg_lag_warm", "amg_depth", "amg_min_core", "amg_global", "hlate", "hre", "gtile", "vpre", "vpost", "vcoarse", "vgamma", "forces", "pseg", "lsplit", "blocks", "blktab") if getattr(a, k) != ap.get_default(k)})
 assert a.pseg < 3 or a.tabstream, "--pseg 3, 4 patch many pages per stream: the reader does that with --tabstream only"
 assert not a.amg_global or a.emuonly or a.plan, "--amg-global: a CPU reference (the gateway carries the cell plan only)"
 IMG = None
+
+def diverged(rows):
+    """The first history row with a value that is not finite, or None. The device program ends after that row
+    (resident/program.py), so it is the last one; DIVERGED on stdout names the iteration and the fields."""
+    for q, r in enumerate(rows):
+        bad = sorted(k for k, v in r.items() if not np.isfinite(v))
+        if bad:
+            print("DIVERGED: outer iteration %d of this run: %s not finite (%s); the program stopped there" % (
+                q + 1, ", ".join(bad), " ".join("%s=%s" % (k, r[k]) for k in r if not k.startswith("its"))), flush=True)
+            return dict(row=q + 1, outer=r.get("outer"), fields=bad)
+    return None
+
+
+diverged_cases = []   # --cases: the cases whose run diverged; they decide the exit status once every case has its line
+
 
 def mcache_open(mode):   # a --mcache path ending in .zst is read and written as a zstd stream (Small k4: 121 GB raw)
     if not a.mcache.endswith(".zst"):
@@ -297,7 +343,7 @@ else:
                     l1_vec=None if a.l1 in (None, "auto") else int(a.l1), fuse=a.fuse, redm=bool(a.redm), sched=a.sched, hoist=bool(a.hoist),
                     joint_red=bool(a.jointred), fold1=bool(a.fold1), fusepart=bool(a.fusepart), gsplit=bool(a.gsplit), wplace=a.wplace,
                     bcast_run=bool(a.bcast), bgather=bool(a.bgather), bscal=bool(a.bscal), scratch_cap=a.cap, narrow=a.narrow,
-                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=bool(a.cse), hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg)
+                    amg_vec=a.amg_vec, ptiles=a.ptiles, lsched=a.lsched, sliced=a.sliced, dedup=bool(a.dedup), cse_ir=a.cse, hlate=bool(a.hlate), hre=a.hre, pseg=a.pseg, span=a.span, lsplit=a.lsplit)
         if a.gdump:
             from ttfluid.tools import gcensus
             gcensus.dump(m, prog, a.gdump, [int(x) for x in a.gdump_cores.split(",")] if a.gdump_cores else list(range(0, P, 11)))
@@ -341,7 +387,7 @@ else:
         mesh = 8192 + 512 + 2 * K * (16 if mm.red2 else 12 * PP) + NSH * SHS * 4 + 512
         code = (a.page * 1024 if a.page else pad(len(E.c))) + pad(len(E.b)) + (a.nwin * 4 if a.nwin else pad(len(E.n)))
         ts = 2 * (4096 + 64 * 32) if E.tab_stream else 0
-        ts += 4096 if E.tab_stream and a.bpatch != 0 else 0      # cb_sync may grow a page for the B-patch mailbox
+        ts += 4096 if E.tab_stream and (a.bpatch != 0 or any(gshare())) else 0      # cb_sync may grow a page for the mailboxes
         blk = (ttfluid.resident.encode.BLOCKS or {}).get("tab")   # --blktab: the body table is kernel text, the kernel config buffer grows by it
         blk = -(-4 * sum(len(q) for q in blk) // 4096) * 4096 if blk else 0
         return mm.ntiles * 4096 + code + pad(E.tab.shape[1] + 64) + fixed + rings + mesh + max(a.gcache, 6 if a.gcache < 0 else 0) * 4096 + ts + (0 if mm.ndram else 2048 * min(a.narrow, 2)) + blk
@@ -354,7 +400,17 @@ else:
         assert not a.load, "--blocks: a --load file is already encoded"
         ttfluid.resident.encode.BLOCKS = dict(plan={}, gen={}, brk=int(a.blocks == 2), **({"tab": {}} if a.blktab else {}))
     if not a.load:
-        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
+        E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break)
+        if a.tabdense:
+            S_ = E.tab_stream
+            print("tabdense %d: %d twin maps, %d of %d (core, twin) tables dense, L1 table %d words, blob %d words a core (staging %d)" % (
+                a.tabdense, len(S_["dense"]), S_["ndense"], len(S_["l1"]) * len(S_["dense"]), S_["l1_words"], S_["blob_words"], S_["staging_words"]), flush=True)
+            from ttfluid.resident.tabstream import gcensus
+            from ttfluid.resident.program import PHASES
+            gc_ = gcensus(E)   # which gathers the dense twin reaches, one execution of every op, means over the cores
+            for (ph, cls), (no, nl, nd, nh) in sorted(gc_.items(), key=lambda kv: (-1 if kv[0][0] is None else kv[0][0], -kv[1][1])):
+                print("gcensus %-11s %-40s ops %4d  local entries a core %9.0f  through a dense table %9.0f  halo %7.0f" % (
+                    "top" if ph is None else PHASES[ph], cls, no, nl, nd, nh), flush=True)
         if a.tscheck:   # as run_vm.py: NCRISC's streamed walk replayed against the cursor tables, every core
             from ttfluid.resident.tabstream import check
             check(E, E.tab_stream, E.tab_cursor)
@@ -363,7 +419,7 @@ else:
             k = max(0, int((a.l1_bytes - (cb_bytes(E) - m.ntiles * 4096)) // 4096 - m.nsmall) // m.T)
             while True:
                 m.place(k, print)
-                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile))
+                E = Encoded(m, page=bool(a.page), pdev=P, tab_stream=a.tabstream, tab_sort=bool(a.tsort), phase=getattr(prog, "phase_at", None), gtile=bool(a.gtile), tab_dense=a.tabdense, tab_break=a.tabdense_break)
                 print("l1 auto: %d vector slots in L1, CB bytes %d" % (k, cb_bytes(E)), flush=True)
                 if cb_bytes(E) <= a.l1_bytes or k == 0:
                     break
@@ -399,6 +455,8 @@ else:
                 gateways={f"{x}->{y}" + (f".{k}" if a.gw > 1 else ""): g for (x, y, k), g in gw.items()}, shadow_kb=NSH * SHS * 4 / 1024,
                 gw_load={g: (v["gP"], v["gR"], len(v["rec"])) for g, v in gtab.items()},
                 cells_per_chip=[int(np.sum(m.lay.owner[prog.cells.name] // P == k)) for k in range(K)])
+    if E.tab_stream:
+        info["loc"] = list(E.tab_stream["loc"])   # for --bpatch auto on a run from the images
     print("plan", json.dumps(info), flush=True)
     if cb_bytes(E) > a.l1_bytes:   # images that cannot fit L1 fail only at launch, after the whole lowering: refuse them here
         msg = "CB bytes %d over --l1-bytes %d (halo %d B): more chips or a smaller case" % (cb_bytes(E), a.l1_bytes, E.m.hwords * 4)
@@ -449,7 +507,7 @@ elif not a.noemu:
         if a.ref:
             with open(a.ref, "wb") as f:
                 pickle.dump(ref, f)
-        sys.exit()
+        sys.exit(4 if diverged(me.history) else 0)
 
 stamp("host tables built")
 import torch  # noqa: E402
@@ -571,9 +629,13 @@ GB = 1024 if 1024 + 32 * P <= 4000 else 4096   # vm_brisc.cpp gather slots: befo
 RB = 4096 if GB == 1024 else GB + 32 * P       # reduction broadcast
 E0 = RB + 2 * BW    # mesh words to E0 + 1616
 if a.bpatch is None or a.bpatch < 0:
-    lm = E.tab_stream.get("loc_mean", 0.0) if isinstance(getattr(E, "tab_stream", None), dict) else 0.0   # (images: pass --bpatch)
-    a.bpatch = 4 if lm >= a.bpatch_min else 0
-    print("--bpatch auto: %.1f local residue entries per patched map tile (min %.0f) -> %d" % (lm, a.bpatch_min, a.bpatch), flush=True)
+    loc = E.tab_stream["loc"] if isinstance(E.tab_stream, dict) else None   # None: no streamed tables, or images lowered before they recorded it
+    a.bpatch, lm = bpatch_auto(loc, a.bpatch_min)
+    print("--bpatch auto: %.1f local residue entries per patched map tile (min %.0f) -> %d" % (lm, a.bpatch_min, a.bpatch)
+          + (" (these images do not record the entries: lower again, or pass --bpatch 4)" if E.tab_stream and not loc else ""), flush=True)
+if a.bgts is None and a.tgts is None:
+    print("--bgts / --tgts auto: %d / %d" % gshare(), flush=True)
+a.bgts, a.tgts = gshare()
 assert 0 <= a.bpatch < 8 and not (a.bpatch and not a.tabstream), "--bpatch K: 1..7 with --tabstream"
 assert 0 <= a.bgts < 8 and not (a.bgts and not a.tabstream), "--bgts K: 1..7 with --tabstream"
 assert not a.tsort or a.tabstream, "--tsort 1 needs --tabstream"
@@ -628,9 +690,10 @@ elif IMG is not None:   # chip by chip: chip k's arrays are built from its image
             STATE = {k: z[k] for k in z.files if k != "hist"}
         print("state from %s" % a.state_in, flush=True)
         stamp("state read")
-    up = lambda name: image_dev.upload(md, K, DEVBLK, lambda k: image_dev.chip_arrays(IMG, k, P, STATE, name)[name], to_dev)
+    filled = lambda name: (image_dev.chip_shape(IMG, P, name), lambda k, out: image_dev.chip_fill(IMG, k, P, name, out, STATE))
+    up = lambda name: image_dev.upload(md, K, DEVBLK, *filled(name), name)
     t_arena, t_const, t_home, t_blob = up("arena"), up("consts"), up("home"), up("blob")
-    t_tab = image_dev.upload(md, K, DEVBLK, chip_tab, to_dev)
+    t_tab = image_dev.upload(md, K, DEVBLK, (P, L), lambda k, out: np.copyto(out, chip_tab(k)), "tab")
     stamp("images uploaded (arena, consts, home, blob, tab)")
     t_c, t_b, t_n = (to_dev(np.tile(code[k], (K, 1))) for k in "cbn")
     t_hist = to_dev(np.zeros((K * H, 16), np.uint32))
@@ -698,6 +761,7 @@ def kd(src, ct, cfg, rt=None, crt=None):
         ([("CFD_TSORT", "1")] if a.tsort and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_BPATCH", str(a.bpatch))] if a.bpatch and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
         ([("CFD_BGTS", str(a.bgts))] if a.bgts and src in ("vm_ncrisc.cpp", "vm_brisc.cpp") else []) + \
+        ([("CFD_DENSE", "1")] if a.tabdense and src in ("vm_ncrisc.cpp", "vm_brisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_TGTS", str(a.tgts))] if a.tgts and src in ("vm_ncrisc.cpp", "vm_compute.cpp") else []) + \
         ([("CFD_GTILE", "1")] if a.gtile and src == "vm_ncrisc.cpp" else []) + \
         ([("CFD_NARROW", str(CB_H))] if a.narrow and src == "vm_compute.cpp" else []) + \
@@ -820,8 +884,8 @@ def main():
             stamp("case %d: homes written" % rr)
         elif rr and a.legs:   # the next leg continues: homes stay on the device, the arena's state registers from the dump
             ttnn.deallocate(t_arena)
-            t_arena = image_dev.upload(md, K, DEVBLK, lambda k: image_dev.carry_arena(
-                IMG, k, P, o[k * P:(k + 1) * P, 1024:].reshape(P, nv, 1024)), to_dev)
+            t_arena = image_dev.upload(md, K, DEVBLK, image_dev.chip_shape(IMG, P, "arena"), lambda k, out: np.copyto(
+                out, image_dev.carry_arena(IMG, k, P, o[k * P:(k + 1) * P, 1024:].reshape(P, nv, 1024))))
             io[0] = t_arena
             common[0] = t_arena.buffer_address()
             stamp("leg %d: arena carried" % rr)
@@ -850,6 +914,8 @@ def main():
             hl = from_dev(t_hist, np.uint32).reshape(K, H, 16)
             rows_all += [{nm: float(hl[0, q, i:i + 1].view(np.float32)[0]) for i, nm in enumerate(E.out_names)}
                          for q in range(min(int(o.reshape(K * P, -1)[0, 14]), H))]
+            if rows_all and not all(np.isfinite(v) for v in rows_all[-1].values()):
+                break   # this leg ended on a non-finite row: the next one would only carry it
         if a.cases:   # every case its own answer, read before the next case's homes overwrite this one's
             report(o, walls[-1:], ticks[-1:], clks[-1:], None, ".c%d" % rr)
     if not a.cases:
@@ -888,7 +954,7 @@ def mesh_program():
 
 
 def next_homes():   # the next case's homes as one multi-device host tensor (the image's start or --state-in)
-    return image_dev.host_shards(md, K, DEVBLK, lambda k: image_dev.chip_arrays(IMG, k, P, STATE, "home")["home"])[0]
+    return image_dev.host_shards(md, K, DEVBLK, *filled("home"))[0]
 
 
 def core0_ticks(o):
@@ -1021,7 +1087,7 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
                              halo_all_max=int(h[:, 54].max()), halo_all_med=float(np.median(h[:, 54])),
                              gw={int(g): dict(relay=int(h[g, 50]), members=int(h[g, 51]), rcred=int(h[g, 52]),
                                               send=int(h[g, 53])) for g in gws}),
-               last=rows[-1] if rows else None)
+               last=rows[-1] if rows else None, diverged=diverged(rows))
     if a.phase:   # hdr 512 + 2 id MATH, 544 BRISC, 576 B_RED, 608 B_HALO, 640 B_WAITC (vm_compute / vm_brisc CFD_PHASE)
         from ttfluid.resident.program import PHASES
         hz = amax * 1e6
@@ -1075,10 +1141,17 @@ def report(o, walls, ticks, clks, rows_legs, tag, hist=None, home_pages=None):
         f.write(json.dumps(res) + "\n")
     if res["abort"]["cores"] or not nrow:   # a run that aborted on its bounded waits is a failure, not a row
         raise SystemExit(3)
+    if res["diverged"]:   # the state is saved and the row is in the result; the answer is not one
+        if not a.cases:
+            raise SystemExit(4)
+        diverged_cases.append(tag)   # the program ended by itself, so the cases after this one still run
 
 
 try:
     main()
+    if diverged_cases:   # a process with a diverged case fails like a single diverged run, after every case has run
+        print("status 4: %d of %d cases diverged (%s)" % (len(diverged_cases), a.cases, " ".join(diverged_cases)), flush=True)
+        raise SystemExit(4)
 finally:   # a failed build or run must still release the mesh, or the interpreter hangs at exit
     ttnn.close_mesh_device(md)
     if FAB:

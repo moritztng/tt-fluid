@@ -22,6 +22,7 @@ The lowered program (MIR) is a list of
 Registers are IR register numbers plus temporaries; after allocation they are arena tile numbers (`phys`).
 """
 import bisect
+import hashlib
 import os
 from collections import Counter, defaultdict
 
@@ -66,8 +67,8 @@ UNARY = ("neg", "abs", "sqrt", "tanh", "log", "exp")
 # =================================================================================================================
 def rcb(xyz, P, chips=None, faces=None):
     """Recursive coordinate bisection of points into P parts of near-equal size. chips = K > 1: chip first, for a
-    line of K chips: K equal strips along the longest axis (strip k on chip k, neighbours one hop apart), then
-    bisection of each strip into its P / K cores. faces = (owner, neighbour) of the internal faces: each bisection
+    line of K chips: K equal strips along the longest axis (strip k on chip k, neighbours one hop apart; with faces,
+    cells that would join strips two apart are moved so that none do), then bisection of each strip into its P / K cores. faces = (owner, neighbour) of the internal faces: each bisection
     cuts along the axis that cuts the fewest faces, not the longest one. On a mesh with a thin dense layer (the
     refinement above occDrivAer's ground) the longest axis slices the layer into parts 2-3 cells thick, almost all
     halo: the worst core's halo, which sizes every core's halo buffer, drops 3.3x on the coarse occDrivAer."""
@@ -78,6 +79,18 @@ def rcb(xyz, P, chips=None, faces=None):
         cut = [int(round(len(xyz) * k / chips)) for k in range(chips + 1)]
         for k in range(chips):
             parts[order[cut[k]:cut[k + 1]]] = k
+        if faces is not None:
+            # A strip thinner than the mesh's coarsest cells (equal counts make the strip through the refinement thin)
+            # lets its two neighbours share faces, and chips two apart on the line are not one hop apart. The cells that
+            # reach across move one strip up until every face joins the same or adjacent strips: a one-cell layer of
+            # coarse cells, so the counts stay near equal. Strips only rise and are bounded, so this ends.
+            fo, fn = np.asarray(faces[0]), np.asarray(faces[1])
+            while True:
+                a, b = parts[fo], parts[fn]
+                far = np.abs(a - b) > 1
+                if not far.any():
+                    break
+                parts[np.unique(np.where(a < b, fo, fn)[far])] += 1
         strip = parts.copy()
         for k in range(chips):
             sel = np.nonzero(strip == k)[0]
@@ -266,12 +279,21 @@ def _aid(a):
     return (a.__array_interface__["data"][0], a.shape, a.strides, a.dtype.str)
 
 
-def cse(code):
+def _acid(a):
+    """An index array's identity by its content (dtype, shape, digest of the bytes): --cse 2. The tracer builds equal
+    index arrays again per caller (interp and grad of one field from two schemes), and by memory identity those
+    gathers never match, so everything computed from them is computed and gathered once per caller."""
+    a = np.asarray(a)
+    return (a.dtype.str, a.shape, hashlib.sha1(np.ascontiguousarray(a).tobytes()).digest())
+
+
+def cse(code, content=False):
     """Value numbering: an ew / gather / bsum / reduce that repeats an earlier one (same op on the same registers) is
     dropped and its uses read the earlier result. Same operations on the same values, so bit-exact; what goes is the
     trace's recomputation (grad U built three times in the momentum phase, interp of one field per caller, ...).
     Only single-definition registers take part as results. A copy into a register forgets every entry that reads it;
     a jump target forgets everything (a value from before a loop head or a merge may not hold on every path)."""
+    aid = _acid if content else _aid     # content: equal index arrays match whatever object holds them (--cse 2)
     defs = Counter(d for ins in code for d in _uses_defs(ins)[1])
     targets = {ins[-1] for ins in code if ins[0] in ("jump", "jumpif")}
     memo, readers, ren, out = {}, defaultdict(list), {}, []
@@ -288,7 +310,7 @@ def cse(code):
         elif op == "gather":
             ins = ("gather", ins[1], [(rn(s), c, p) for s, c, p in ins[2]])
             args = tuple(s for s, _, _ in ins[2])
-            key = ("gather",) + tuple((s, _aid(c), _aid(p)) for s, c, p in ins[2])
+            key = ("gather",) + tuple((s, aid(c), aid(p)) for s, c, p in ins[2])
         elif op == "bsum":
             ins, args = ("bsum", ins[1], rn(ins[2])), (rn(ins[2]),)
             key = ("bsum",) + args
@@ -950,7 +972,7 @@ def slot_extents(code, space, cells, slotfold, L, T):
 class Machine:
     def __init__(self, prog, mesh, P, nslot=NSLOT, log=print, layout="rcb", tiles=None, l1_vec=None, fuse=False, scratch_cap=32,
                  span_homes=False, hoist=False, cap_min=False, sched=False, amg_vec=False, ptiles=False, bcast_run=False, joint_red=False, fold1=False,
-                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0):
+                 gsplit=False, fusepart=False, bgather=False, wplace=False, mad=False, bscal=False, hsplit=False, bloc=0, hrun=False, chip_cores=None, red2=None, chip_line=False, redm=False, pseg=False, dedup=False, narrow=False, lsched=False, sliced=False, cse_ir=False, hlate=False, hre=0, span=0, lsplit=False):
         # two-stage reductions: fold the chip's partials, then the K chip sums; no joint reductions then. Needed when
         # K * P partials do not fit one fold tile, and the default from 8 chips (r13 2x4: 520.3 vs 546.9 ms/it)
         self.red2 = bool(chip_cores) and ((P > LANES or P >= 8 * chip_cores) if red2 is None else red2)
@@ -976,8 +998,8 @@ class Machine:
         code = fold_constants(code, prog.space, prog.dtype)
         if cse_ir:
             n0 = len(code)
-            code = cse(code)[0]
-            log(f"cse: {n0} -> {len(code)} instructions")
+            code = cse(code, content=int(cse_ir) >= 2)[0]
+            log(f"cse: {n0} -> {len(code)} instructions" + (" (index arrays by content)" if int(cse_ir) >= 2 else ""))
         code = dce(code)
         self.sliced, self.ext = sliced, {}
         if sliced:
@@ -1053,11 +1075,17 @@ class Machine:
         self._split_gathers()
         self._halos()
         self.scratch_cap, self.span_homes, self.hoist, self.cap_min = scratch_cap, span_homes, hoist, cap_min
+        self.span = span
         self.sched = sched
         if fuse and self.T > 1:
             self._segments()
             self._scratch()
         self._allocate()
+        if lsplit:
+            k = self._split_loops(l1_vec, cold=lsplit > 1)
+            log("lsplit: %d live ranges split around innermost loops" % k)
+            if k:
+                self._allocate()
         self.dedup = dedup
         self._pre_place = (list(self.mir), dict(self.phys), self.ntiles, self.nvec, self.nsmall)
         self.place(l1_vec, log)
@@ -1878,22 +1906,7 @@ class Machine:
     def _allocate(self):
         mir = self.mir
         n = len(mir)
-        succ = _mir_succ(mir)
-        ud = [(_mir_uses(i), _mir_defs(i)) for i in mir]
-        live_in = [set() for _ in range(n)]
-        live_out = [set() for _ in range(n)]
-        changed = True
-        while changed:
-            changed = False
-            for i in range(n - 1, -1, -1):
-                o = set()
-                for s in succ[i]:
-                    o |= live_in[s]
-                u, d = ud[i]
-                inn = (o - set(d)) | set(u)
-                if o != live_out[i] or inn != live_in[i]:
-                    live_out[i], live_in[i] = o, inn
-                    changed = True
+        ud, live_in, live_out = _liveness(mir)
         tiles = set()
         for u, d in ud:
             tiles |= set(u) | set(d)
@@ -2044,6 +2057,70 @@ class Machine:
         self.adj = adj
         self.live_entry = live0
 
+    def _split_loops(self, l1_vec, cold=False):
+        """lsplit: free the L1 colours that values merely live across a Krylov loop hold while it runs. A written vector
+        with an L1 colour that the solve neither reads nor writes is copied to a new register in front of it and back
+        behind it: in between it is dead, so the loop's own vectors can take its colour, and the copy (two uses) goes
+        to DRAM. That is T pages out and T back per solve, nothing per pass. The region is the innermost loop widened
+        to its exits and to the jumps that skip it (label LOOP .. label END, from the first jump to END): one way in
+        at the top, one way out at the bottom, or the loop is left alone. Only for a loop with a vector the placement
+        without the split left in DRAM (the U, k, omega solves: the other velocity components held colours through
+        each of them, unused). cold (lsplit 2): a colour holder the region does touch, but less often than a vector the
+        trial left in DRAM, is split the same way and the region works on the copy (the solution of a BiCGStab solve
+        is read and written once a pass and is a state register that holds a colour everywhere else: U_y and U_z had
+        3 L1 homes in their own solves where U_x, whose state register lost the colour, had 16). Only when every touch
+        in the region is a plain block load or a block result. Data movement only: same values. Returns the number
+        of (loop, register) splits."""
+        if l1_vec is None or self.T == 1:
+            return 0
+        snap = (self.mir, dict(self.phys), self.ntiles, self.nvec, self.nsmall)
+        self.mir = list(self.mir)
+        self._place(l1_vec)          # trial: who holds a colour without the split
+        isv = lambda r: isinstance(r, int) and self.is_vec(r)
+        l1 = {r for r in self.phys if isv(r) and r not in self.dram and r not in self.ovl}
+        dram = set(self.dram)
+        self.mir, self.phys, self.ntiles, self.nvec, self.nsmall = snap
+        mir = self.mir
+        labels = {ins[1]: i for i, ins in enumerate(mir) if ins[0] == "label"}
+        jumps = {k: labels[ins[-1]] for k, ins in enumerate(mir) if ins[0] in ("jump", "jumpif")}
+        back = [(t, k) for k, t in jumps.items() if t < k]
+        inner = [(i, j) for i, j in back if not any((a, b) != (i, j) and i <= a and b <= j for a, b in back)]
+        ud, live_in, _ = _liveness(mir)
+        touch = lambda ins: [r for x in (ins[1] if ins[0] == "seg" else [ins]) for r in _mir_uses(x) + _mir_defs(x)]
+        writes = {r for ins in mir if ins[0] != "fetch" for r in _mir_defs(ins)}
+        fetched = getattr(self, "fetched_from", {})
+        front, behind, n = defaultdict(list), defaultdict(list), 0
+        for i, j in sorted(inner):
+            hi = max([t for k, t in jumps.items() if i <= k <= j] + [j])         # the last exit label
+            lo = min([k for k, t in jumps.items() if k < i and i <= t <= hi] + [i])   # the first jump that skips the loop
+            if any((lo <= k <= hi) != (lo <= t <= hi) for k, t in jumps.items()) or mir[hi][0] not in ("label", "jumpif"):
+                continue
+            if not {r for ins in mir[i:j + 1] for r in touch(ins)} & dram:
+                continue
+            cnt = Counter(r for ins in mir[lo:hi + 1] for r in touch(ins))
+            ok = lambda r: isv(r) and r in l1 and r in writes and r not in fetched and not self.space[r].stack
+            ren = {}
+            if cold:
+                hot = max((k for r, k in cnt.items() if isv(r) and r in dram), default=0)
+                flat = [x for ins in mir[lo:hi + 1] for x in (ins[1] if ins[0] == "seg" else [ins])]
+                plain = lambda x, r: x[0] == "blk" and all(u[0] == "ld" or r not in _mir_uses(("blk", [u], [])) for u in x[1])
+                ren = {r: None for r in live_in[lo] if ok(r) and 0 < cnt[r] < hot
+                       and all(plain(x, r) for x in flat if r in _mir_uses(x) or r in _mir_defs(x))}
+            for r in sorted(r for r in live_in[lo] if ok(r) and (cnt[r] == 0 or r in ren)):
+                c = self._tmp(self.space[r])
+                if r in self.ext:
+                    self.ext[c] = self.ext[r]
+                front[lo].append(("blk", [("ld", 0, r)], [(0, c)]))
+                behind[hi].append(("blk", [("ld", 0, c)], [(0, r)]))
+                if r in ren:
+                    ren[r] = c
+                n += 1
+            if ren:
+                mir[lo:hi + 1] = [_rename_regs(ins, ren) for ins in mir[lo:hi + 1]]
+        if n:
+            self.mir = [x for k, ins in enumerate(mir) for x in front.get(k, []) + [ins] + behind.get(k, [])]
+        return n
+
     # ---- DRAM homes. With l1_vec set (and T > 1), only that many vector slots stay in L1; the rest live in DRAM, each
     # as many pages per core as its widest register's tiles, packed: phys DBASE + the slot's tile offset, page core *
     # hpages + offset + tile. A DRAM-homed fetched constant is read in place from its DRAM constant pages (phys KBASE +
@@ -2131,6 +2208,11 @@ class Machine:
                     used += vsize[c]
             keep.sort()
             dslot = {c: i for i, c in enumerate(c for c in range(self.nvec) if c not in keep)}
+        span = "span" if self.span else None
+        if span:   # one more L1 slot of T tiles that no register is coloured into (_span_fill)
+            keep = list(keep) + [span]
+            vsize = dict(vsize) if isinstance(vsize, dict) else dict(enumerate(vsize))
+            vsize[span] = T
         koff = np.concatenate([[0], np.cumsum([vsize[c] for c in keep])]).astype(int)
         newc = {c: int(koff[i]) for i, c in enumerate(keep)}
         dord = sorted(dslot, key=dslot.get)
@@ -2181,6 +2263,9 @@ class Machine:
             self._log("wplace 2: %d vector registers overlaid on one-tile slots (%d offsets), %d stay in %d L1 colours" % (
                 len(self.ovl), len(wid), sum(1 for r in phys if r not in self.ovl and isv(r) and r not in self.dram), len(keep)))
         D = self.dram
+        if span:
+            mir = self._span_fill(mir, D, self.nsmall + newc[span])
+        spanh = self.span_held if span and self.span >= 2 else ()   # --span 2: a gather from the span is a page for any destination
 
         def blk(ins, nxt):
             """A block with its DRAM-homed loads made ldr pages: (new block, instructions consumed)."""
@@ -2189,7 +2274,7 @@ class Machine:
             split = (dst is not None and u[0] in ("lds", "fill") and
                      (len(ins[1]) == 1 or (len(ins[1]) == 2 and ins[1][0][2] == "__anchor__")))
             src = u[2] if u[0] == "lds" else None
-            if split and (dst in D or src in D):
+            if split and (dst in D or src in D or src in spanh):
                 if nxt is not None and nxt[0] == "gather" and nxt[1] == dst and nxt[2] in self.base:
                     # the split gather's two halves become one page the reader builds
                     return ("blk", [("ldr", 0, src, u[3] if src is not None else 0, nxt[2], nxt[3])], ins[2]), 2
@@ -2220,6 +2305,58 @@ class Machine:
             out.append(ins)
             i += 1
         self.mir = out
+
+    # ---- span (--span 1): a split gather whose window and whole residue read ONE DRAM-homed vector reads an L1 copy
+    # of that vector instead. The copy lives in the span, one reserved L1 slot of T tiles; an ordinary copy block in
+    # front of the gather fills it through the reader ring (T pages, what the gather's window read cost) unless the
+    # span already holds that vector. The gather is then the single-L1-vector case the dense tables serve
+    # (--tabdense), with no window read and no gather-cache miss. The span is dropped at every label and jump and by
+    # a store to its vector. A part's halo entries still read the halo page; gathers that mix vectors, in-place
+    # constants (narrow would start to round them) and gathers with no window keep today's path. Values are
+    # unchanged: the same lanes are read, from a copy. With --span 1 a served gather whose destination is in L1 stays
+    # a block and a gather op (two syncs); --span 2 makes it one reader page as well, like the DRAM destinations.
+    def _span_fill(self, mir, D, base):
+        out, cur, held, nfill, npage, skipped = [], None, None, 0, 0, Counter()
+        self.span_held = set()
+        i = 0
+        while i < len(mir):
+            ins = mir[i]
+            nxt = mir[i + 1] if i + 1 < len(mir) else None
+            if ins[0] in ("label", "jump", "jumpif"):
+                cur = None
+            src = None
+            if ins[0] == "blk" and nxt is not None and nxt[0] == "gather" and len(ins[2]) == 1 and \
+                    nxt[1] == ins[2][0][1] and nxt[2] in self.base:
+                u = ins[1][-1]
+                if u[0] == "lds" and u[2] in D and (len(ins[1]) == 1 or (len(ins[1]) == 2 and ins[1][0][2] == "__anchor__")):
+                    why = "constant" if u[2] in self.alias else "parts" if any(x != u[2] for x, h in nxt[3]) \
+                        else "self" if nxt[1] == u[2] else None
+                    if why is None:
+                        src = u[2]
+                    else:
+                        skipped[why] += 1
+            if src is not None:
+                if cur != src:
+                    held = self._tmp(self.space[src])
+                    if src in self.ext:
+                        self.ext[held] = self.ext[src]
+                    self.phys[held] = base
+                    self.span_held.add(held)
+                    out.append(("blk", [("ld", 0, src)], [(0, held)]))
+                    cur, nfill = src, nfill + 1
+                out.append(("blk", list(ins[1][:-1]) + [("lds", u[1], held, u[3])], ins[2]))
+                out.append(("gather", nxt[1], nxt[2], [(held, h) for _, h in nxt[3]]))
+                npage += 1
+                i += 2
+                continue
+            if cur is not None and cur in _mir_defs(ins):
+                cur = None
+            out.append(ins)
+            i += 1
+        self.span_stat = (nfill, npage, dict(skipped))
+        self._log("span: %d gathers read the L1 span at tile %d, %d fills (static), kept on today's path: %s" % (
+            npage, base, nfill, ", ".join("%s %d" % kv for kv in sorted(skipped.items())) or "none"))
+        return out
 
     def _overlay(self, regs, T, isv):
         """wplace 2: home a vector register (heaviest first) on consecutive one-tile slots that no register live with it
@@ -2712,6 +2849,16 @@ def _rename_uses(ins, ren):
     return ins
 
 
+def _rename_regs(ins, ren):
+    """ins with the registers of ren replaced as plain block loads and as block results (the members of a run too)."""
+    if ins[0] == "seg":
+        return ("seg", [_rename_regs(x, ren) for x in ins[1]])
+    if ins[0] != "blk":
+        return ins
+    f = lambda r: ren.get(r, r)
+    return ("blk", [(u[0], u[1], f(u[2])) + tuple(u[3:]) if u[0] == "ld" else u for u in ins[1]], [(k, f(r)) for k, r in ins[2]])
+
+
 def _adjacent_reduces(code, window=64):
     """Trace-level half of the pairing: reduce A ... reduce B with only ew/copy between and B not depending on A
     becomes (the between that does not need A) A B (the between that does). Lowering then puts nothing but B's partial
@@ -2752,6 +2899,28 @@ def _adjacent_reduces(code, window=64):
         out += ind + [a, hit] + dins
         i = k + 1
     return out
+
+
+def _liveness(mir):
+    """Per MIR instruction: (uses, defs), the registers live into it and the registers live out of it."""
+    n = len(mir)
+    succ = _mir_succ(mir)
+    ud = [(_mir_uses(i), _mir_defs(i)) for i in mir]
+    live_in = [set() for _ in range(n)]
+    live_out = [set() for _ in range(n)]
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n - 1, -1, -1):
+            o = set()
+            for s in succ[i]:
+                o |= live_in[s]
+            u, d = ud[i]
+            inn = (o - set(d)) | set(u)
+            if o != live_out[i] or inn != live_in[i]:
+                live_out[i], live_in[i] = o, inn
+                changed = True
+    return ud, live_in, live_out
 
 
 def _mir_succ(mir):

@@ -37,7 +37,7 @@ development, but those runs are not part of this release's results.
 **How big a case can I run?**
 Up to a few tens of thousands of cells per chip stay entirely in SRAM with the default flags. Larger cases stream
 vectors from DRAM (`--tabstream`, see the [tutorial](tutorial.md)). The 8.66 M-cell motorbike runs on two chips. The
-practical limit today is host memory for the lowering (about 220 GB for that case).
+practical limit today is host memory for the lowering (about 90 GB for that case).
 
 **Why does a 2-chip run give slightly different residuals than a 1-chip run?**
 fp32 addition is not associative, and a different partition sums in a different order. Each partition gives the same

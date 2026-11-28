@@ -232,7 +232,7 @@ def install_machine(C, sub, own_of, state):
     P0, k = sub["cores"], sub["chip"]
     lo, hi = k * P0, (k + 1) * P0
     g = sub["g"]
-    mach.rcb = lambda C_, P_, chips=None: sub["owner"]
+    mach.rcb = lambda C_, P_, chips=None, faces=None: sub["owner"]
     mach.gmax = lambda x: C("max", x)
     lay0, fin0, nh0 = Layout.__init__, Maps.finish, Maps.needs_halo
 
@@ -656,6 +656,8 @@ def run_mesh_worker(sub_path, argv, conn, out, replay=None, ckpt=None):
             prog = m.prog
             L0 = max(len(t) for t in tab)
             info = dict(info, cells_per_chip=C("cat", [int(own_cell.sum())]))
+            if "loc" in info:      # this chip's cores -> the mesh's
+                info["loc"] = [sum(x) for x in zip(*C("cat", [tuple(info["loc"])]))]
             spaces = {sp.name: sp for sp in [prog.cells] + list(prog.pspace.values())}
             const_state = {}
             for name, cr in prog.state:          # state registers that stayed constants: assembled over the chips
@@ -681,7 +683,12 @@ def run_mesh_worker(sub_path, argv, conn, out, replay=None, ckpt=None):
             img = cls(shared, {k: cls.chip_of(E, tab, slice(0, P), L0, shared, members)})
             dig = img.digest(k)
             state["digest"] = dig
-            img.write = lambda d: (img.write_chip(d, k), k == 0 and img.write_shared(d))
+            def write(d, floor_gb=0):       # this chip's files; the floor is checked with this chip's exact size
+                image.check_free(d, sum(image._disk_bytes(v) for v in img.chip(k).values()), floor_gb)
+                img.write_chip(d, k)
+                if k == 0:
+                    img.write_shared(d)
+            img.write = write
             img.digest = lambda q: dig if q == k else None
             return img
         image.Image.from_lowering = classmethod(from_lowering)

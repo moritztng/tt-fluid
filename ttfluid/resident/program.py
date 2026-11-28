@@ -302,6 +302,18 @@ def build(solver, max_outer=2000, amg_owner=None, amg_kind="pairwise", amg_smoot
     IT.set(it)
     tr.out("outer", IT.c[()])
     outs.append("outer")
+    # A diverged run ends here, at the first outer iteration with a residual that is not finite, and its history row
+    # says which (run_mesh prints DIVERGED and exits 4). Without this exit no test of any loop is ever true again (a
+    # comparison with NaN is false), so every solve of every later iteration runs to its maxIter: a run that looks
+    # hung and costs the whole iteration budget at five times the healthy pace. x - x is 0 for a finite x and NaN for
+    # an infinite or NaN one, and "!= 0" reads NaN as true on the SFPU, in BRISC soft-float and in the emulators,
+    # where an ordered comparison with NaN does not agree between them. A finite run never takes this branch.
+    bad = None
+    for k, v in res.items():
+        nf = np.not_equal(v - v, 0.0)
+        bad = nf if bad is None else bad + nf
+    if bad is not None:
+        tr.jumpif(bad.c[()], END)
     rc = solver.case.residual_control()
     from ttfluid.solver.simple import _lookup
     conv = None

@@ -73,7 +73,8 @@ Each run appends one JSON row to `ttfluid_runs.jsonl` (`--out` to change). Usefu
 Other options:
 
 - `--chips 2` uses both chips of a p300 board (a 1x2 mesh). `--chips 4`, `8`, `16`, `32` map to 2x2, 2x4, 4x4 and 4x8
-  meshes for multi-card systems and Galaxies.
+  meshes for multi-card systems and Galaxies. On a Blackhole Galaxy `--chips 2` and `4` take a block of
+  neighbouring chips ([architecture.md](architecture.md#chips-boards-and-meshes)).
 - `--arch wh` for Wormhole.
 - `--no-check` skips the emulator (for large cases the emulator is slow).
 - Everything after `--` goes to the underlying runner, `python -m ttfluid.device.run_mesh --help`.
@@ -97,5 +98,8 @@ the [tutorial](tutorial.md).
   build of torch first (as above), or pip fetches the much larger CUDA build.
 - **The run exits with status 3 and `abort.cores` > 0**: some cores gave up on a bounded wait, and the program ended
   without hanging the chip. Reset the card (`tt-smi -r`) and rerun. If it repeats, open an issue with the log.
+- **The run prints `DIVERGED` and exits with status 4**: a residual became NaN or infinite. The run stops in that
+  iteration and saves its state, and the line names the iteration and the fields. The case or its start state is the
+  place to look; [accuracy](accuracy.md#a-known-behaviour-of-the-case) describes the one way we have seen it happen.
 - **Unsupported boundary condition**: the run stops while reading the case. Open an issue with the patch type; most
   simple types are a few lines in `ttfluid/solver/fields.py`.

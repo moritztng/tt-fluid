@@ -81,6 +81,23 @@ void kernel_main() {
             const uint32_t* xs = reinterpret_cast<const uint32_t*>(sw[T_JOB + 4 * j + 1]);
             const uint32_t n = sw[T_JOB + 4 * j + 2];
             uint32_t* out = reinterpret_cast<uint32_t*>(sw[T_JOB + 4 * j + 3]);
+#ifdef CFD_DENSE
+            if (n >> 31) {   // lanes of a dense gather tile (vm_ncrisc.cpp N_GATHER): out[e] = src[ix[e]]
+                const uint16_t* ix = reinterpret_cast<const uint16_t*>(xs);
+                const uint32_t nd = n & 0x7fffffffu;
+                uint32_t e = 0;
+                for (; e + 8 <= nd; e += 8) {
+                    const uint32_t i0 = ix[e], i1 = ix[e + 1], i2 = ix[e + 2], i3 = ix[e + 3];
+                    const uint32_t i4 = ix[e + 4], i5 = ix[e + 5], i6 = ix[e + 6], i7 = ix[e + 7];
+                    const uint32_t v0 = src[i0], v1 = src[i1], v2 = src[i2], v3 = src[i3];
+                    const uint32_t v4 = src[i4], v5 = src[i5], v6 = src[i6], v7 = src[i7];
+                    out[e] = v0, out[e + 1] = v1, out[e + 2] = v2, out[e + 3] = v3;
+                    out[e + 4] = v4, out[e + 5] = v5, out[e + 6] = v6, out[e + 7] = v7;
+                }
+                for (; e < nd; ++e) out[e] = src[ix[e]];
+                continue;
+            }
+#endif
             uint32_t e = 0;
             for (; e + 4 <= n; e += 4) {
                 const uint32_t x0 = xs[e], x1 = xs[e + 1], x2 = xs[e + 2], x3 = xs[e + 3];
@@ -120,8 +137,8 @@ void kernel_main() {
     // state published at that poll: loads to hdr 700 + 2 (16 unpack state + reader class), acquires to 960 + 2 pack
     // state, own work to 976, the after-drains to 978 (load) and 952 (acquire), the last poll of each drain kind to
     // 980 + 2 kind, of the load's poll to 986, of the acquire's to 954 (two words each: low, high); counts at 988..990. Nothing from 992 on: BRISC stages its history row there (16 words)
-#define USTATE(s) UNPACK((hw[300] = (s)))
-#define PSTATE(s) PACK((hw[301] = (s)))
+#define USTATE(s) UNPACK((hw[304] = (s)))
+#define PSTATE(s) PACK((hw[305] = (s)))
 #ifdef TRISC_MATH
     for (uint32_t i = 700; i < 992; ++i) hw[i] = 0;
     auto wadd = [&](uint32_t i, uint32_t dt) __attribute__((noinline)) {   // out of line, as the three below: one copy each, the kernel config buffer is 69 KB
@@ -130,7 +147,7 @@ void kernel_main() {
         if (nl < lo) hw[i + 1] = hw[i + 1] + 1;
     };
     auto ncls = [&]() -> uint32_t {   // the reader's class: the part it is in, else its op (32 + op)
-        const uint32_t q = hw[302];
+        const uint32_t q = hw[306];
         switch (q) {
             case 10: return 9;        // STREAM waits for a free cb_in slot
             case 11: return 8;        // STREAM's DRAM read barrier
@@ -171,7 +188,7 @@ void kernel_main() {
         ckernel::math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::DestReg>(dst);
         uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
         while (ckernel::semaphore_read(ckernel::semaphore::UNPACK_TO_DEST) == 0) {
-            const uint32_t u = hw[300] & 7;   // at BRISC's token (3) the class is the writer's op (1 + op, word 956; 13..15 = GATHER, SCAL, PH), else the reader's
+            const uint32_t u = hw[304] & 7;   // at BRISC's token (3) the class is the writer's op (1 + op, word 956; 13..15 = GATHER, SCAL, PH), else the reader's
             const uint32_t qb = hw[956];
             const uint32_t i = 700 + 2 * (16 * u + (u == 3 ? (qb <= 12 ? qb : qb == 16 ? 13 : qb == 17 ? 14 : 15) : ncls()));
             const uint32_t t = static_cast<uint32_t>(ckernel::read_wall_clock());
@@ -192,7 +209,7 @@ void kernel_main() {
         mdrain(2);
         uint32_t tp = static_cast<uint32_t>(ckernel::read_wall_clock());
         while (ckernel::semaphore_read(ckernel::semaphore::MATH_PACK) >= mpmax) {
-            const uint32_t i = 960 + 2 * (hw[301] & 7);
+            const uint32_t i = 960 + 2 * (hw[305] & 7);
             const uint32_t t = static_cast<uint32_t>(ckernel::read_wall_clock());
             wadd(i, t - tp);
             tp = t;

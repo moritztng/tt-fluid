@@ -22,8 +22,8 @@ $/h    = capex / (3 x 8760 h)  +  wall kW x PUE 1.3 x $0.15 per kWh
 $/case = batch wall time x $/h / 3600 / cases in the batch
 ```
 
-A batch fills the box with independent cases: one case per GPU on an 8-GPU server, one case per p300c board (2 chips)
-on a QuietBox 2. The batch wall time is that of the slowest member, so the box is charged for every second any part of
+A batch fills the box with independent cases: one case per p300c board (2 chips) on a QuietBox 2; on an 8-GPU server
+one case per GPU or, packed under NVIDIA MPS, up to eight per GPU ("Packed GPUs" below). The batch wall time is that of the slowest member, so the box is charged for every second any part of
 it is busy.
 
 | | QuietBox 2 | 8x H100 SXM | 8x B200 |
@@ -40,6 +40,31 @@ it is busy.
 
 The B200 row is derived. One case ran on one B200; the 8-GPU batch is assumed to take the same time, which flatters
 the B200 (the measured H100 batch of 8 took 4 % longer than its fastest member).
+
+### Packed GPUs
+
+One case uses 6 GiB of an H100's 80 and keeps the GPU 53 % busy, so one case per GPU is not the GPU at its best.
+Under NVIDIA MPS several cases share a GPU. One H100 SXM was measured with 2, 4 and 8 cases at once
+(`bench/nvidia/pack_plan.sh`, raw data in `results/nvidia/h100-packed/`, one line per cell in `cells.tsv`), same case,
+same precision mode, every case passing the drag check. The server is priced as eight such GPUs:
+
+| cases per GPU | 2 | 4 | 8 | 8, Richardson smoother |
+|---|---|---|---|---|
+| batch wall, one GPU | 891.3 s | 1,331.6 s | 2,122.3 s | 2,062.2 s |
+| busy board power per GPU | 295.6 W | 356.5 W | 409.5 W | 403.3 W |
+| wall kW, 8 GPUs | 3.72 | 4.23 | 4.69 | 4.63 |
+| $/h | 10.207 | 10.308 | 10.396 | 10.386 |
+| cases in the batch | 16 | 32 | 64 | 64 |
+| $/case | 0.1579 | 0.1192 | 0.0958 | **0.0930** |
+| QuietBox 2 advantage per $ | 1.37x | 1.03x | 0.83x | **0.81x** |
+
+The last column is the GPU at its best so far: the eight cases use the Richardson smoother in the pressure solver
+(`bench/nvidia/fvSolution.spuma.mbs.richardson`), the setting the SPUMA paper reports fastest on a GPU. At $0.0930 per
+case the packed H100 server is 1.24x cheaper than the QuietBox 2. These rows are derived: a whole 8-GPU server with
+eight cases per GPU has not been measured. A cell of twelve cases per GPU (73 GiB of the 80) ran 300 iterations only
+and is not priced. Two things the packed number does not show: a packed batch returns its first result later
+(2,122 s for eight cases against 681 s for one case alone on that GPU), and each packed case holds one host core, 64
+for the server.
 
 ## A fair baseline
 
@@ -58,9 +83,9 @@ OpenFOAM we know of. The rules we held ourselves to:
   (`bench/nvidia/boundfix/boundFix.C`, loaded with `LD_PRELOAD`) rather than report a failed GPU run.
 - **Cheapest documented price.** NVIDIA gets the lowest server listing we could document. Tenstorrent gets its own
   store price, which a buyer would negotiate down, and its full power rating.
-- **One case per GPU.** The case fits easily in one GPU's memory, and splitting one case over several GPUs costs
-  efficiency. Packing two cases on one GPU could raise GPU throughput; we did not measure it, and a bound derived from
-  GPU utilisation would leave the QuietBox 2 ahead at about 1.35x.
+- **Cases per GPU: packed until the GPU is full.** One case per GPU leaves an H100 half idle, so the comparison also
+  prices 2, 4 and 8 cases per GPU under NVIDIA MPS ("Packed GPUs" above). The packed server, not the one-case row, is
+  the baseline the QuietBox 2 has to beat.
 
 Build and run scripts: `bench/nvidia/spuma_build.sh`, `spdp_build.sh`, `spuma_pack.sh`, `spuma_min.sh`,
 `spuma_run.sh`, `boundfix.sh`.
@@ -76,8 +101,9 @@ Build and run scripts: `bench/nvidia/spuma_build.sh`, `spdp_build.sh`, `spuma_pa
 
 ## What the number is not
 
-- It is not a speed record. One H100 finishes a case in about 750 s; one p300c board takes about 1300 s. The advantage
-  comes from the price of the box.
+- It is not a speed record. One H100 finishes a case in about 750 s; one p300c board takes about 1300 s. Per dollar
+  the QuietBox 2 is ahead of a GPU server that runs one case per GPU, because of the price of the box, and behind a
+  packed one.
 - It is one case. HPC_motorbike Small is a realistic snappyHexMesh external-aerodynamics mesh, but other meshes and models will land
   elsewhere.
 - Larger Tenstorrent systems (the 32-chip Galaxy) and the 65 M-cell occDrivAer car case are on the roadmap. We do not
