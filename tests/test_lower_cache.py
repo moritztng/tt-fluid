@@ -39,6 +39,9 @@ def test_cached_lowering_is_byte_equal(tmp_path):
     plain = lower(tmp_path / "plain_pseg", "--pseg", 3)[0]
     assert plain != cold
     assert warm == plain
+    warm3, out = lower(tmp_path / "warm3", "--cache", cache, "--lsplit", 2, "--cse", 2, "--tabdense", 530, "--span", 2)
+    assert "cache: trace read" in out
+    assert warm3 == lower(tmp_path / "plain_s3", "--lsplit", 2, "--cse", 2, "--tabdense", 530, "--span", 2)[0]
 
 
 def test_key_missing_an_input_is_caught(tmp_path):

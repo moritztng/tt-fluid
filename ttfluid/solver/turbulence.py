@@ -24,6 +24,7 @@ from .ops import FaceOps
 from .fields import VolField, FixedValue
 
 SMALL = 1e-15
+SMALL_F32 = 1e-6    # floatScalarSMALL: what SMALL is in an OpenFOAM single-precision build
 GREAT = 1e15
 ROOTVSMALL = 1e-150
 
@@ -41,6 +42,24 @@ def _vdot(a, T):
 def _entry_scalar(entry, key, default):
     v = entry.get(key)
     return default if v is None else float(v[0] if isinstance(v, list) else v)
+
+
+def _ras_dict(case_dir):
+    """The RAS sub-dictionary of constant/turbulenceProperties (or momentumTransport); {} when there is none."""
+    from . import foamio
+    for name in ("turbulenceProperties", "momentumTransport"):
+        f = Path(case_dir) / "constant" / name
+        if f.exists():
+            d = foamio.read_dict(f)
+            ras = d.get("RAS", d)
+            return ras if isinstance(ras, dict) else {}
+    return {}
+
+
+def _floor(ras, key, default):
+    """A RASModel floor (kMin, omegaMin): the dictionary's value when it has one, plain or dimensioned."""
+    v = ras.get(key)
+    return default if v is None else float(v[-1] if isinstance(v, list) else v)
 
 
 # ---- boundary conditions owned by the turbulence model ------------------------------------------------------------
@@ -539,7 +558,7 @@ class KOmegaSST:
     beta1, beta2 = 0.075, 0.0828
     betaStar = 0.09
     a1, b1, c1 = 0.31, 1.0, 10.0
-    kMin = omegaMin = SMALL
+    kMin = omegaMin = SMALL   # RASModel defaults in double precision; __init__ sets the instance's
     # wall-function coefficients (wallFunctionCoefficients defaults)
     Cmu, kappa, E = 0.09, 0.41, 9.8
     wf_beta1 = 0.075   # omegaWallFunction beta1
@@ -556,6 +575,16 @@ class KOmegaSST:
         self.nut = VolField.read(mesh, d / "nut", registry=REGISTRY)
         self.k.name, self.omega.name, self.nut.name = "k", "omega", "nut"
         self.relax = relax or {"k": 0.9, "omega": 0.9}
+        # RASModel.C: kMin and omegaMin are SMALL unless the RAS dictionary sets them, and SMALL follows the scalar
+        # type (1e-15 double, 1e-6 float). omega's floor has to follow it: the step divides by omega twice ((F1 - 1)
+        # CD / omega with CD = 2 alphaOmega2 (grad k . grad omega) / omega), so a cell that bound() leaves at the
+        # floor comes back near 1 / floor one iteration later. From 1e-15 that is 1e18, the residual of the next
+        # omega solve squares to 1e52 and the first Krylov dot product leaves fp32 (3.4e38): inf, then NaN in every
+        # field. k is in no denominator of the step, and a healthy run carries k below 1e-6, so kMin keeps the
+        # double-precision value in both precisions.
+        ras = _ras_dict(case_dir)
+        self.kMin = _floor(ras, "kMin", SMALL)
+        self.omegaMin = _floor(ras, "omegaMin", SMALL if np.dtype(self.ops.dtype) == np.float64 else SMALL_F32)
         self.wd = wall_distance or WallDistance(mesh)
         self.y, self.y_b = self.wd.y, self.wd.y_b
 

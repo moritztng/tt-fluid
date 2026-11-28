@@ -97,6 +97,16 @@ class Cache:
         omit: input names left out of every key. Only for the test that proves the gate can fail."""
         self.root, self.floor, self.log, self.omit = Path(root).expanduser(), floor_gb * 1e9, log, set(omit)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._mmaps = []
+
+    def evict(self):
+        """Advise the kernel to drop resident pages of every mmap'd cache buffer (data stays intact in buffers.bin)."""
+        for mm in self._mmaps:
+            if not mm.closed and len(mm):
+                try:
+                    mm.madvise(mmap.MADV_DONTNEED, 0, len(mm))
+                except (OSError, ValueError):
+                    pass
 
     def key(self, stage, inputs):
         inputs = {k: v for k, v in dict(inputs, **process_inputs()).items() if k not in self.omit}
@@ -152,11 +162,12 @@ class Cache:
         (d / "index.json").write_text(json.dumps(index))
         return off
 
-    @staticmethod
-    def _load(d):
+    def _load(self, d):
         index = json.loads((d / "index.json").read_text())
         with open(d / "buffers.bin", "rb") as f:
-            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY) if index and index[-1][0] + index[-1][1] else None
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) if index and index[-1][0] + index[-1][1] else None
+        if mm is not None:
+            self._mmaps.append(mm)
         view = memoryview(mm) if mm is not None else memoryview(b"")
         with open(d / "value.pkl", "rb") as f:
             return pickle.load(f, buffers=[view[o:o + n] for o, n in index])

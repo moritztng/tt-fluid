@@ -48,6 +48,11 @@ def norm_factor(A, x, b, Ax):
     return np.abs(Ax - t).sum() + np.abs(b - t).sum() + SMALL
 
 
+def vsmall(dtype):
+    """OpenFOAM's VSMALL for the precision of the arithmetic (SolverPerformance::vsmall_, the singularity test)."""
+    return 1e-300 if np.dtype(dtype) == np.float64 else 1e-37
+
+
 def _converged(r, r0, c):
     return r < c.tolerance or (c.relTol > 0 and r < c.relTol * r0)
 
@@ -96,7 +101,7 @@ def pbicgstab(A, x, b, c):
     while it < c.maxIter:
         rho_old = rho
         rho = r0 @ r
-        if abs(rho) < 1e-300:
+        if abs(rho) < vsmall(r.dtype):
             break
         if it == 0:
             p = r.copy()
@@ -239,7 +244,7 @@ def csr_pbicgstab(A, x, b, c, iter_scale=100):
     while it < maxIter:
         rho_old = rho
         rho = r0 @ r
-        if abs(rho) < 1e-300:
+        if abs(rho) < vsmall(r.dtype):
             break
         if it == 0:
             p = r.copy()

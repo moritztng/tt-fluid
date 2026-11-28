@@ -17,6 +17,7 @@ space the global ids of the elements it owns with their (core, lane), so results
 import hashlib
 import io
 import json
+import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -33,6 +34,7 @@ class Image:
     def __init__(self, shared, chips):
         self.shared = shared          # name -> array or JSON-able object
         self._chips = chips           # k -> dict, or k -> path (lazy)
+        self._members = {}            # (k, space) -> members(k, space)
         self.s = shared["scalars"]
 
     # ---- from a global lowering --------------------------------------------------------------------------------
@@ -80,15 +82,17 @@ class Image:
                     const_state=const_state)
 
     @staticmethod
-    def chip_of(E, tab, rows, L0, shared, members):
+    def chip_of(E, tab, rows, L0, shared, members, arrays=None):
         """One chip's arrays: E's rows `rows` (a slice over E's cores), tab its rewritten table rows (lists, indexed
-        like E's), members(space) -> (global ids, core on the chip, lane) of the elements the chip owns."""
+        like E's), members(space) -> (global ids, core on the chip, lane) of the elements the chip owns.
+        `arrays`, when given, supplies (arena, home, consts) directly instead of slicing E."""
         TBP = shared["scalars"]["TBP"]
         t = np.zeros((rows.stop - rows.start, L0), np.uint32)
         for i, row in enumerate(tab[rows]):
             t[i, :len(row)] = row
-        ch = dict(arena=np.ascontiguousarray(E.arena[rows]), home=np.ascontiguousarray(E.home[rows]),
-                  consts=np.ascontiguousarray(E.consts[rows]), tab=t,
+        A, Hm, C = (E.arena[rows], E.home[rows], E.consts[rows]) if arrays is None else arrays
+        ch = dict(arena=np.ascontiguousarray(A), home=np.ascontiguousarray(Hm),
+                  consts=np.ascontiguousarray(C), tab=t,
                   tab_halo=np.asarray(E.tab_halo[rows], np.uint32))
         if E.tab_stream:
             blob = np.zeros((rows.stop - rows.start, TBP * LANES), np.uint32)
@@ -100,6 +104,38 @@ class Image:
             ch["core/" + name] = np.asarray(core, np.int32)
             ch["lane/" + name] = np.asarray(lane, np.int32)
         return ch
+
+    @staticmethod
+    def used_chip(ch):
+        """Non-zero 4-KB blocks of each array in one chip's dict, scanned in parallel across arrays."""
+        items = list(ch.items())
+        return dict(zip((n for n, _ in items), _READERS.map(lambda kv: _used_pages(kv[1]), items)))
+
+    @staticmethod
+    def write_chip_arrays(d, k, ch, used_k=None):
+        """Write one chip's arrays as sparse .npy files in parallel across arrays."""
+        cd = Path(d) / f"chip{k}"
+        cd.mkdir(parents=True, exist_ok=True)
+
+        def _one(kv):
+            name, arr = kv
+            f = cd / (name.replace("/", "@") + ".npy")
+            f.unlink(missing_ok=True)   # never truncate in place: identical arrays are hardlinked across images
+            _save_sparse(f, arr, used_k and used_k[name])
+
+        list(_READERS.map(_one, list(ch.items())))
+
+    @staticmethod
+    def digest_chip(shared, ch):
+        h = hashlib.sha256()
+        for name in ("c", "b", "n"):
+            h.update(name.encode() + np.ascontiguousarray(shared[name]).tobytes())
+        h.update(json.dumps([shared["scalars"], shared["gtab"], shared["out_names"]], sort_keys=True).encode())
+        for name in sorted(ch):
+            a = np.ascontiguousarray(ch[name])
+            h.update(name.encode() + str(a.dtype).encode() + str(a.shape).encode())
+            h.update(a.reshape(-1).view(np.uint8))   # the array's bytes without the copy tobytes() makes (home is 8 GB a chip on Small)
+        return h.hexdigest()
 
     def write_shared(self, d):
         d = Path(d)
@@ -154,59 +190,64 @@ class Image:
 
     # ---- the gate ------------------------------------------------------------------------------------------------
     def digest(self, k):
-        h = hashlib.sha256()
-        for name in ("c", "b", "n"):
-            h.update(name.encode() + np.ascontiguousarray(self.shared[name]).tobytes())
-        h.update(json.dumps([self.s, self.shared["gtab"], self.shared["out_names"]], sort_keys=True).encode())
-        ch = self.chip(k)
-        for name in sorted(ch):
-            a = np.ascontiguousarray(ch[name])
-            h.update(name.encode() + str(a.dtype).encode() + str(a.shape).encode())
-            h.update(a.reshape(-1).view(np.uint8))   # the array's bytes without the copy tobytes() makes (home is 8 GB a chip on Small)
-        return h.hexdigest()
+        return Image.digest_chip(self.shared, self.chip(k))
 
     # ---- results, chip by chip ------------------------------------------------------------------------------------
     def state(self, out_rows, home_rows):
         """out_rows(k) -> chip k's arena (P, ntiles, LANES) fp32; home_rows(k) -> its DRAM homes (P, hpages, LANES).
-        Returns name -> global array, as Encoded.state_from_arena."""
-        P, K = self.s["P"], self.s["K"]
-        sp_n = self.shared["spaces"]
+        Returns name -> global array, as Encoded.state_from_arena. Each register is read front to back on its own
+        thread, as put_state writes it."""
+        from ttfluid.resident.machine import DBASE
         out = {}
-        regs_all = [(name, shape, regs) for name, shape, regs in self.shared["state"]]
-        glob = {}
-        for name, shape, regs in regs_all:
+        for name, shape, regs in self.shared["state"]:
+            out[name] = np.zeros((self.shared["spaces"][regs[0][0]], len(regs)), np.float32)
             for i, (spn, t, n) in enumerate(regs):
                 if t is None:
-                    glob[(name, i)] = np.asarray(self.shared["const_state"][f"{name}/{i}"], np.float32)
-                else:
-                    glob[(name, i)] = np.zeros(sp_n[spn], np.float32)
-        for k in range(K):
-            ch = self.chip(k)
+                    out[name][:, i] = self.shared["const_state"][f"{name}/{i}"]
+
+        def get(col, ids, X, idx):
+            col[ids] = X[idx]
+        for k in range(self.s["K"]):
             A, H = out_rows(k), home_rows(k)
-            for name, shape, regs in regs_all:
+            jobs = []
+            for name, shape, regs in self.shared["state"]:
                 for i, (spn, t, n) in enumerate(regs):
-                    if t is None:
-                        continue
-                    from ttfluid.resident.machine import DBASE
-                    X, tt = (H, t - DBASE) if t >= DBASE else (A, t)
-                    flat = X[:, tt:tt + n].reshape(P, -1)
-                    ids = ch["ids/" + spn]
-                    glob[(name, i)][ids] = flat[ch["core/" + spn], ch["lane/" + spn]]
-        for name, shape, regs in regs_all:
-            arrs = [glob[(name, i)] for i in range(len(regs))]
-            out[name] = np.stack(arrs, -1).reshape(arrs[0].shape + tuple(shape)) if shape else arrs[0]
-        return out
+                    if t is not None:
+                        X, tt = (H, t - DBASE) if t >= DBASE else (A, t)
+                        core, tile, lane, ids = self.members(k, spn)
+                        jobs.append(_READERS.submit(get, out[name][:, i], ids, X, (core, tt + tile, lane)))
+            for j in jobs:
+                j.result()
+        return {name: out[name].reshape((-1,) + tuple(shape)) if shape else out[name][:, 0]
+                for name, shape, regs in self.shared["state"]}
+
+    def members(self, k, spn):
+        """Chip k's elements of space spn in the order they lie on the chip: (core, tile, lane in the tile, global id),
+        so a register's values are written front to back (in global-id order every write lands on another page)."""
+        if (k, spn) not in self._members:
+            ch = self.chip(k)
+            core, lane, ids = (np.asarray(ch[f"{a}/{spn}"]) for a in ("core", "lane", "ids"))
+            o = np.argsort(core.astype(np.int64) << 32 | lane, kind="stable")
+            self._members[k, spn] = core[o], lane[o] // LANES, lane[o] % LANES, ids[o]
+        return self._members[k, spn]
 
     def put_state(self, k, arena, home, state):
         """The inverse of state() for chip k: write name -> global array (state()'s layout) into chip k's arena
         (P, ntiles, LANES) and DRAM homes (P, hpages, LANES), fp32 views, in place, so the next launch starts from it
         (a restart). Either array may be None to write only the other. A register the lowering kept as a constant
-        must already hold the value: a state that changes one cannot be loaded into these images."""
+        must already hold the value: a state that changes one cannot be loaded into these images. The components of
+        a name are gathered together, one row per element, and each register is written on its own thread (numpy
+        indexing releases the GIL): Small k2 lays 122 M values over a chip's homes."""
         from ttfluid.resident.machine import DBASE
+
+        def put(X, idx, col):
+            X[idx] = col
+        jobs = []
         for name, shape, regs in self.shared["state"]:
             v = np.asarray(state[name], np.float32)
             v = v.reshape(v.shape[0], -1) if shape else v[:, None]
             assert v.shape[1] == len(regs), (name, v.shape, len(regs))
+            g = None
             for i, (spn, t, n) in enumerate(regs):
                 if t is None:
                     c = np.asarray(self.shared["const_state"][f"{name}/{i}"], np.float32)
@@ -216,9 +257,16 @@ class Image:
                 X, tt = (home, t - DBASE) if t >= DBASE else (arena, t)
                 if X is None:
                     continue
-                ch = self.chip(k)
-                lane = np.asarray(ch["lane/" + spn])
-                X[np.asarray(ch["core/" + spn]), tt + lane // LANES, lane % LANES] = v[np.asarray(ch["ids/" + spn]), i]
+                core, tile, lane, ids = self.members(k, spn)
+                if g is None:
+                    g = v[ids]
+                jobs.append(_READERS.submit(put, X, (core, tt + tile, lane), g[:, i]))
+        for j in jobs:
+            j.result()
+
+
+GAP, CHUNK = 1 << 18, 1 << 26      # read_into: stored ranges closer than GAP are one read; a read is at most CHUNK
+_READERS = ThreadPoolExecutor(int(os.environ.get("CFD_IMG_THREADS", 8)))   # preadv and numpy indexing release the GIL
 
 
 class _ChipFiles(dict):
@@ -233,6 +281,38 @@ class _ChipFiles(dict):
 
     def get(self, name, default=None):
         return self[name] if name in self else default
+
+    def read_into(self, name, out):
+        """Array `name` read into out, a zeroed C-contiguous buffer of its byte size, from the byte ranges the file
+        stores. write_chip left the zero pages as holes and a hole is not read, so its pages of out stay untouched:
+        they take no time and no RAM (Small k2: 5.3 of 27.3 GB is stored). Ranges closer than GAP are read as one,
+        because the zero rows of the constants sit between data every ~60 KB and one read per range is slower than
+        reading the zeros between them."""
+        buf = memoryview(out).cast("B")
+        with open(dict.__getitem__(self, name), "rb") as f:
+            major, _ = np.lib.format.read_magic(f)
+            (np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0)(f)
+            off, fd = f.tell(), f.fileno()
+            end = os.fstat(fd).st_size
+            assert end - off == len(buf), (name, end - off, len(buf))
+            runs, p = [], off
+            while p < end:
+                try:
+                    a = os.lseek(fd, p, os.SEEK_DATA)
+                except OSError:      # ENXIO: a hole to the end of the file
+                    break
+                p = os.lseek(fd, a, os.SEEK_HOLE)
+                if runs and a - runs[-1][1] <= GAP:
+                    runs[-1][1] = p
+                else:
+                    runs.append([a, p])
+
+            def read(lo, hi):
+                while lo < hi:
+                    n = os.preadv(fd, [buf[lo - off:hi - off]], lo)
+                    assert n > 0, (name, lo, hi)
+                    lo += n
+            list(_READERS.map(lambda r: read(*r), [(a, min(a + CHUNK, hi)) for lo, hi in runs for a in range(lo, hi, CHUNK)]))
 
     def values(self):
         return [self[n] for n in self]

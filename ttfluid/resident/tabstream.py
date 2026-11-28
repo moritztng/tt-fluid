@@ -16,10 +16,18 @@ Because each section is sorted by lane, tile t's entries of a section are blob[i
 and the reader can prefetch tile t + 1 of the patched map while it patches tile t (two staging buffers of one
 tile's words; a lane is patched at most once per map, so one tile needs at most 1024 words over all its sections).
 
+Dense maps (stream(dense=), encode.py tab_dense): where nearly every lane of a reader-patched page has a residue entry,
+the local section of the map is stored in destination order instead, one uint16 source word index per lane of the
+tile (512 words a tile): the residue's source where the lane has one, lane + shift (the window's lane) elsewhere.
+The reader then gathers the page in one pass with no window read (vm_ncrisc.cpp gather16: 6.4 cycles a value against
+12.1 for a residue entry); the map's header word 1 carries DENSE. Halo and zero sections are unchanged.
+
 Encoded(m, tab_stream=True) uses it: E.tab becomes the L1 part, E.tab_blob the DRAM part, E.tab_halo the halo
 section's offset in the new L1 table. stream(E) builds the layout from an Encoded program's cursor tables; check(E, S) replays NCRISC's cursor walk on the L1 table and the
 streamed walk on the blob for every core, map and tile and asserts they patch the same lanes from the same sources.
 """
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 
 from .machine import NH
@@ -85,27 +93,77 @@ def _by_src_tile(ent, bounds):
     return ent
 
 
-def stream(E, sort=False):
+DENSE = 1 << 31   # header word 1 of a map (the halo mask): its local section is a dense uint16 index table
+
+
+def dense_index(ent, tm, shift):
+    """The source word index of every lane of tiles [0, tm): the local residue entry's source where the lane has
+    one, lane + shift elsewhere (what the window read; its own lane where that falls outside the 16-bit span of the
+    source: a lane no consumer reads, memu._shifted)."""
+    lane = np.arange(tm * 1024, dtype=np.int64)
+    idx = lane + shift
+    idx = np.where((idx >= 0) & (idx < 1 << 16), idx, lane)
+    e = np.asarray(ent, np.int64)
+    idx[e >> 16] = e & 0xFFFF
+    return idx
+
+
+def bpatch_auto(loc, bpatch_min):
+    """--bpatch auto: (K, local residue entries per patched map tile). K is 4 when the lowering counted at least
+    `bpatch_min` entries per patched (map, tile), else 0. `loc` is stream()'s pair of sums; None when there are no
+    streamed tables or the images were lowered before they recorded it."""
+    lm = loc[0] / max(loc[1], 1) if loc else 0.0
+    return (4 if lm >= bpatch_min else 0), lm
+
+
+def stream(E, sort=False, dense=None, brk=0):
+    """dense: [(map, shift, min local entries a tile)]: twin j is map nm + j, the same entries as its map, stored
+    dense on a core when the local residue entries per tile reach the minimum (encode.py points the pages whose
+    window and residue come from one L1 vector at the twin). brk: the broken arm of the dense gate: on core 0 the
+    first brk pairs of residue lanes of every dense table read each other's source (the state compare must fail)."""
     m = E.m
+    dense = list(dense or [])
+    assert not (dense and _enc.WIDE), "dense tables index 16-bit lanes"
+    ndense = 0
     P, T, nm = len(E.tab), m.T, len(m.maps.tab)      # E's rows: every core, or the cores of Encoded(cores=)
     nparts = [t["nparts"] for t in m.maps.tab]
-    l1, blob, halo_off, staging, loc = [], [], [], 0, []
-    for i in range(P):
+    wide = _enc.WIDE
+    nparts += [nparts[o] for o, _, _ in dense]
+    assert all(nparts[nm + j] == 1 for j in range(len(dense))), "a dense twin has one part"
+
+    def _core(i):
         tab = E.tab[i]
-        L = [nm] + [0] * nm
-        B = []
-        for mid in range(nm):
-            secs, counts = _sections(tab, mid, nparts[mid])
+        L = [len(nparts)] + [0] * len(nparts)
+        B_chunks, b_len = [], 0
+        stg, loc_i, nd_i = 0, [], 0
+        for mid in range(len(nparts)):
+            orig, dsh, dmin = (mid, 0, 0) if mid < nm else dense[mid - nm]
+            secs, counts = _sections(tab, orig, nparts[mid])
             tm = max([int(_lane(k, e.astype(np.int64)).max()) // 1024 + 1 for k, e in secs if len(e)] or [1])
             assert tm <= T and len(L) < 1 << 20
             L[1 + mid] = len(L) | tm << 20
-            base, H = len(B), []
+            base, H = b_len, []
             per_tile = np.zeros(tm, np.int64)
             loc_tile = np.zeros(tm, np.int64)
-            for kind, ent in secs:
+            dn = mid >= nm and len(secs[0][1]) >= dmin * tm
+            for si, (kind, ent) in enumerate(secs):
                 lanes = _lane(kind, ent.astype(np.int64))
                 bounds = np.searchsorted(lanes, np.arange(tm + 1) * 1024)
                 assert bounds[-1] == len(ent)
+                if dn and si == 0:
+                    assert nparts[mid] == 1 and kind == "l" and len(np.unique(lanes)) == len(lanes)
+                    loc_tile += np.diff(bounds)
+                    H += (b_len - base + np.arange(tm) * 512).tolist()
+                    idx = dense_index(ent, tm, dsh)
+                    if brk and i == 0:
+                        ln = lanes[:2 * (min(brk, len(lanes) // 2))]
+                        idx[ln[0::2]], idx[ln[1::2]] = idx[ln[1::2]].copy(), idx[ln[0::2]].copy()
+                    h_arr = np.asarray(_half(idx), np.uint32)
+                    B_chunks.append(h_arr)
+                    b_len += len(h_arr)
+                    per_tile += 512
+                    nd_i += 1
+                    continue
                 if sort and kind == "l":
                     ent = _by_src_tile(ent, bounds)
                 if RUNSTATS is not None and kind == "l" and len(ent):
@@ -117,27 +175,64 @@ def stream(E, sort=False):
                     start = np.r_[True, ~step] | cut
                     ln = np.diff(np.r_[np.flatnonzero(start), len(ent)])
                     RUNSTATS.append(np.bincount(np.minimum(ln, 64), minlength=65))
-                H += (len(B) - base + bounds[:tm]).tolist()
-                B += _cut(kind, ent.astype(np.int64)).tolist()
+                H += (b_len - base + bounds[:tm]).tolist()
+                if len(ent):
+                    B_chunks.append(_cut(kind, ent.astype(np.int64)).astype(np.uint32))
+                    b_len += len(ent)
                 per_tile += np.diff(bounds)
                 if kind == "l":
                     loc_tile += np.diff(bounds)
-            H.append(len(B) - base)
-            assert (H[-1] < 1 << 32 if _enc.WIDE else H[-1] < 1 << 16) and len(counts) <= 32
+            H.append(b_len - base)
+            assert (H[-1] < 1 << 32 if wide else H[-1] < 1 << 16) and len(counts) <= 32
             # section offsets: two uint16 a word, or (WIDE: a map may hold more than 65,536 entries on a core) one a word
-            L += [base, sum(1 << k for k, (_, nh) in enumerate(counts) if nh)] + (H if _enc.WIDE else _half(H))
-            loc.append(loc_tile[loc_tile > 0])
-            staging = max(staging, int(per_tile.max()) if T else 0)
+            L += [base, sum(1 << k for k, (_, nh) in enumerate(counts) if nh) | (DENSE if dn else 0)] + (H if wide else _half(H))
+            if mid < nm:
+                loc_i.append(loc_tile[loc_tile > 0])
+            stg = max(stg, int(per_tile.max()) if T else 0)
         d = _hdir(E, i)    # the halo directory below tab_halo (more than one plan) moves with the plans
-        halo_off.append(len(L) + d)
+        h_off = len(L) + d
         L += tab[int(E.tab_halo[i]) - d:E.tab_len[i]].tolist()   # not the padding up to the longest core's table
-        l1.append(np.array(L, np.uint32))
-        blob.append(np.array(B, np.uint32))
+        B_arr = np.concatenate(B_chunks) if B_chunks else np.zeros(0, np.uint32)
+        return np.array(L, np.uint32), B_arr, h_off, stg, loc_i, nd_i
+
+    if RUNSTATS is None and P > 1:
+        with ThreadPoolExecutor(min(8, P)) as ex:
+            res = list(ex.map(_core, range(P)))
+    else:
+        res = [_core(i) for i in range(P)]
+    l1 = [r[0] for r in res]
+    blob = [r[1] for r in res]
+    halo_off = [r[2] for r in res]
+    staging = max((r[3] for r in res), default=0)
+    loc = [x for r in res for x in r[4]]
+    ndense = sum(r[5] for r in res)
     loc = np.concatenate(loc) if loc else np.zeros(0)
-    # loc_mean: local residue entries per patched (map, tile), mean over cores (run_vm --bpatch auto)
-    return dict(sort=sort, loc_mean=float(loc.mean()) if len(loc) else 0.0, l1=l1, blob=blob, halo_off=halo_off, staging_words=staging, nparts=nparts,
+    # loc: local residue entries and the patched (map, tile)s they sit in, over these cores; run_mesh --bpatch auto
+    # tests their ratio. Two integers, so the chips of a per-chip lowering add up to the global lowering's pair.
+    return dict(sort=sort, dense=dense, ndense=ndense, loc=(int(loc.sum()), len(loc)), l1=l1, blob=blob, halo_off=halo_off, staging_words=staging, nparts=nparts,
                 l1_words=max(len(x) for x in l1), blob_words=max(len(x) for x in blob),
                 today_words=E.tab.shape[1])
+
+
+def gcensus(E):
+    """Static census of the gathered values by path (encode.py gops), one execution of every op (the loop counts are
+    the reader's): {(phase id or None, class): [ops, local entries, of them through a dense table, halo entries]},
+    entries as means over the cores. Says which gathers a dense twin reaches and which it leaves on the entry loops."""
+    S, npt, P = E.tab_stream, E.tab_stream["nparts"], len(E.tab_stream["l1"])
+    cache, out = {}, {}
+    for cls, mid, tw, _, ph in E.gops:
+        if mid not in cache:
+            cnt = [_sections(E.tab_cursor[i], mid, npt[mid])[1] for i in range(P)]
+            cache[mid] = np.array([[sum(nl for nl, _ in c), sum(nh for _, nh in c)] for c in cnt], np.float64)
+        dn = np.zeros(P)
+        if tw is not None:
+            dn = np.array([float(int(L[(int(L[1 + tw]) & 0xfffff) + 1]) >> 31) for L in S["l1"]])
+        r = out.setdefault((ph, cls), [0, 0.0, 0.0, 0.0])
+        r[0] += 1
+        r[1] += cache[mid][:, 0].mean()
+        r[2] += (cache[mid][:, 0] * dn).mean()
+        r[3] += cache[mid][:, 1].mean()
+    return out
 
 
 def _walk_cursor(tab, mid, nparts, T):
@@ -166,8 +261,17 @@ def _walk_stream(L, B, mid, nparts, T):
     else:
         w = np.asarray(L[q + 2:q + 2 + (nh + 1) // 2], np.int64)
         H = base + np.stack([w & 0xFFFF, w >> 16], 1).ravel()[:nh]
+    if int(L[q + 1]) & DENSE:   # 'd': the tile's 512 index words as stored
+        kinds[0] = "d"
     return [[(kind, int(x)) for k, kind in enumerate(kinds) for x in B[H[k * tm + t]:H[k * tm + t + 1]]] if t < tm
             else [] for t in range(T)]
+
+
+def _undense(tile, t, shift):
+    """a dense tile as the reader applies it, checked against the residue walk: (lane, source) of every lane"""
+    w = np.array([x for k, x in tile if k == "d"], np.int64)
+    assert len(w) == 512
+    return np.stack([w & 0xFFFF, w >> 16], 1).ravel()
 
 
 def check(E, S, tab=None):
@@ -175,11 +279,30 @@ def check(E, S, tab=None):
     m = E.m
     tab = E.tab if tab is None else tab
     for i in range(m.P):
+        nm = len(m.maps.tab)
         for mid, nparts in enumerate(S["nparts"]):
-            a = [[(k, _cut(k, x)) for k, x in tile] for tile in _walk_cursor(tab[i], mid, nparts, m.T)]
+            orig = mid if mid < nm else S["dense"][mid - nm][0]    # a twin holds its map's entries
+            a = [[(k, _cut(k, x)) for k, x in tile] for tile in _walk_cursor(tab[i], orig, nparts, m.T)]
             b = _walk_stream(S["l1"][i], S["blob"][i], mid, nparts, m.T)
-            if S.get("sort"):   # same entries per tile, order free
+            if not any(k == "d" for tile in b for k, _ in tile) and S.get("sort"):   # same entries per tile, order free
                 a, b = [sorted(x) for x in a], [sorted(x) for x in b]
+            if any(k == "d" for tile in b for k, _ in tile):
+                # a dense map: every lane's index is its residue source, or the window's lane; the rest as stored
+                sh = S["dense"][mid - nm][1]
+                for t, (ta, tb) in enumerate(zip(a, b)):
+                    if not tb:
+                        assert not ta
+                        continue
+                    idx = _undense(tb, t, sh)
+                    lane = t * 1024 + np.arange(1024)
+                    want = np.where((lane + sh >= 0) & (lane + sh < 1 << 16), lane + sh, lane)
+                    for k, x in ta:
+                        if k == "l":
+                            want[(x >> 16) - t * 1024] = x & 0xFFFF
+                    assert (idx == want).all(), f"core {i} map {mid} tile {t}: dense index differs"
+                    assert sorted(e for e in ta if e[0] != "l") == sorted(e for e in tb if e[0] != "d"), \
+                        f"core {i} map {mid}: streamed walk differs"
+                continue
             assert a == b, f"core {i} map {mid}: streamed walk differs"
         h0, h1 = int(E.tab_halo_cursor[i] if hasattr(E, "tab_halo_cursor") else E.tab_halo[i]), S["halo_off"][i]
         d = _hdir(E, i)

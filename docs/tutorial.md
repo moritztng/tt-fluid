@@ -59,11 +59,12 @@ differs from the one-chip run in the low bits, because fp32 sums are taken in a 
 
 ## Part 2: HPC_motorbike Small on a QuietBox 2
 
-This is the run behind the README's cost table. It needs a host with about 220 GB of RAM for the one-time lowering and a
-QuietBox 2 (or any machine with p300 boards) for the run. Each step below is the step that produced the published
-numbers, and the logs in `results/tenstorrent/quietbox2-p300x4/` hold the exact flags of those runs (the `jsonl` rows
-record every option). Unlike everything else in these docs, Part 2 was not re-run from a clean clone for v0.1.0: it
-needs the big-memory host and several hours. If a step does not work as written, please open an issue.
+This is the largest case in the README's cost table. It needs a host with about 90 GB of RAM for the one-time lowering
+(it peaks at 84 GB) and a QuietBox 2, or any machine with p300 boards, for the run. The steps below are the fastest
+line measured so far. The README's table was made with the v0.1.0 line, and the logs in
+`results/tenstorrent/quietbox2-p300x4/` hold the exact flags of those runs (the `jsonl` rows record every option).
+Part 2 was not re-run from a clean clone: it needs the big-memory host and about an hour. If a step does not work as
+written, please open an issue.
 
 ### 1. Get the case
 
@@ -75,15 +76,16 @@ The case is `incompressible/simpleFoam/HPC_motorbike/Small` of the OpenFOAM HPC 
 ### 2. Lower once, write per-chip images
 
 ```bash
-FLAGS="--arch bh --mesh 1,2 --layout rcb --l1 0 --wplace 2 --gw 1 --nsh 1 --page 16 --nwin 1024 --tabstream \
-  --amg --amg-stack --amg-vec --amg-smoothed 0 --amg-min-core 10 --amg-depth 0 --vcoarse 8 \
-  --lsched --phase --sliced --fuse --cse 1 --hlate 1 --vpre 1 --vpost 1 --strips"
-python -m ttfluid.device.run_mesh case 800 --case motorbike $FLAGS --images img_k2
+FLAGS="--arch bh --mesh 1,2 --layout rcb --wplace 2 --gw 1 --nsh 1 --page 16 --tabstream --lsched --phase --sliced \
+  --fuse --cse 2 --hlate 1 --strips --tsort 1 --l1 1 --l1-bytes 1461760 --lsplit 2 --tabdense 530 --span 2 \
+  --forces motorbike/system/controlDict:forceCoeffsAll"
+PYTHONHASHSEED=0 python -m ttfluid.device.run_mesh case 800 --case motorbike $FLAGS --nwin 8192 --images img_k2
 ```
 
 This traces one SIMPLE iteration of the full case, partitions it over the two chips of one board, schedules and encodes
-it, and writes one image per chip. It runs on the CPU only. It refuses to start if the write would leave the disk with
-less than 200 GB free (`--min-free-gb`).
+it, and writes one image per chip. It runs on the CPU only and takes about half an hour. It refuses to start if the
+write would leave the disk with less than 200 GB free (`--min-free-gb`). `PYTHONHASHSEED=0` fixes the order of the
+reductions, so two lowerings give the same images.
 
 If you lower the same case again with other flags or after a code change, add `--cache DIR` and set `PYTHONHASHSEED`
 to a fixed value. The case read, the traced program and the partition are kept in DIR and read back when nothing they
@@ -95,8 +97,18 @@ disk. `--preflight` runs the lowering up to that point, writes nothing and exits
 `--cache` the sizes a line came to are kept, so a second attempt at a refused line stops in its first seconds, and so
 does a lowering whose peak memory the host no longer has.
 
-The pressure solve is Jacobi-preconditioned CG (`--amg-depth 0` builds no coarse level). On Blackhole that is faster
+The pressure solve is Jacobi-preconditioned CG, the default when `--amg` is not given. On Blackhole that is faster
 than an aggregation V-cycle: it needs about six times as many iterations, but each costs a twentieth.
+
+Four of these options are what makes this line faster than v0.1.0's, and none of them changes a value.
+`--tabdense 530` stores the larger gather maps as dense index tables. `--span 2` gives a gather from a vector that
+lives in DRAM a copy in L1 memory to read. `--lsplit 2` moves a vector out of L1 for the duration of a solver loop
+that needs the room for its own vectors. `--cse 2` computes an interpolation or a gradient of a field once when
+several terms ask for it. With the settings the run chooses itself (step 4), the first 100 iterations take 108 s on
+the device. The line this one replaces (`--l1 2 --lsplit 1`) took 136 s and v0.1.0's (`--l1 1 --gcache 14`) 161 s,
+so this one is 1.26 and 1.49 times faster, and the state after those 100 iterations is bit for bit the same with all
+three. [architecture.md](architecture.md) describes the options, and the raw logs of these legs are in
+`results/tenstorrent/galaxy-blackhole-pair/`.
 
 ### 3. Starting state from potentialFoam
 
@@ -110,13 +122,16 @@ python -m ttfluid.lower.of_state img_k2 motorbike motorbike/0 state0.npz
 export TT_VISIBLE_DEVICES=0,1
 export TT_MESH_GRAPH_DESC_PATH=$(python -c "import ttnn, pathlib; print(pathlib.Path(ttnn.__file__).parent / \
   'tt_metal/fabric/mesh_graph_descriptors/p300_mesh_graph_descriptor.textproto')")
-python -m ttfluid.device.run_mesh case 800 $FLAGS --from-images img_k2 --state-in state0.npz --noemu --runs 1 \
-  --links 0 --rlink 1 --os 1 --tsort 1 --gcache 14 --bgts 5 --tgts 2 --l1 1 \
-  --forces motorbike/system/controlDict:forceCoeffsAll --out motorbike.jsonl
+python -m ttfluid.device.run_mesh case 800 --case motorbike $FLAGS --from-images img_k2 --state-in state0.npz \
+  --noemu --runs 1 --nwin 1024 --links 0 --rlink 1 --os 1 --out motorbike.jsonl
 ```
 
-On one p300c board at 1350 MHz this takes about 1250 s of device time for 800 iterations. A QuietBox 2 runs two such
-cases at once, one per board (`TT_VISIBLE_DEVICES=2,3` for the second).
+On two Blackhole chips at 1350 MHz the first 100 iterations take about 108 s of device time (measured on two
+chips of a Blackhole Galaxy). 800 iterations have not been timed with this line yet; with the line it replaces they
+took 1030 s, at 136 s for the first 100. A QuietBox 2 runs two such cases at once, one per board
+(`TT_VISIBLE_DEVICES=2,3` for the second). The run sizes its gather cache to the L1 memory that is left, chooses
+`--bpatch` from counts stored in the images and shares the copies of a gather among the three processors of a core
+(`--bgts 6 --tgts 3` on Blackhole). It prints each choice.
 
 `--forces` evaluates the case's `forceCoeffs` function object on the state each iteration starts from and stores Cd
 and Cl in the history, which is saved with the final state in `motorbike_case_1x2_state.npz`.
