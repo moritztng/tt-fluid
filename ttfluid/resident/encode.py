@@ -32,6 +32,13 @@ C_MAD, C_MSB = 41, 42   # a = d + b c, a = d - b c
 C_LDRH = 43             # C_LDR of a bf16 page (Machine narrow), widened to fp32 in Dest
 C_STWH = 44             # C_STW packed to bf16 (Machine narrow 2)
 C_PH = 45               # phase marker (Encoded(phase=...)): phase id in the top 16 bits; vm_compute CFD_PHASE
+C_BLK = 46              # a generated SFPU body (BLOCKS): n << 16, then its n-word program inline (blockgen.program);
+                        # with BLOCKS["tab"]: W(C_BLK, 1) | offset << 16, the program sits in the MATH kernel's table
+# BLOCKS (run_mesh --blocks, tools): None = every op its stock word. Else dict(plan=..., gen=...): each block is lowered
+# by blklower.lower_block(**plan) and its bodies by blockgen.program(**gen); the kernel needs CFD_BLK. The arithmetic
+# and its order are the uop list's, so memu stays the reference and the state digest must not move.
+BLOCKS = None
+BLK_STAT = {"bodies": 0, "words": 0}    # and blklower.lower_block's counts
 NARROW = 1 << 27        # desc bit: a bf16 constant page (vm_ncrisc window)
 TILE = 0x80     # op bit: tile operand += loop counter
 # BRISC
@@ -176,6 +183,9 @@ class Encoded:
         self.cores = np.arange(m.P) if cores is None else np.asarray(cores)
         assert not (tab_stream and getattr(m, "hrun", False)), "hrun marks the L1 gather tables"
         assert tab_stream or not WIDE, "wide gather entries carry the lane within its tile: only the streamed walk"
+        if BLOCKS:      # the counts are of this encoding (run_mesh encodes again per --l1 auto step)
+            BLK_STAT.clear()
+            BLK_STAT.update(bodies=0, words=0)
         self.loop_pages = 1     # paged: the most code pages the ring holds at once (a tile loop's body, or an N_CODE's
         #   pages past compute's release point); the ring needs more than this
         P = pdev or m.P
@@ -260,10 +270,32 @@ class Encoded:
             return loop, lds, sts
 
         def body(ins):
+            uops, stores = ins[1], ins[2]
+            if BLOCKS:
+                from . import blklower, blockgen
+                gen = BLOCKS.get("gen", {})
+                uops, stores = blklower.lower_block(uops, stores, m.nslot, accept=lambda sp: blockgen.accept(sp, **gen),
+                                                    info=BLK_STAT, **BLOCKS.get("plan", {}))
             c(W(C_ACQ))
-            for u in ins[1]:
+            for u in uops:
                 k = u[0]
-                if k == "ld":
+                if k == "body":
+                    ws = blockgen.program(u[1], brk=BLOCKS.get("brk", 0), **gen)
+                    BLK_STAT["bodies"] += 1
+                    tab = BLOCKS.get("tab")
+                    if tab is None:     # inline: the program follows its op word
+                        assert len(ws) < PW, "a body program must fit a code page"
+                        BLK_STAT["words"] += len(ws)
+                        c(W(C_BLK) | len(ws) << 16, *ws)
+                    else:               # table: one op word a body, equal programs share one entry (run_mesh --blktab)
+                        k = tuple(int(x) for x in ws)
+                        if k not in tab:
+                            tab[k] = sum(len(p) for p in tab)
+                        assert tab[k] < 1 << 16, "the body table is over 64 K words"
+                        BLK_STAT["words"] += 1
+                        BLK_STAT["programs"], BLK_STAT["table words"] = len(tab), sum(len(p) for p in tab)
+                        c(W(C_BLK, 1) | tab[k] << 16)
+                elif k == "ld":
                     c(W(C_LD, u[1]) | tf(u[2]) | phys[u[2]] << 16)
                 elif k == "lds":      # offset load: lane l reads lane l + u[3] (a multiple of 4 = 16 B)
                     assert u[3] % 4 == 0
@@ -294,7 +326,7 @@ class Encoded:
                 else:
                     raise NotImplementedError(k)
             c(W(C_COMMIT))
-            for s, r in ins[2]:
+            for s, r in stores:
                 if phys[r] >= DBASE:
                     c(W(C_STWH if r in m.narrow_home else C_STW, s))
                 else:

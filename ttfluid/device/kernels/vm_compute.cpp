@@ -23,12 +23,15 @@
 #include "api/compute/eltwise_unary/where.h"
 #include "api/compute/eltwise_unary/fill.h"
 #include "api/compute/eltwise_unary/addcmul.h"
+#ifdef CFD_BLK
+#include "blk_exec.h"   // generated SFPU bodies (resident/blockgen.py): blk_init, blk_run
+#endif
 
 enum : uint32_t {
     C_END = 0, C_ACQ, C_COMMIT, C_REL, C_LD, C_ST, C_FILL, C_RVF,
     C_ADD, C_SUB, C_MUL, C_DIV, C_MAX, C_MIN, C_WHERE, C_CPD,
     C_NEG, C_ABS, C_SQRT, C_TANH, C_LOG, C_EXP, C_GTZ, C_GEZ, C_LTZ, C_LEZ, C_EQZ, C_NEZ,
-    C_FOLD, C_TOK, C_SIGB, C_SIGN, C_WAITB, C_WAITN, C_JMP, C_BRT, C_LDS, C_TBEG, C_TEND, C_LDR, C_STW, C_MAD, C_MSB, C_LDRH, C_STWH, C_PH
+    C_FOLD, C_TOK, C_SIGB, C_SIGN, C_WAITB, C_WAITN, C_JMP, C_BRT, C_LDS, C_TBEG, C_TEND, C_LDR, C_STW, C_MAD, C_MSB, C_LDRH, C_STWH, C_PH, C_BLK
 };
 constexpr uint32_t TILE = 0x80;   // op bit: the tile operand is offset by the tile loop counter
 
@@ -252,6 +255,29 @@ void kernel_main() {
                 }));
 #endif
                 break;
+#ifdef CFD_BLK
+#ifdef CFD_BLKTAB
+            case C_BLK:     // a generated body, table form: w >> 16 is the word offset of its program (header, config
+                // words, row program; blk_exec.h) in BLK_TAB, the table of this lowering's distinct programs that
+                // run_mesh --blktab compiles into the MATH kernel (blk_tab.h, included ahead of this file)
+                MATH(({
+                    SFI(C_BLK, blk_init());
+                    blk_run(&BLK_TAB[w >> 16]);
+                }));
+                break;
+#else
+            case C_BLK: {   // a generated body: the n words after this one are its program (header, config words, row
+                // program; blk_exec.h). MATH pushes them, UNPACK and PACK step over them. An op never straddles a page
+                const uint32_t n = w >> 16;
+                MATH(({
+                    SFI(C_BLK, blk_init());
+                    blk_run(const_cast<const uint32_t*>(&P[CR ? (pc & (CR * PW - 1)) : pc]));
+                }));
+                pc += n;
+                break;
+            }
+#endif
+#endif
             case C_TBEG: tn = w >> 16; tl = 0; tpc = pc; break;
             case C_TEND: if (++tl < tn) pc = tpc; break;
             case C_FILL: SFI(C_FILL, fill_tile_init()); fill_tile_bitcast(a, CW(pc)); ++pc; break;
@@ -327,8 +353,9 @@ void kernel_main() {
 #ifdef CFD_PROF
         {
             const uint32_t t = static_cast<uint32_t>(ckernel::read_wall_clock());
-            cyc[op < 40 ? op : 39] += t - tprev;
-            ++cnt[op < 40 ? op : 39];
+            const uint32_t ps = op == C_BLK ? 0 : op < 40 ? op : 39;   // bodies in C_END's slot (one END per run)
+            cyc[ps] += t - tprev;
+            ++cnt[ps];
             tprev = t;
         }
 #endif
