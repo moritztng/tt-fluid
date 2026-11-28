@@ -112,7 +112,7 @@ A case of millions of cells is lowered once on the host and written as per-chip 
 the device run never holds the whole program in memory and reads only its chips' bytes:
 
 1. `run_mesh case N ... --images DIR` lowers and writes the images, then exits. For HPC_motorbike Small this takes about
-   220 GB of RAM.
+   90 GB of RAM.
 2. `lower/of_state.py` turns an OpenFOAM time directory (for example the potentialFoam result) into a starting state.
 3. `run_mesh case N ... --from-images DIR --state-in STATE.npz` runs on the device.
 
