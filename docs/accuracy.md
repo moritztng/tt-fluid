@@ -139,10 +139,16 @@ The tool uses 20. Blocks of 100 iterations are close to independent, so a window
 SPUMA runs check this directly: their means over iterations 201-800 have a standard deviation of 8.9 counts, and the
 rule gives 8.2.
 
-| window | band, counts | a bias this large fails 9 times in 10 |
+The rule stops holding on longer windows of one run. The long tt-fluid histories on record (a 5,000-iteration run on a
+Wormhole Galaxy, 3,000 on four p150a cards, 1,900 on QuietBox 2) give seven windows of 1,100 to 1,900 iterations, and
+their means spread 10.5 counts where independent blocks would give 5. The Galaxy run reads +6.5 counts on 201-1800 and
+-16.0 on 1801-3400. So the tool counts one run as 600 iterations at most, however long its window, and the 12.5 bar is
+reached by pooling runs (below), not by running one of them longer.
+
+| graded | band, counts | a bias this large fails 9 times in 10 |
 |---|---|---|
-| 201-800 (one 800-iteration run) | 17.8 | 29 |
-| 201-1800 and longer | 12.5 | 20 down to 18 |
+| one run, window 201-800 or longer | 17.8 | 29 |
+| four or more runs pooled | 12.5 | 19 |
 
 Three choices behind it:
 
@@ -152,8 +158,8 @@ Three choices behind it:
   OpenFOAM's long-run mean.
 - The window starts at 201. Iterations 101-200 still carry a start-up transient whose size depends on the linear
   solvers (the block mean ranges from -12 to -40 counts across the runs in `results/`).
-- An 800-iteration run is a screen for gross errors. It cannot tell a 15-count bias from chance. A change that
-  alters the trajectory needs iterations 201-1800 to be held to 12.5 counts.
+- One run is a screen for gross errors. It cannot tell a 15-count bias from chance. A change that alters the
+  trajectory is held to 12.5 counts on four or more runs pooled.
 
 With `--base` the tool also reports the shift against a baseline run over the same window. Two correct runs that differ
 only in the order of their floating-point sums sit 11.5 counts apart (one standard deviation) on 201-800: the 28 pairs
@@ -172,7 +178,10 @@ the tracking line alone.
 Runs that track each other are draws of one arithmetic, so their windows can be pooled into one grade, which is how
 a set of 800-iteration runs reaches the 12.5 bar. Each `--pool` adds a run; the tool refuses one that does not track
 the first, and it leaves out the first block of every added run because that block still follows the first run. The
-eight SPUMA SPDP runs on H100 and the one on B200 pool to +8.4 +- 4.6 counts over 5,400 iterations: a pass.
+pooled error is the larger of the rule's and the one the run means themselves show, so runs that disagree widen their
+own band. Four runs or more make a grade of record. Such runs cost nothing extra where several cases run at once:
+start each from a state one rounding step away from the others. The eight SPUMA SPDP runs on H100 and the one on B200
+pool to +8.4 +- 5.0 counts over 5,400 iterations: a pass.
 
 ```bash
 H=results/nvidia/dgx-h100
@@ -186,11 +195,11 @@ What the runs in `results/` grade as:
 |---|---|---|---|---|
 | 16 SPUMA runs on H100, 2 on B200 | 201-800 | -12.6 to +27.0, mean +5.3 | 17.8 | 17 pass, 1 fails (+27.0) |
 | tt-fluid, QuietBox 2 board A | 201-800 | -22.8 | 17.8 | fail |
-| tt-fluid, QuietBox 2 board A | 201-1899 | -17.0 | 12.5 | fail |
+| tt-fluid, QuietBox 2 board A | 201-1899 | -17.0 | 17.8 | pass, by 0.8 |
 
-One failure in 18 correct runs is what a two-sigma band gives. The QuietBox 2 run is low in 16 of its 18 blocks, which
-is 2.8 standard deviations over 201-1899: either a real low bias of 10 to 17 counts (0.2 to 0.4 % of Cd) or a rare
-draw. A 3,000-iteration run will decide; until then this run does not pass.
+One failure in 18 correct runs is what a two-sigma band gives. The QuietBox 2 run is one run, so both lines are
+screens. It sits low, like the Galaxy run's later windows and unlike its earlier ones. Whether tt-fluid as a whole
+sits low is a question for a pooled grade of four or more device runs, which `results/` does not hold yet.
 
 ### A known behaviour of the case
 

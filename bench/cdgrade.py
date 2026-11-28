@@ -11,11 +11,13 @@ coefficient.dat. Several RUNs chain legs of one run.
 The case never settles under SIMPLE: Cd swings about 40 counts from iteration to iteration (1 count = 1e-4), and two
 runs from the same start are unrelated after about 300 iterations. So a run is graded on the mean over a window, and
 the noise of that mean is known in advance from measured runs (docs/accuracy.md, section 3a): the mean of 100 iterations
-has a standard deviation of S100 counts, blocks of 100 are close to independent, so a window of n blocks has
-S100 / sqrt(n).
+has a standard deviation of S100 counts and blocks of 100 are close to independent, so a window of n blocks has
+S100 / sqrt(n). That holds up to about 600 iterations. Beyond it the mean of one device run wanders: windows of
+1,100 to 1,900 iterations spread 10 counts between and within runs, twice what independent blocks give. So one run
+counts as ONE_RUN blocks at most, however long its window, and the noise comes down only with more runs (--pool).
 
     diff  = mean(run, window) - mean(OpenFOAM, its 501 on)       the reference is OpenFOAM's long-run mean
-    band  = max(BAND, 2 sigma of diff)                           BAND once the window is long enough to resolve it
+    band  = max(BAND, 2 sigma of diff)                           BAND once enough runs are pooled to resolve it
     GRADE = PASS if |diff of Cd| <= band else FAIL               exit status 0 / 1
 
 The window starts at 201 because iterations 101-200 still carry a start-up transient that depends on the linear
@@ -29,7 +31,8 @@ After that one linear solve taking one iteration more or fewer separates them fo
 
 Runs that track each other are draws of one arithmetic, so their windows can be pooled into one grade: each --pool
 adds such a run (the tool refuses one that does not track --run), and the pooled window counts every run's blocks
-except the first block of each added run, which still follows the first run.
+except the first block of each added run, which still follows the first run. The pooled sigma is the larger of that
+model and the spread of the run means themselves. RECORD_RUNS runs or more make a grade of record; fewer are a screen.
 """
 import argparse
 import json
@@ -38,7 +41,8 @@ import re
 import sys
 from pathlib import Path
 
-BAND = 12.5                       # counts, the accuracy bar on a window long enough to resolve it
+BAND = 12.5                       # counts, the accuracy bar once enough runs are pooled to resolve it
+ONE_RUN, RECORD_RUNS = 6, 4       # blocks one run counts for at most; runs a grade of record pools
 S100 = {"Cd": 20.0, "Cl": 18.0}   # counts, sd of a 100-iteration mean (OpenFOAM, SPUMA x18, two device builds)
 TRACK_ITS, TRACK = 10, 1.0        # reordered runs stay within TRACK counts of Cd through iteration TRACK_ITS
 BLOCK, START, REF_FROM = 100, 201, 501
@@ -89,8 +93,9 @@ def grade(run, ref, base=None, lo=START, hi=None):
     if gaps or hi - lo + 1 < BLOCK:
         raise SystemExit(f"no window: the run ends at iteration {hi} and a window is {lo}-{lo + BLOCK - 1} or longer"
                          if hi - lo + 1 < BLOCK else f"window {lo}-{hi}: {len(gaps)} iterations missing, first {gaps[0]}")
-    n = (hi - lo + 1) / BLOCK
-    out = dict(window=[lo, hi], ref_its=[REF_FROM, max(ref)])
+    blocks = (hi - lo + 1) / BLOCK
+    n = min(blocks, ONE_RUN)
+    out = dict(window=[lo, hi], ref_its=[REF_FROM, max(ref)], blocks=n)
     for q, name in enumerate(("Cd", "Cl")):
         m, se, sd = window(run, lo, hi, q)
         rm, rse, _ = window(ref, REF_FROM, max(ref), q)
@@ -98,7 +103,7 @@ def grade(run, ref, base=None, lo=START, hi=None):
         sig = math.hypot(noise, rse * 1e4)
         c = dict(run=m, own_se=se * 1e4, block_sd=sd * 1e4, ref=rm, ref_se=rse * 1e4, diff=(m - rm) * 1e4,
                  noise=noise, band=max(BAND, 2 * sig), detects=max(BAND, 2 * sig) + 1.28 * sig,
-                 steady=not sd * 1e4 > S100[name] * (1 + 2 / math.sqrt(2 * max(n - 1, 1))))
+                 steady=not sd * 1e4 > S100[name] * (1 + 2 / math.sqrt(2 * max(blocks - 1, 1))))
         if all(i in ref for i in (lo, hi)):
             c["diff_same_its"] = (m - window(ref, lo, hi, q)[0]) * 1e4
         if base is not None:
@@ -114,13 +119,15 @@ def grade(run, ref, base=None, lo=START, hi=None):
 def pooled(grades):
     """One grade from the grades of several runs of the same arithmetic: the mean over all their window iterations."""
     its = [g["window"][1] - g["window"][0] + 1 for g in grades]
-    n = sum(its) / BLOCK - (len(grades) - 1)
-    out = dict(runs=len(grades), its=sum(its))
+    r, n = len(grades), sum(g["blocks"] for g in grades) - (len(grades) - 1)
+    out = dict(runs=r, its=sum(its), record=r >= RECORD_RUNS)
     for name in ("Cd", "Cl"):
         diff = sum(g[name]["diff"] * k for g, k in zip(grades, its)) / sum(its)
-        sig = math.hypot(S100[name] / math.sqrt(n), grades[0][name]["ref_se"])
-        out[name] = dict(diff=diff, sigma=sig, band=max(BAND, 2 * sig), detects=max(BAND, 2 * sig) + 1.28 * sig,
-                         ok=abs(diff) <= max(BAND, 2 * sig))
+        model = S100[name] / math.sqrt(n)
+        spread = math.sqrt(sum((k / sum(its) * (g[name]["diff"] - diff)) ** 2 for g, k in zip(grades, its)) * r / (r - 1))
+        sig = math.hypot(max(model, spread), grades[0][name]["ref_se"])
+        out[name] = dict(diff=diff, sigma=sig, model=model, spread=spread, band=max(BAND, 2 * sig),
+                         detects=max(BAND, 2 * sig) + 1.28 * sig, ok=abs(diff) <= max(BAND, 2 * sig))
     out["grade"] = "PASS" if out["Cd"]["ok"] else "FAIL"
     return out
 
@@ -179,7 +186,9 @@ def main():
         g["grade"], c = q["grade"], q["Cd"]
         print(f"POOLED GRADE: {q['grade']}  Cd {c['diff']:+.1f} +- {c['sigma']:.1f} counts (Cl {q['Cl']['diff']:+.1f}) "
               f"against a band of {c['band']:.1f} on {q['its']} iterations of {q['runs']} runs; a bias of "
-              f"{c['detects']:.0f} counts fails 9 times in 10")
+              f"{c['detects']:.0f} counts fails 9 times in 10 | sigma from the run means {c['spread']:.1f}, from the "
+              f"model {c['model']:.1f}"
+              + ("" if q["record"] else f" | fewer than {RECORD_RUNS} runs: a screen, not a grade of record"))
     if a.json:
         json.dump(g, open(a.json, "w"), indent=1)
     sys.exit(g["grade"] != "PASS")

@@ -29,11 +29,12 @@ def test_one_percent_error_fails(error, grade):
     assert g["grade"] == grade and g["Cd"]["detects"] < 42
 
 
-def test_band_tightens_to_the_bar_and_base_reports_the_floor():
+def test_one_run_counts_for_600_iterations_however_long_and_base_reports_the_floor():
+    """The mean of one run wanders over long windows, so 1,699 iterations get the band and the floor of 600."""
     run = cdgrade.series([f"{QB2}/qb2k2_D1A.hist.json:0", f"{QB2}/qb2k2_D2A.hist.json:800"])
     g = cdgrade.grade(run, REF, base=run)
-    assert g["window"] == [201, 1899] and g["Cd"]["band"] == cdgrade.BAND
-    assert g["Cd"]["shift"] == 0 and 6.8 < g["Cd"]["floor"] < 6.9
+    assert g["window"] == [201, 1899] and round(g["Cd"]["band"], 1) == 17.8
+    assert g["Cd"]["shift"] == 0 and 11.5 < g["Cd"]["floor"] < 11.6
 
 
 def test_nan_and_gaps():
@@ -76,8 +77,12 @@ def test_runs_of_one_arithmetic_pool_into_one_grade(monkeypatch, capsys):
     """Eight SPUMA runs that differ only in reduction order grade as one 4,800-iteration window at the 12.5 bar."""
     spdp = [str(H100 / f"A_SPDP_g{g}" / "coefficient.dat") for g in range(8)]
     q = cdgrade.pooled([cdgrade.grade(cdgrade.series([f]), REF) for f in spdp])
-    assert q["its"] == 4800 and q["Cd"]["band"] == cdgrade.BAND and q["grade"] == "PASS"
-    assert abs(q["Cd"]["sigma"] - (20 ** 2 / (48 - 7) + 3.5 ** 2) ** 0.5) < 0.05
+    assert q["its"] == 4800 and q["Cd"]["band"] == cdgrade.BAND and q["grade"] == "PASS" and q["record"]
+    assert abs(q["Cd"]["model"] - 20 / (48 - 7) ** 0.5) < 0.01 and q["Cd"]["sigma"] >= (q["Cd"]["model"] ** 2 + 3.5 ** 2) ** 0.5 - 0.05
+    two = [cdgrade.grade(cdgrade.series([f]), REF) for f in spdp[:2]]
+    two[1]["Cd"]["diff"] = two[0]["Cd"]["diff"] + 40   # two runs that disagree: a wide band and a screen, not a record
+    q = cdgrade.pooled(two)
+    assert q["Cd"]["spread"] == pytest.approx(20) and q["Cd"]["band"] > 40 and not q["record"]
     monkeypatch.setattr(sys, "argv", ["cdgrade.py", "--run", spdp[0], "--pool", str(H100 / "A_DP_g0" / "coefficient.dat")])
     with pytest.raises(SystemExit) as e:   # fp64 is another arithmetic: it does not track, so it is not pooled
         cdgrade.main()
