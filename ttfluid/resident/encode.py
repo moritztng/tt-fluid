@@ -154,7 +154,7 @@ def hrun_words(lane, idx, rmin=8):
 
 class Encoded:
     def __init__(self, m, page=False, pdev=None, tab_stream=False, look=False, cores=None, tab_sort=False, phase=None,
-                 gtile=False, tab_dense=0):
+                 gtile=False, tab_dense=0, tab_break=0):
         """page: the compute stream is paged from DRAM through a ring NCRISC fills (vm_ncrisc N_CODE): every basic
         block starts on a PW-word page, the padding is C_JMP (in paged mode JMP and BRT end a block and compute moves
         on to the next delivered page), and NCRISC pushes the pages of a MIR instruction before any of its own ops
@@ -487,7 +487,7 @@ class Encoded:
         if tab_stream:      # residue tables in DRAM, a tile-offset index in L1 (tabstream.py)
             from .tabstream import stream
             self.tab_cursor, self.tab_halo_cursor = self.tab, self.tab_halo
-            self.tab_stream = S = stream(self, sort=tab_sort, dense=[(o, sh, tab_dense) for o, sh in twin])
+            self.tab_stream = S = stream(self, sort=tab_sort, dense=[(o, sh, tab_dense) for o, sh in twin], brk=tab_break)
             self.tab = _pad(S["l1"])
             self.tab_blob = _pad(S["blob"])
             self.tab_halo = np.array(S["halo_off"], np.uint32)

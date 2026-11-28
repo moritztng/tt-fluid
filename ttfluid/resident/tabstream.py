@@ -106,10 +106,11 @@ def dense_index(ent, tm, shift):
     return idx
 
 
-def stream(E, sort=False, dense=None):
+def stream(E, sort=False, dense=None, brk=0):
     """dense: [(map, shift, min local entries a tile)]: twin j is map nm + j, the same entries as its map, stored
     dense on a core when the local residue entries per tile reach the minimum (encode.py points the pages whose
-    window and residue come from one L1 vector at the twin)."""
+    window and residue come from one L1 vector at the twin). brk: the broken arm of the dense gate: on core 0 the
+    first brk pairs of residue lanes of every dense table read each other's source (the state compare must fail)."""
     m = E.m
     dense = list(dense or [])
     assert not (dense and _enc.WIDE), "dense tables index 16-bit lanes"
@@ -141,7 +142,11 @@ def stream(E, sort=False, dense=None):
                     assert nparts[mid] == 1 and kind == "l" and len(np.unique(lanes)) == len(lanes)
                     loc_tile += np.diff(bounds)
                     H += (len(B) - base + np.arange(tm) * 512).tolist()
-                    B += _half(dense_index(ent, tm, dsh))
+                    idx = dense_index(ent, tm, dsh)
+                    if brk and i == 0:
+                        ln = lanes[:2 * (min(brk, len(lanes) // 2))]
+                        idx[ln[0::2]], idx[ln[1::2]] = idx[ln[1::2]].copy(), idx[ln[0::2]].copy()
+                    B += _half(idx)
                     per_tile += 512
                     ndense += 1
                     continue

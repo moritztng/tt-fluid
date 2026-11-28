@@ -1018,6 +1018,7 @@ void kernel_main() {
                             uint32_t dkeep = 1024;                                   // dense lanes this core gathers
 #else
                             constexpr bool dn = false;
+                            (void)dn;
 #endif
 #ifdef CFD_BPATCH
                             // BRISC scatters the upper (8 - CFD_BPATCH) / 8 of every L1-source local section (vm_brisc.cpp
